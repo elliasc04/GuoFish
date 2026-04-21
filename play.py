@@ -1,14 +1,17 @@
 """Play chess against a ChessTransformer model.
 
 Supports both regular and FP16-compressed checkpoints.
+Optionally uses MCTS for stronger play.
 
 Usage:
     python play.py                                           # uses default checkpoint
     python play.py models/chess_transformer_25.8M_50.5pct_fp16.pt
+    python play.py --mcts --simulations 800                  # use MCTS search
 """
 
 import argparse
 import math
+import time
 from pathlib import Path
 
 import chess
@@ -120,28 +123,86 @@ def decode_move(index: int, board: chess.Board) -> chess.Move:
     return chess.Move(from_sq, to_sq, promotion=promotion)
 
 
-def pick_engine_move(model: ChessTransformer, board: chess.Board, device: torch.device) -> chess.Move:
-    tokens = board_to_tokens(board).unsqueeze(0).to(device)
-    mask = legal_move_mask(board).unsqueeze(0).to(device)
+def pick_engine_move(model: ChessTransformer, board: chess.Board, device: torch.device,
+                     mcts_engine=None, num_simulations: int = 800) -> tuple[chess.Move, dict]:
+    """Pick engine move using either raw policy or MCTS.
 
-    with torch.no_grad():
-        # Handle FP16 model on GPU
-        if next(model.parameters()).dtype == torch.float16:
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+    Returns:
+        tuple: (move, stats_dict) where stats_dict contains timing and search info
+    """
+    start_time = time.time()
+    stats = {}
+
+    if mcts_engine is not None:
+        # Use MCTS search
+        move = mcts_engine.search(board, num_simulations=num_simulations)
+        elapsed = time.time() - start_time
+
+        # Get root node stats for display
+        stats['time'] = elapsed
+        stats['simulations'] = num_simulations
+        stats['sims_per_sec'] = num_simulations / elapsed if elapsed > 0 else 0
+        stats['batches'] = mcts_engine.evaluator.total_batches
+        stats['avg_batch'] = (mcts_engine.evaluator.total_evals /
+                              max(1, mcts_engine.evaluator.total_batches))
+        stats['eval'] = mcts_engine.last_best_child_q  # Q-value of chosen move
+
+        # Reset evaluator stats for next move
+        mcts_engine.evaluator.total_batches = 0
+        mcts_engine.evaluator.total_evals = 0
+    else:
+        # Use raw policy (single forward pass)
+        tokens = board_to_tokens(board).unsqueeze(0).to(device)
+        mask = legal_move_mask(board).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            # Handle FP16 model on GPU
+            if next(model.parameters()).dtype == torch.float16:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    policy_logits, value = model(tokens, legal_move_mask=mask)
+            else:
                 policy_logits, value = model(tokens, legal_move_mask=mask)
-        else:
-            policy_logits, value = model(tokens, legal_move_mask=mask)
 
-    best_index = int(torch.argmax(policy_logits, dim=1).item())
-    print(f"[engine eval: {value.item():+.3f}]")
-    return decode_move(best_index, board)
+        best_index = int(torch.argmax(policy_logits, dim=1).item())
+        move = decode_move(best_index, board)
+        elapsed = time.time() - start_time
+
+        stats['time'] = elapsed
+        stats['eval'] = value.item()
+        stats['simulations'] = None
+
+    return move, stats
+
+
+def format_engine_stats(stats: dict) -> str:
+    """Format engine stats for display."""
+    parts = []
+
+    if stats.get('eval') is not None:
+        parts.append(f"eval: {stats['eval']:+.3f}")
+
+    if stats.get('simulations') is not None:
+        parts.append(f"sims: {stats['simulations']}")
+        parts.append(f"{stats['sims_per_sec']:.0f} sims/s")
+        if stats.get('avg_batch'):
+            parts.append(f"batch: {stats['avg_batch']:.0f}")
+
+    parts.append(f"time: {stats['time']*1000:.0f}ms")
+
+    return " | ".join(parts)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Play chess against ChessTransformer")
     parser.add_argument("checkpoint", type=Path, nargs="?",
-                        default=Path("models/chess_transformer_25.8M_50.5pct.pt"),
+                        default=Path("models/guofish_25.8M_51.9p.pt"),
                         help="Path to model checkpoint")
+    parser.add_argument("--mcts", action="store_true",
+                        help="Use MCTS search instead of raw policy")
+    parser.add_argument("--simulations", type=int, default=800,
+                        help="Number of MCTS simulations per move (default: 800)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of MCTS worker threads (default: auto)")
     args = parser.parse_args()
 
     if not args.checkpoint.exists():
@@ -150,6 +211,15 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(args.checkpoint, device)
+
+    # Initialize MCTS if requested
+    mcts_engine = None
+    if args.mcts:
+        from mcts import ParallelMCTS
+        # Let ParallelMCTS auto-tune workers unless explicitly specified
+        mcts_engine = ParallelMCTS(model, device, num_workers=args.workers)
+        print(f"MCTS enabled: {args.simulations} simulations, {mcts_engine.num_workers} workers, "
+              f"batch size {mcts_engine.evaluator.min_batch_size}-{mcts_engine.evaluator.max_batch_size}")
 
     # Ask the user which side to play
     while True:
@@ -167,8 +237,8 @@ def main():
 
     # If the engine plays white, make its opening move first
     if human_side == chess.BLACK:
-        move = pick_engine_move(model, board, device)
-        print(f"Engine plays: {board.san(move)}\n")
+        move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+        print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
         board.push(move)
 
     while True:
@@ -192,8 +262,8 @@ def main():
                 print("You win by checkmate!")
             return
 
-        engine_move = pick_engine_move(model, board, device)
-        print(f"Engine plays: {board.san(engine_move)}\n")
+        engine_move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+        print(f"Engine plays: {board.san(engine_move)}  [{format_engine_stats(stats)}]\n")
         board.push(engine_move)
 
         if board.is_game_over():

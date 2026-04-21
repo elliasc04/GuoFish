@@ -13,7 +13,7 @@ import pgn_parallel  # worker lives in a .py module (spawn semantics on Windows)
 PGN_PATH = Path('data/lichess_elite_2020-08.pgn')
 OUT_DIR  = Path('data/processed')
 
-NUM_GAMES = 50000
+NUM_GAMES = 150000
 
 
 def iter_pgn_blocks(path, max_games):
