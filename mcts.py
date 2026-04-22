@@ -21,11 +21,87 @@ from queue import Queue, Empty
 from typing import Optional
 
 import chess
+import chess.polyglot
+import numpy as np
 import torch
 
 # MCTS hyperparameters
 C_PUCT = 1.5  # Exploration constant
 VIRTUAL_LOSS = 3  # Penalize in-flight nodes to encourage exploration diversity
+MAX_TREE_DEPTH = 60  # Maximum simulation depth to prevent endgame slowdowns
+
+
+class TranspositionCache:
+    """Thread-safe ring buffer cache for NN evaluations, keyed by Zobrist hash.
+
+    Uses a circular buffer instead of OrderedDict to avoid O(n) LRU operations.
+    Stores (policy_logits, value) pairs to avoid re-evaluating positions
+    reached via different move orders (transpositions).
+    """
+
+    def __init__(self, max_size: int = 500_000):
+        self.max_size = max_size
+        # Hash table for O(1) lookup
+        self._cache: dict[int, tuple[torch.Tensor, float]] = {}
+        # Ring buffer of keys for O(1) eviction (no ordering maintained)
+        self._ring: list[Optional[int]] = [None] * max_size
+        self._ring_idx = 0  # Next position to write
+        self._lock = threading.Lock()
+
+        # Stats
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, zobrist_hash: int) -> Optional[tuple[torch.Tensor, float]]:
+        """Get cached (policy_logits, value) for hash. Returns None on miss."""
+        with self._lock:
+            result = self._cache.get(zobrist_hash)
+            if result is not None:
+                self.hits += 1
+                return result
+            self.misses += 1
+            return None
+
+    def put(self, zobrist_hash: int, policy: torch.Tensor, value: float):
+        """Store (policy_logits, value) for hash. Evicts oldest entry if at capacity."""
+        with self._lock:
+            if zobrist_hash in self._cache:
+                # Update existing entry (no ring position change needed)
+                self._cache[zobrist_hash] = (policy, value)
+                return
+
+            # Evict entry at current ring position if occupied
+            old_key = self._ring[self._ring_idx]
+            if old_key is not None:
+                self._cache.pop(old_key, None)
+
+            # Insert new entry
+            self._cache[zobrist_hash] = (policy, value)
+            self._ring[self._ring_idx] = zobrist_hash
+
+            # Advance ring pointer
+            self._ring_idx = (self._ring_idx + 1) % self.max_size
+
+    def clear(self):
+        """Clear all cached entries and reset stats."""
+        with self._lock:
+            self._cache.clear()
+            self._ring = [None] * self.max_size
+            self._ring_idx = 0
+            self.hits = 0
+            self.misses = 0
+
+    @property
+    def size(self) -> int:
+        """Current number of cached entries."""
+        with self._lock:
+            return len(self._cache)
+
+    @property
+    def hit_rate(self) -> float:
+        """Cache hit rate (0.0 to 1.0)."""
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
 
 
 @dataclass
@@ -139,12 +215,13 @@ class BatchedEvaluator:
 
     def __init__(self, model: torch.nn.Module, device: torch.device,
                  max_batch_size: int = 128, min_batch_size: int = 8,
-                 batch_timeout_ms: float = 50.0):
+                 batch_timeout_ms: float = 50.0, seq_length: int = 68):
         self.model = model
         self.device = device
         self.max_batch_size = max_batch_size
         self.min_batch_size = min_batch_size  # Wait for at least this many
         self.batch_timeout = batch_timeout_ms / 1000.0  # Convert to seconds
+        self.seq_length = seq_length  # Tokenization scheme (65 or 68)
 
         self.request_queue: Queue[EvalRequest] = Queue()
         self.running = False
@@ -184,10 +261,11 @@ class BatchedEvaluator:
         """Collect requests aggressively to maximize batch size for GPU efficiency."""
         batch = []
 
-        # First, block until we get at least one request
+        # First, block until we get at least one request (no timeout polling)
         while len(batch) == 0 and self.running:
             try:
-                request = self.request_queue.get(timeout=0.005)
+                # Use blocking get() - avoids CPU spin from timeout polling
+                request = self.request_queue.get(timeout=1.0)  # Long timeout for clean shutdown
                 batch.append(request)
             except Empty:
                 continue
@@ -228,10 +306,15 @@ class BatchedEvaluator:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
                 policy_logits, values = self.model(tokens_batch)
 
-        # Distribute results back to workers
+        # Bulk D2H transfer - move entire tensors to CPU before iterating
+        # This avoids per-item synchronization overhead
+        policy_cpu = policy_logits.cpu()
+        values_cpu = values.cpu()
+
+        # Distribute results back to workers (now from CPU tensors)
         for i, req in enumerate(batch):
-            req.policy = policy_logits[i]
-            req.value = values[i].item()
+            req.policy = policy_cpu[i]
+            req.value = values_cpu[i].item()
             req.event.set()  # Signal worker that result is ready
 
         # Stats
@@ -243,12 +326,13 @@ class MCTSWorker:
     """Worker thread that traverses the tree and submits leaves for evaluation."""
 
     def __init__(self, worker_id: int, root: MCTSNode, root_board: chess.Board,
-                 evaluator: BatchedEvaluator, stats: dict, target_sims: int,
-                 completion_event: threading.Event):
+                 evaluator: BatchedEvaluator, cache: TranspositionCache,
+                 stats: dict, target_sims: int, completion_event: threading.Event):
         self.worker_id = worker_id
         self.root = root
         self.root_board = root_board
         self.evaluator = evaluator
+        self.cache = cache
         self.stats = stats
         self.target_sims = target_sims
         self.completion_event = completion_event
@@ -281,6 +365,7 @@ class MCTSWorker:
         node = self.root
         board = self.root_board.copy()
         path = [node]  # Track path for virtual loss
+        depth = 0
 
         # === Selection: traverse to leaf ===
         while node.is_expanded and node.children:
@@ -288,6 +373,16 @@ class MCTSWorker:
             node = node.select_child()
             path.append(node)
             board.push(node.move)
+            depth += 1
+
+            # Max depth cutoff to prevent endgame slowdowns
+            if depth >= MAX_TREE_DEPTH:
+                # Treat as terminal with value 0 (draw-ish)
+                for n in path:
+                    n.revert_virtual_loss()
+                node.backpropagate(0.0)
+                self.stats['simulations'] += 1
+                return
 
         node.apply_virtual_loss()
 
@@ -311,16 +406,31 @@ class MCTSWorker:
             node.backpropagate(value)
             return
 
-        # === Expansion & Evaluation: submit to evaluator ===
-        # Tokenize on worker thread to offload CPU work from evaluator
-        tokens = board_to_tokens(board)
-        request = EvalRequest(node=node, tokens=tokens)
-        self.evaluator.submit(request)
-        request.event.wait()  # Block until evaluated
+        # === Expansion & Evaluation ===
+        # Check transposition cache first (Zobrist hash includes side-to-move, castling, ep)
+        zobrist_hash = chess.polyglot.zobrist_hash(board)
+        cached = self.cache.get(zobrist_hash)
+
+        if cached is not None:
+            # Cache hit - use cached policy and value
+            policy, nn_value = cached
+        else:
+            # Cache miss - submit to evaluator
+            tokens = board_to_tokens(board, self.evaluator.seq_length)
+            request = EvalRequest(node=node, tokens=tokens)
+            self.evaluator.submit(request)
+            request.event.wait()  # Block until evaluated
+
+            policy = request.policy
+            nn_value = request.value if request.value is not None else 0.0
+
+            # Store in cache (policy logits, not softmax'd)
+            if policy is not None:
+                self.cache.put(zobrist_hash, policy, nn_value)
 
         # Expand node with policy LOGITS (Softmax happens inside expand now)
         legal_moves = list(board.legal_moves)
-        node.expand(request.policy, legal_moves)
+        node.expand(policy, legal_moves)
 
         # Revert virtual loss along path
         for n in path:
@@ -331,7 +441,6 @@ class MCTSWorker:
         # We need Mover's perspective (who moved TO this node = opponent of board.turn).
         # - If board.turn == BLACK, mover was WHITE, use NN value as-is.
         # - If board.turn == WHITE, mover was BLACK, negate NN value.
-        nn_value = request.value if request.value is not None else 0.0
         mover_value = nn_value if board.turn == chess.BLACK else -nn_value
 
         # Backpropagate from mover's perspective
@@ -341,12 +450,17 @@ class MCTSWorker:
 
 
 class ParallelMCTS:
-    """Parallel MCTS with batched neural network evaluation."""
+    """Parallel MCTS with batched neural network evaluation and tree reuse."""
 
     def __init__(self, model: torch.nn.Module, device: torch.device,
-                 num_workers: Optional[int] = None, max_batch_size: Optional[int] = None):
+                 num_workers: Optional[int] = None, max_batch_size: Optional[int] = None,
+                 cache_size: int = 500_000):
         self.model = model
         self.device = device
+
+        # Auto-detect tokenization scheme from model's seq_length attribute
+        # (set by ChessTransformerV1/V2 in play.py)
+        self.seq_length: int = getattr(model, 'seq_length', 68)
 
         # Auto-tune workers: more workers helps fill batches despite GIL
         # Use many workers to keep the request queue full
@@ -363,15 +477,24 @@ class ParallelMCTS:
 
         # Min batch size - aim for good GPU utilization
         # Larger min = better GPU efficiency but more latency
-        min_batch_size = max(16, num_workers)
+        min_batch_size = max(4, num_workers)
 
         self.evaluator = BatchedEvaluator(
             model=model,
             device=device,
             max_batch_size=max_batch_size,
             min_batch_size=min_batch_size,
-            batch_timeout_ms=100.0  # Wait up to 100ms to collect min_batch_size
+            batch_timeout_ms=100.0,  # Wait up to 100ms to collect min_batch_size
+            seq_length=self.seq_length
         )
+
+        # Transposition cache for NN evaluations (persists across searches)
+        self.cache = TranspositionCache(max_size=cache_size)
+
+        # Persistent tree for reuse across searches
+        self.root: Optional[MCTSNode] = None
+        self.root_board: Optional[chess.Board] = None
+        self._root_hash: Optional[int] = None  # Zobrist hash for position comparison
 
         self.model.eval()
 
@@ -383,29 +506,108 @@ class ParallelMCTS:
         """Stop the evaluator thread. Call when done with MCTS."""
         self.evaluator.stop()
 
+    def clear_cache(self):
+        """Clear the transposition cache."""
+        self.cache.clear()
+
+    def reset(self):
+        """Clear the persistent tree. Call at start of a new game."""
+        self.root = None
+        self.root_board = None
+        self._root_hash = None
+
+    def apply_move(self, move: chess.Move):
+        """
+        Advance the tree by the given move, preserving the relevant subtree.
+        Call this after a move is played to enable tree reuse.
+        """
+        if self.root is None or self.root_board is None or move not in self.root.children:
+            # Nothing to reuse
+            self.root = None
+            self.root_board = None
+            self._root_hash = None
+            return
+
+        # Advance to child node
+        new_root = self.root.children[move]
+        new_root.parent = None  # Detach so siblings can be garbage collected
+        self.root = new_root
+        self.root_board.push(move)
+        self._root_hash = chess.polyglot.zobrist_hash(self.root_board)
+
+    def _reset_virtual_loss(self, node: MCTSNode):
+        """Recursively reset virtual_loss to 0 in the subtree (defensive)."""
+        node.virtual_loss = 0
+        for child in node.children.values():
+            self._reset_virtual_loss(child)
+
+    def _add_dirichlet_noise(self, root: MCTSNode, alpha: float = 0.3, epsilon: float = 0.25):
+        """
+        Add Dirichlet noise to root's children priors for exploration.
+        Standard AlphaZero formula: P'(a) = (1 - epsilon) * P(a) + epsilon * Dir(alpha)
+        """
+        if not root.children:
+            return
+
+        moves = list(root.children.keys())
+        noise = np.random.dirichlet([alpha] * len(moves))
+
+        for move, n in zip(moves, noise):
+            child = root.children[move]
+            child.prior = (1 - epsilon) * child.prior + epsilon * n
+
     def search(self, board: chess.Board, num_simulations: int = 800,
-               time_limit: float = None) -> chess.Move:
+               time_limit: float = None, add_dirichlet_noise: bool = False) -> Optional[chess.Move]:
         """
         Run MCTS search and return the best move.
 
         Args:
             board: Current board position
-            num_simulations: Target number of simulations
+            num_simulations: Target total simulations (including prior visits if reusing tree)
             time_limit: Optional time limit in seconds (overrides num_simulations)
+            add_dirichlet_noise: If True, add Dirichlet noise to root priors (for self-play)
 
         Returns:
-            Best move according to MCTS
+            Best move according to MCTS, or None if no legal moves
         """
-        root = MCTSNode()
-        stats = defaultdict(int)
-        completion_event = threading.Event()
+        board_hash = chess.polyglot.zobrist_hash(board)
 
-        # Initial expansion of root
-        self._expand_root(root, board)
+        # Check if we can reuse the existing tree
+        if self.root is not None and self._root_hash == board_hash:
+            # Reuse existing root
+            root = self.root
+            # Defensive: ensure no stale virtual losses from previous search
+            self._reset_virtual_loss(root)
+        else:
+            # Create fresh root
+            root = MCTSNode()
+            self._expand_root(root, board)
+            self.root = root
+            self.root_board = board.copy()
+            self._root_hash = board_hash
 
         if not root.children:
             # No legal moves
             return None
+
+        # Add Dirichlet noise for exploration (per-search, not per-tree)
+        if add_dirichlet_noise:
+            self._add_dirichlet_noise(root)
+
+        # Calculate how many new simulations to run
+        # num_simulations is the target total, so subtract existing visits
+        existing_visits = root.visit_count
+        target_new_sims = max(0, num_simulations - existing_visits)
+
+        if target_new_sims == 0:
+            # Already have enough simulations
+            best_move, best_child = max(root.children.items(), key=lambda x: x[1].visit_count)
+            self.last_root_q = root.q_value
+            self.last_best_child_q = -best_child.q_value
+            return best_move
+
+        stats = defaultdict(int)
+        completion_event = threading.Event()
 
         # Start evaluator (keeps running across searches)
         self.evaluator.start()
@@ -418,8 +620,9 @@ class ParallelMCTS:
                 root=root,
                 root_board=board,
                 evaluator=self.evaluator,
+                cache=self.cache,
                 stats=stats,
-                target_sims=num_simulations,
+                target_sims=target_new_sims,
                 completion_event=completion_event
             )
             worker.start()
@@ -448,7 +651,7 @@ class ParallelMCTS:
 
     def _expand_root(self, root: MCTSNode, board: chess.Board):
         """Expand root node synchronously."""
-        tokens = board_to_tokens(board).unsqueeze(0).to(self.device)
+        tokens = board_to_tokens(board, self.seq_length).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
@@ -459,43 +662,74 @@ class ParallelMCTS:
         root.visit_count = 1
         root.value_sum = value[0].item()
 
-    def get_policy(self, board: chess.Board, num_simulations: int = 800) -> dict[chess.Move, float]:
+    def get_policy(self, board: chess.Board, num_simulations: int = 800,
+                   add_dirichlet_noise: bool = False) -> dict[chess.Move, float]:
         """
         Run MCTS and return visit count distribution over moves.
-        Useful for training data generation.
-        """
-        root = MCTSNode()
-        stats = defaultdict(int)
-        completion_event = threading.Event()
+        Useful for training data generation. Benefits from tree reuse.
 
-        self._expand_root(root, board)
+        Args:
+            board: Current board position
+            num_simulations: Target total simulations
+            add_dirichlet_noise: If True, add Dirichlet noise to root priors
+
+        Returns:
+            Dictionary mapping moves to visit count proportions
+        """
+        board_hash = chess.polyglot.zobrist_hash(board)
+
+        # Check if we can reuse the existing tree
+        if self.root is not None and self._root_hash == board_hash:
+            root = self.root
+            self._reset_virtual_loss(root)
+        else:
+            root = MCTSNode()
+            self._expand_root(root, board)
+            self.root = root
+            self.root_board = board.copy()
+            self._root_hash = board_hash
 
         if not root.children:
             return {}
 
-        self.evaluator.start()
+        if add_dirichlet_noise:
+            self._add_dirichlet_noise(root)
 
-        workers = []
-        for i in range(self.num_workers):
-            worker = MCTSWorker(
-                worker_id=i,
-                root=root,
-                root_board=board,
-                evaluator=self.evaluator,
-                stats=stats,
-                target_sims=num_simulations,
-                completion_event=completion_event
-            )
-            worker.start()
-            workers.append(worker)
+        # Calculate new simulations needed
+        existing_visits = root.visit_count
+        target_new_sims = max(0, num_simulations - existing_visits)
 
-        completion_event.wait()
+        if target_new_sims > 0:
+            stats = defaultdict(int)
+            completion_event = threading.Event()
 
-        for worker in workers:
-            worker.stop()
+            self.evaluator.start()
+
+            workers = []
+            for i in range(self.num_workers):
+                worker = MCTSWorker(
+                    worker_id=i,
+                    root=root,
+                    root_board=board,
+                    evaluator=self.evaluator,
+                    cache=self.cache,
+                    stats=stats,
+                    target_sims=target_new_sims,
+                    completion_event=completion_event
+                )
+                worker.start()
+                workers.append(worker)
+
+            completion_event.wait()
+
+            for worker in workers:
+                worker.stop()
 
         # Return normalized visit counts
         total_visits = sum(child.visit_count for child in root.children.values())
+        if total_visits == 0:
+            return {}
+
         policy = {
             move: child.visit_count / total_visits
             for move, child in root.children.items()
@@ -504,28 +738,82 @@ class ParallelMCTS:
         return policy
 
 
-# === Board Tokenization (matches play.py) ===
+# === Board Tokenization ===
+# V1 (65 tokens): 64 squares + side-to-move
+# V2 (68 tokens): 64 squares + side + castling + ep + CLS
 
-def board_to_tokens(board: chess.Board) -> torch.Tensor:
-    """Convert chess board to token tensor for the neural network."""
+TOKEN_WHITE_TO_MOVE = 13
+TOKEN_BLACK_TO_MOVE = 14
+TOKEN_CASTLING_BASE = 15
+TOKEN_EP_NONE = 31
+TOKEN_EP_BASE = 32
+TOKEN_CLS = 40
+
+
+def board_to_tokens_v1(board: chess.Board) -> torch.Tensor:
+    """V1: 65 tokens (64 squares + side-to-move)."""
     tokens = []
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece is None:
             tokens.append(0)
         else:
-            # White pieces: 1-6, Black pieces: 7-12
             offset = 0 if piece.color else 6
             tokens.append(piece.piece_type + offset)
-    # Side to move token: 13 for white, 14 for black
     tokens.append(13 if board.turn else 14)
     return torch.tensor(tokens, dtype=torch.long)
+
+
+def board_to_tokens_v2(board: chess.Board) -> torch.Tensor:
+    """V2: 68 tokens (64 squares + side + castling + ep + CLS)."""
+    tokens = []
+
+    # Positions 0-63: piece placement
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece is None:
+            tokens.append(0)
+        else:
+            offset = 0 if piece.color else 6
+            tokens.append(piece.piece_type + offset)
+
+    # Position 64: side to move
+    tokens.append(TOKEN_WHITE_TO_MOVE if board.turn else TOKEN_BLACK_TO_MOVE)
+
+    # Position 65: castling rights (4-bit encoded)
+    castling_bits = (
+        (8 if board.has_kingside_castling_rights(chess.WHITE) else 0) |
+        (4 if board.has_queenside_castling_rights(chess.WHITE) else 0) |
+        (2 if board.has_kingside_castling_rights(chess.BLACK) else 0) |
+        (1 if board.has_queenside_castling_rights(chess.BLACK) else 0)
+    )
+    tokens.append(TOKEN_CASTLING_BASE + castling_bits)
+
+    # Position 66: en passant target file
+    if board.ep_square is not None:
+        ep_file = chess.square_file(board.ep_square)
+        tokens.append(TOKEN_EP_BASE + ep_file)
+    else:
+        tokens.append(TOKEN_EP_NONE)
+
+    # Position 67: CLS token
+    tokens.append(TOKEN_CLS)
+
+    return torch.tensor(tokens, dtype=torch.long)
+
+
+def board_to_tokens(board: chess.Board, seq_length: int = 68) -> torch.Tensor:
+    """Convert board to tokens using appropriate scheme based on seq_length."""
+    if seq_length == 65:
+        return board_to_tokens_v1(board)
+    else:
+        return board_to_tokens_v2(board)
 
 
 # === Demo / Testing ===
 
 def main():
-    """Demo: run MCTS on starting position."""
+    """Demo: run MCTS on starting position with tree reuse."""
     import sys
     sys.path.insert(0, '.')
 
@@ -554,9 +842,11 @@ def main():
     num_workers = 4 if device.type == 'cuda' else 2
     mcts = ParallelMCTS(model, device, num_workers=num_workers)
 
-    # Run search on starting position
+    # === First search: starting position ===
     board = chess.Board()
-    print(f"\nSearching starting position with {num_workers} workers...")
+    print(f"\n{'='*60}")
+    print(f"Search 1: Starting position with {num_workers} workers")
+    print(f"{'='*60}")
     print(board)
 
     start_time = time.time()
@@ -564,11 +854,57 @@ def main():
     elapsed = time.time() - start_time
 
     print(f"\nBest move: {best_move}")
-    print(f"Time: {elapsed:.2f}s")
-    print(f"Simulations: 400")
-    print(f"Sims/sec: {400/elapsed:.1f}")
-    print(f"Batches: {mcts.evaluator.total_batches}")
-    print(f"Avg batch size: {mcts.evaluator.total_evals / max(1, mcts.evaluator.total_batches):.1f}")
+    print(f"Time: {elapsed:.2f}s | Sims/sec: {400/elapsed:.1f}")
+    print(f"Root visits after search: {mcts.root.visit_count if mcts.root else 0}")
+    print(f"Cache: {mcts.cache.hits} hits, {mcts.cache.misses} misses ({mcts.cache.hit_rate:.1%})")
+
+    if best_move is None:
+        print("No legal moves found!")
+        return
+
+    # === Apply the best move and demonstrate tree reuse ===
+    print(f"\n{'='*60}")
+    print(f"Applying move {best_move} and reusing subtree...")
+    print(f"{'='*60}")
+
+    # Check visits in the child we're about to promote
+    if mcts.root and best_move in mcts.root.children:
+        child_visits_before = mcts.root.children[best_move].visit_count
+        print(f"Child '{best_move}' visits before apply_move: {child_visits_before}")
+
+    mcts.apply_move(best_move)
+    board.push(best_move)
+
+    print(f"Root visits after apply_move: {mcts.root.visit_count if mcts.root else 0}")
+    print(board)
+
+    # === Second search: after e2e4 (or whatever move was played) ===
+    print(f"\n{'='*60}")
+    print(f"Search 2: Position after {best_move} (tree reuse active)")
+    print(f"{'='*60}")
+
+    # Request 600 total simulations - some already exist from first search
+    existing = mcts.root.visit_count if mcts.root else 0
+    print(f"Existing visits: {existing}, requesting 600 total")
+
+    start_time = time.time()
+    best_move_2 = mcts.search(board, num_simulations=600)
+    elapsed = time.time() - start_time
+
+    new_visits = (mcts.root.visit_count if mcts.root else 0) - existing
+    print(f"\nBest move: {best_move_2}")
+    print(f"Time: {elapsed:.2f}s | New sims: {new_visits}")
+    print(f"Root visits after search: {mcts.root.visit_count if mcts.root else 0}")
+    print(f"Cache: {mcts.cache.hits} hits, {mcts.cache.misses} misses ({mcts.cache.hit_rate:.1%})")
+
+    # === Summary ===
+    print(f"\n{'='*60}")
+    print("Tree Reuse Summary:")
+    print(f"  - First search built tree with ~400 visits")
+    print(f"  - apply_move() preserved subtree under '{best_move}'")
+    print(f"  - Second search only needed ~{new_visits} new simulations")
+    print(f"  - Total evaluator batches: {mcts.evaluator.total_batches}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
