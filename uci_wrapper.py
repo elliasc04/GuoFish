@@ -13,10 +13,14 @@ import sys
 from typing import Optional
 
 import chess
+import chess.polyglot
 import torch
 
 from mcts import ParallelMCTS
 from play import load_model, ChessTransformerV2
+
+# Opening book path (Polyglot .bin format)
+OPENING_BOOK_PATH = "gm2001.bin"
 
 
 def log(msg: str):
@@ -61,6 +65,32 @@ class UCIEngine:
         # Track if we're continuing from the same game (for tree reuse)
         self._last_position_fen: Optional[str] = None
         self._last_moves: list[str] = []
+
+        # Opening book (lazy loaded)
+        self._book_reader: Optional[chess.polyglot.MemoryMappedReader] = None
+        self._book_loaded = False
+
+    def _probe_book(self) -> Optional[chess.Move]:
+        """Look up current position in opening book. Returns best move or None."""
+        # Lazy load the opening book
+        if not self._book_loaded:
+            self._book_loaded = True
+            if os.path.exists(OPENING_BOOK_PATH):
+                try:
+                    self._book_reader = chess.polyglot.open_reader(OPENING_BOOK_PATH)
+                except Exception:
+                    self._book_reader = None
+
+        if self._book_reader is None:
+            return None
+
+        try:
+            # Get weighted random move from book (more natural play)
+            entry = self._book_reader.weighted_choice(self.board)
+            return entry.move
+        except IndexError:
+            # Position not in book
+            return None
 
     def handle_uci(self):
         """Respond to 'uci' command with engine identification."""
@@ -212,6 +242,13 @@ class UCIEngine:
             movetime <ms> - Time for this move
             infinite - Search until 'stop' (not implemented, uses default)
         """
+        # Check opening book first
+        book_move = self._probe_book()
+        if book_move is not None:
+            log(f"bestmove {book_move.uci()}")
+            return
+
+        # Out of book - use MCTS
         if self.mcts is None:
             self._initialize_engine()
 
@@ -251,6 +288,8 @@ class UCIEngine:
 
     def handle_quit(self):
         """Clean shutdown."""
+        if self._book_reader is not None:
+            self._book_reader.close()
         if self.mcts is not None:
             self.mcts.shutdown()
         sys.exit(0)
