@@ -22,11 +22,12 @@ from torch.utils.data import DataLoader, TensorDataset
 # --- Model Definition ---
 
 class ChessTransformer(nn.Module):
-    def __init__(self, vocab_size=15, d_model=512, nhead=8, num_layers=8, dropout=0.1, head_dim=256):
+    def __init__(self, vocab_size=43, d_model=512, nhead=8, num_layers=8, dropout=0.1, head_dim=64):
         super().__init__()
+        self.seq_length = 68  # For MCTS compatibility
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.emb_dropout = nn.Dropout(dropout)
-        self.pos_encoder = nn.Parameter(torch.randn(1, 65, d_model) * 0.02)
+        self.pos_encoder = nn.Parameter(torch.randn(1, 68, d_model) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -52,8 +53,8 @@ class ChessTransformer(nn.Module):
         x = self.embedding(x) + self.pos_encoder
         x = self.emb_dropout(x)
         x = self.transformer(x)
-        pooled_state = x.mean(dim=1)
-        value = self.value_head(pooled_state).squeeze(-1)
+        cls_state = x[:, 67, :]  # CLS token at position 67
+        value = self.value_head(cls_state).squeeze(-1)
         x_squares = x[:, :64, :]
         from_feats = self.from_proj(x_squares)
         to_feats = self.to_proj(x_squares)
@@ -71,12 +72,13 @@ def log(msg: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Train ChessTransformer")
-    parser.add_argument("--data", type=str, default="data/lichess_processed_dataset.pt",
+    parser.add_argument("--data", type=str, default="data/lichess_processed_dataset_50k.pt",
                         help="Path to processed dataset")
     parser.add_argument("--epochs", type=int, default=15, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=870, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=768, help="Batch size")
     parser.add_argument("--lr", type=float, default=5e-4, help="Max learning rate for OneCycleLR")
     parser.add_argument("--workers", type=int, default=6, help="DataLoader workers")
+    parser.add_argument("--accum-steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     args = parser.parse_args()
 
@@ -137,6 +139,8 @@ def main():
     VALUE_LOSS_WEIGHT = 0.5
 
     num_batches = len(train_loader)
+    accum_steps = args.accum_steps
+    optimizer_steps_per_epoch = math.ceil(num_batches / accum_steps)
 
     start_epoch = 0
     best_val_loss = float('inf')
@@ -155,14 +159,16 @@ def main():
             log(f"WARNING: {args.resume} not found, starting fresh")
 
     # Initialize scheduler AFTER resume so we can set last_epoch correctly
-    steps_completed = start_epoch * num_batches
+    # OneCycleLR steps_per_epoch = optimizer steps, not micro-batches
+    optimizer_steps_completed = start_epoch * optimizer_steps_per_epoch
     scheduler = OneCycleLR(
-        optimizer, max_lr=args.lr, epochs=args.epochs, steps_per_epoch=num_batches,
-        last_epoch=steps_completed - 1 if steps_completed > 0 else -1
+        optimizer, max_lr=args.lr, epochs=args.epochs, steps_per_epoch=optimizer_steps_per_epoch,
+        last_epoch=optimizer_steps_completed - 1 if optimizer_steps_completed > 0 else -1
     )
 
+    effective_batch = args.batch_size * accum_steps
     log(f"\nTrain batches: {num_batches:,} | Val batches: {len(val_loader):,} | Epochs: {args.epochs}")
-    log(f"Batch size: {args.batch_size} | Max LR: {args.lr}")
+    log(f"Batch size: {args.batch_size} x {accum_steps} accum = {effective_batch} effective | Max LR: {args.lr}")
     log("=" * 80)
 
     # --- Training Loop ---
@@ -179,12 +185,20 @@ def main():
             correct_moves = 0
             total_positions = 0
 
+            optimizer_step_count = 0
+            # Accumulator for logging (tracks losses over accum window)
+            accum_loss = 0.0
+            accum_policy_loss = 0.0
+            accum_value_loss = 0.0
+
             for batch_idx, (tokens, target_moves, target_values) in enumerate(train_loader):
                 tokens = tokens.to(device, non_blocking=True)
                 target_moves = target_moves.to(device, non_blocking=True)
                 target_values = target_values.to(device, non_blocking=True)
 
-                optimizer.zero_grad(set_to_none=True)
+                # Zero gradients only at start of accumulation window
+                if batch_idx % accum_steps == 0:
+                    optimizer.zero_grad(set_to_none=True)
 
                 with autocast(device_type='cuda', dtype=torch.bfloat16):
                     policy_logits, predicted_values = model(tokens)
@@ -192,30 +206,53 @@ def main():
                     value_loss = value_criterion(predicted_values, target_values)
                     batch_loss = policy_loss + VALUE_LOSS_WEIGHT * value_loss
 
-                batch_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
+                # Scale loss for gradient accumulation
+                scaled_loss = batch_loss / accum_steps
+                scaled_loss.backward()
 
+                # Track metrics (unscaled for reporting)
                 total_loss += batch_loss.item()
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
+                accum_loss += batch_loss.item()
+                accum_policy_loss += policy_loss.item()
+                accum_value_loss += value_loss.item()
 
                 predictions = torch.argmax(policy_logits, dim=1)
                 correct_moves += (predictions == target_moves).sum().item()
                 total_positions += tokens.size(0)
 
-                if batch_idx % 100 == 0:
-                    current_acc = (correct_moves / total_positions) * 100
-                    current_lr = scheduler.get_last_lr()[0]
-                    elapsed = time.time() - epoch_start
-                    samples_per_sec = total_positions / elapsed if elapsed > 0 else 0
-                    log(
-                        f"Epoch {epoch+1}/{args.epochs} | Batch {batch_idx}/{num_batches} | "
-                        f"Loss: {batch_loss.item():.4f} (P: {policy_loss.item():.4f}, V: {value_loss.item():.4f}) | "
-                        f"Acc: {current_acc:.2f}% | LR: {current_lr:.2e} | "
-                        f"Time: {elapsed:.1f}s | {samples_per_sec:.0f} samples/s"
-                    )
+                # Optimizer step at accumulation boundary or end of epoch
+                is_accum_boundary = (batch_idx + 1) % accum_steps == 0
+                is_last_batch = (batch_idx + 1) == num_batches
+                if is_accum_boundary or is_last_batch:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer_step_count += 1
+
+                    # Log at optimizer step boundaries
+                    if optimizer_step_count % 100 == 0 or optimizer_step_count == 1:
+                        current_acc = (correct_moves / total_positions) * 100
+                        current_lr = scheduler.get_last_lr()[0]
+                        elapsed = time.time() - epoch_start
+                        samples_per_sec = total_positions / elapsed if elapsed > 0 else 0
+                        # Average over micro-batches in this accumulation window
+                        micro_batches_in_window = (batch_idx % accum_steps) + 1 if is_last_batch and not is_accum_boundary else accum_steps
+                        avg_loss = accum_loss / micro_batches_in_window
+                        avg_policy = accum_policy_loss / micro_batches_in_window
+                        avg_value = accum_value_loss / micro_batches_in_window
+                        log(
+                            f"Epoch {epoch+1}/{args.epochs} | Step {optimizer_step_count}/{optimizer_steps_per_epoch} | "
+                            f"Loss: {avg_loss:.4f} (P: {avg_policy:.4f}, V: {avg_value:.4f}) | "
+                            f"Acc: {current_acc:.2f}% | LR: {current_lr:.2e} | "
+                            f"Time: {elapsed:.1f}s | {samples_per_sec:.0f} samples/s"
+                        )
+
+                    # Reset accumulators for next window
+                    accum_loss = 0.0
+                    accum_policy_loss = 0.0
+                    accum_value_loss = 0.0
 
             train_time = time.time() - epoch_start
             train_acc = (correct_moves / total_positions) * 100
@@ -270,7 +307,7 @@ def main():
             if val_avg_loss < best_val_loss:
                 best_val_loss = val_avg_loss
                 params_str = f"{num_params // 1000}k" if num_params < 1_000_000 else f"{num_params / 1_000_000:.1f}M"
-                checkpoint_path = f"models/guofish_{params_str}_{val_acc:.1f}p.pt"
+                checkpoint_path = f"models/guofish2_{params_str}_{val_acc:.1f}p.pt"
 
                 torch.save({
                     'epoch': epoch + 1,

@@ -80,9 +80,15 @@ if __name__ == '__main__':
     print(f"Moves shape:  {moves_tensor.shape}")
     print(f"Values shape: {values_tensor.shape}")
 
+    # Sanity check: verify vocab_size and sequence length match pgn_parallel constants
+    print(f"\nSanity check:")
+    print(f"  Sequence length: {tokens_tensor.shape[1]} (expected: {pgn_parallel.SEQ_LENGTH})")
+    print(f"  Vocab size: {pgn_parallel.VOCAB_SIZE}")
+    print(f"  Token range in data: [{tokens_tensor.min().item()}, {tokens_tensor.max().item()}]")
+
     torch.save({
         'tokens': tokens_tensor,
         'moves':  moves_tensor,
         'values': values_tensor,
     }, 'data/lichess_processed_dataset.pt')
-    print("Saved tensors to lichess_processed_dataset.pt")
+    print("\nSaved tensors to lichess_processed_dataset.pt")
