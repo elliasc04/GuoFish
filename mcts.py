@@ -363,7 +363,8 @@ class MCTSWorker:
     def _run_simulation(self):
         """Run one MCTS simulation."""
         node = self.root
-        board = self.root_board.copy()
+        # stack=False skips cloning move history (much faster, we don't need undo)
+        board = self.root_board.copy(stack=False)
         path = [node]  # Track path for virtual loss
         depth = 0
 
@@ -462,29 +463,36 @@ class ParallelMCTS:
         # (set by ChessTransformerV1/V2 in play.py)
         self.seq_length: int = getattr(model, 'seq_length', 68)
 
-        # Auto-tune workers: more workers helps fill batches despite GIL
-        # Use many workers to keep the request queue full
+        # Auto-tune workers: more workers helps fill batches despite GIL on GPU.
+        # On CPU, more workers just thrash the GIL - keep it small.
         if num_workers is None:
-            num_workers = 32 if device.type == 'cuda' else 8
+            num_workers = 32 if device.type == 'cuda' else 2
         self.num_workers = num_workers
 
-        # Auto-tune batch size based on hardware
+        # Auto-tune batch size based on hardware.
+        # On CPU, batching provides little benefit (forward pass scales linearly),
+        # so keep batches small to avoid waiting.
         if max_batch_size is None:
             if device.type == 'cuda':
                 max_batch_size = 1024  # GPU can handle large batches
             else:
-                max_batch_size = 32  # CPU - keep it small
+                max_batch_size = 4  # CPU - minimal batching
 
-        # Min batch size - aim for good GPU utilization
-        # Larger min = better GPU efficiency but more latency
-        min_batch_size = max(4, num_workers)
+        # Min batch size - on CPU, don't wait for batches to fill.
+        # On GPU, larger min batches improve utilization.
+        if device.type == 'cuda':
+            min_batch_size = max(4, num_workers)
+            batch_timeout_ms = 100.0
+        else:
+            min_batch_size = 1  # Process immediately on CPU
+            batch_timeout_ms = 5.0  # Short timeout - don't block workers
 
         self.evaluator = BatchedEvaluator(
             model=model,
             device=device,
             max_batch_size=max_batch_size,
             min_batch_size=min_batch_size,
-            batch_timeout_ms=100.0,  # Wait up to 100ms to collect min_batch_size
+            batch_timeout_ms=batch_timeout_ms,
             seq_length=self.seq_length
         )
 
@@ -641,11 +649,12 @@ class ParallelMCTS:
         # Select best move (most visited)
         best_move, best_child = max(root.children.items(), key=lambda x: x[1].visit_count)
 
-        # Store evaluation stats for external access
-        # Q-values are from the perspective of the side that just moved TO this position
-        # So we negate to get perspective of side-to-move at root
-        self.last_root_q = root.q_value
-        self.last_best_child_q = -best_child.q_value  # Negate: child Q is from opponent's view
+        # Store evaluation stats from SIDE-TO-MOVE-AT-ROOT's (engine's) perspective.
+        # Convention: each node's q_value is from the MOVER's perspective (who moved TO that node).
+        # - root.q_value is from the opponent's view (they moved to reach root) -> negate
+        # - best_child.q_value is from engine's view (engine moves to reach child) -> use as-is
+        self.last_root_q = -root.q_value
+        self.last_best_child_q = best_child.q_value
 
         return best_move
 
@@ -660,7 +669,10 @@ class ParallelMCTS:
         legal_moves = list(board.legal_moves)
         root.expand(policy_logits[0], legal_moves)
         root.visit_count = 1
-        root.value_sum = value[0].item()
+        # Seed value in MOVER's perspective (same convention as backpropagate).
+        # NN outputs absolute value (White winning = +1). Mover to root = opponent of board.turn.
+        nn_value = value[0].item()
+        root.value_sum = nn_value if board.turn == chess.BLACK else -nn_value
 
     def get_policy(self, board: chess.Board, num_simulations: int = 800,
                    add_dirichlet_noise: bool = False) -> dict[chess.Move, float]:
@@ -734,6 +746,12 @@ class ParallelMCTS:
             move: child.visit_count / total_visits
             for move, child in root.children.items()
         }
+
+        # Update search stats so callers can read root/best-child Q-values
+        # Both stored from SIDE-TO-MOVE-AT-ROOT's (engine's) perspective.
+        best_child = max(root.children.values(), key=lambda c: c.visit_count)
+        self.last_root_q = -root.q_value  # root.q is from opponent's view -> negate
+        self.last_best_child_q = best_child.q_value  # child.q is from engine's view -> as-is
 
         return policy
 
