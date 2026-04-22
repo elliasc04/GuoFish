@@ -72,7 +72,7 @@ def log(msg: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Train ChessTransformer")
-    parser.add_argument("--data", type=str, default="data/lichess_processed_dataset_50k.pt",
+    parser.add_argument("--data", type=str, default="data/lichess_processed_dataset_150k.pt",
                         help="Path to processed dataset")
     parser.add_argument("--epochs", type=int, default=15, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=768, help="Batch size")
