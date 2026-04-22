@@ -231,28 +231,88 @@ def decode_move(index: int, board: chess.Board) -> chess.Move:
 
 
 def pick_engine_move(model: nn.Module, board: chess.Board, device: torch.device,
-                     mcts_engine=None, num_simulations: int = 800) -> tuple[chess.Move, dict]:
+                     mcts_engine=None, num_simulations: int = 800,
+                     temperature: float = 0.0, avoid_repetition: bool = True) -> tuple[chess.Move | None, dict]:
     """Pick engine move using either raw policy or MCTS.
+
+    Args:
+        temperature: Sampling temperature (0.0 = deterministic, higher = more random)
+        avoid_repetition: If True and winning, avoid moves that repeat positions
 
     Returns:
         tuple: (move, stats_dict) where stats_dict contains timing and search info
     """
+    import numpy as np
     start_time = time.time()
     stats = {}
 
     if mcts_engine is not None:
-        # Use MCTS search
-        move = mcts_engine.search(board, num_simulations=num_simulations)
+        # Use MCTS search - get policy distribution
+        policy_dict = mcts_engine.get_policy(board, num_simulations=num_simulations)
         elapsed = time.time() - start_time
 
-        # Get root node stats for display
+        if not policy_dict:
+            return None, stats
+
+        moves = list(policy_dict.keys())
+        visit_probs = np.array([policy_dict[m] for m in moves])
+
+        # Get eval from root Q-value.
+        # last_root_q is from engine's (side-to-move) perspective.
+        # Convert to absolute: positive = White winning, negative = Black winning.
+        root_q = mcts_engine.last_root_q
+        stats['eval'] = root_q if board.turn == chess.WHITE else -root_q
+
+        # Anti-repetition: only trigger when we're winning AND opponent has already
+        # caused a 2-fold repetition (one more repeat by us = 3-fold draw claim).
+        # Among moves MCTS considers near-co-best (>= 90% of best visits), avoid
+        # the ones that would complete the 3-fold repetition.
+        if avoid_repetition and root_q > 0.15 and board.is_repetition(2):
+            best_prob = np.max(visit_probs)
+            threshold = best_prob * 0.9  # Only moves MCTS considers near-equal to best
+            good_moves_mask = visit_probs >= threshold
+
+            # Check which moves would trigger a 3-fold repetition draw
+            repeats = []
+            for move in moves:
+                board.push(move)
+                repeats.append(board.is_repetition(3))
+                board.pop()
+
+            # Only penalize if there's at least one near-co-best move that doesn't draw
+            has_good_non_repeat = any(good_moves_mask[i] and not repeats[i]
+                                       for i in range(len(moves)))
+
+            if has_good_non_repeat:
+                for i in range(len(moves)):
+                    if good_moves_mask[i] and repeats[i]:
+                        visit_probs[i] *= 0.01
+
+                if visit_probs.sum() > 0:
+                    visit_probs = visit_probs / visit_probs.sum()
+                else:
+                    visit_probs = np.array([policy_dict[m] for m in moves])
+
+        # Apply temperature sampling
+        if temperature > 0.001:
+            # Transform visit probabilities with temperature
+            visit_counts = visit_probs * num_simulations  # Approximate counts
+            visit_counts = np.power(visit_counts, 1.0 / temperature)
+            visit_probs = visit_counts / visit_counts.sum()
+            move = np.random.choice(moves, p=visit_probs)
+            stats['sampled'] = True
+        else:
+            # Deterministic: pick most visited
+            move = moves[np.argmax(visit_probs)]
+            stats['sampled'] = False
+
+        # Get stats
         stats['time'] = elapsed
         stats['simulations'] = num_simulations
         stats['sims_per_sec'] = num_simulations / elapsed if elapsed > 0 else 0
         stats['batches'] = mcts_engine.evaluator.total_batches
         stats['avg_batch'] = (mcts_engine.evaluator.total_evals /
                               max(1, mcts_engine.evaluator.total_batches))
-        stats['eval'] = mcts_engine.last_best_child_q  # Q-value of chosen move
 
         # Reset evaluator stats for next move
         mcts_engine.evaluator.total_batches = 0
@@ -275,9 +335,11 @@ def pick_engine_move(model: nn.Module, board: chess.Board, device: torch.device,
         move = decode_move(best_index, board)
         elapsed = time.time() - start_time
 
+        # NN outputs absolute value already (White winning = +, Black winning = -).
         stats['time'] = elapsed
         stats['eval'] = value.item()
         stats['simulations'] = None
+        stats['sampled'] = False
 
     return move, stats
 
@@ -341,13 +403,33 @@ def main():
         print("Please enter 'w' or 'b'.")
 
     board = chess.Board()
-    print("\nStarting game. Enter moves in SAN (e.g. e4, Nf3, O-O). Type 'quit' to stop.\n")
+    print("\nStarting game. Enter moves in SAN (e.g. e4, Nf3, O-O).")
+    print("To inject an engine move, enter two moves: 'e4 e5' (your move, then engine's).")
+    print("Type 'undo' to rewind one full move, 'quit' to stop.\n")
 
-    # If the engine plays white, make its opening move first
+    # If the engine plays white, make its opening move first (with injection option)
     if human_side == chess.BLACK:
-        move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-        print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
-        board.push(move)
+        first_move_input = input("Engine's first move (press Enter for engine choice): ").strip()
+        if first_move_input:
+            try:
+                move = board.parse_san(first_move_input)
+                print(f"Engine plays: {board.san(move)}  [injected]\n")
+                board.push(move)
+            except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
+                print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
+                move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+                if move is None:
+                    print("Engine has no legal moves!")
+                    return
+                print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
+                board.push(move)
+        else:
+            move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+            if move is None:
+                print("Engine has no legal moves!")
+                return
+            print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
+            board.push(move)
 
     while True:
         raw = input("Your move: ").strip()
@@ -355,10 +437,57 @@ def main():
             print("Quitting.")
             return
 
+        # Handle undo command
+        if raw.lower() in ("undo", "back"):
+            if len(board.move_stack) >= 2:
+                # Undo both player and engine moves
+                undone_engine = board.pop()
+                undone_player = board.pop()
+                print(f"Undid: {undone_player} (you), {undone_engine} (engine)")
+                print(board)
+                print()
+            elif len(board.move_stack) == 1 and human_side == chess.BLACK:
+                # Undo just the engine's first move (playing as black)
+                undone_engine = board.pop()
+                print(f"Undid engine's first move: {undone_engine}")
+                print(board)
+                print()
+                # Re-prompt for engine's first move
+                first_move_input = input("Engine's first move (press Enter for engine choice): ").strip()
+                if first_move_input:
+                    try:
+                        move = board.parse_san(first_move_input)
+                        print(f"Engine plays: {board.san(move)}  [injected]\n")
+                        board.push(move)
+                    except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
+                        print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
+                        move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+                        if move is None:
+                            print("Engine has no legal moves!")
+                            return
+                        print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
+                        board.push(move)
+                else:
+                    move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+                    if move is None:
+                        print("Engine has no legal moves!")
+                        return
+                    print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
+                    board.push(move)
+            else:
+                print("Nothing to undo.")
+            continue
+
+        # Split input to check for injected engine move
+        parts = raw.split()
+        if not parts:
+            continue
+
+        # Parse user's move (first part)
         try:
-            human_move = board.parse_san(raw)
+            human_move = board.parse_san(parts[0])
         except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
-            print(f"Could not parse '{raw}' as a legal move ({type(e).__name__}). Try again.")
+            print(f"Could not parse '{parts[0]}' as a legal move ({type(e).__name__}). Try again.")
             continue
 
         board.push(human_move)
@@ -370,9 +499,27 @@ def main():
                 print("You win by checkmate!")
             return
 
-        engine_move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-        print(f"Engine plays: {board.san(engine_move)}  [{format_engine_stats(stats)}]\n")
-        board.push(engine_move)
+        # Check for injected engine move (second part)
+        injected_move = None
+        if len(parts) >= 2:
+            try:
+                injected_move = board.parse_san(parts[1])
+            except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
+                print(f"Could not parse injected move '{parts[1]}' ({type(e).__name__}). Engine will play normally.")
+                injected_move = None
+
+        if injected_move is not None:
+            # Use injected move instead of engine search
+            print(f"Engine plays: {board.san(injected_move)}  [injected]\n")
+            board.push(injected_move)
+        else:
+            # Normal engine move
+            engine_move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+            if engine_move is None:
+                print("Engine has no legal moves - game over!")
+                return
+            print(f"Engine plays: {board.san(engine_move)}  [{format_engine_stats(stats)}]\n")
+            board.push(engine_move)
 
         if board.is_game_over():
             outcome = board.outcome()
