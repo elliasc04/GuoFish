@@ -394,10 +394,35 @@ def format_engine_stats(stats: dict) -> str:
     return " | ".join(parts)
 
 
+class RestartGame(Exception):
+    """Raised from any input prompt to abort the current game and start a new one."""
+
+
+_RESTART_WORDS = {"new", "new game", "restart", "again", "play again"}
+
+
+def prompt(message: str) -> str:
+    """input() wrapper that raises RestartGame when the user types a restart keyword."""
+    value = input(message).strip()
+    if value.lower() in _RESTART_WORDS:
+        raise RestartGame()
+    return value
+
+
+def ask_play_again() -> bool:
+    while True:
+        ans = input("Play again? [y/n]: ").strip().lower()
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no", "quit", "exit"):
+            return False
+        print("Please enter 'y' or 'n'.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Play chess against ChessTransformer")
     parser.add_argument("checkpoint", type=Path, nargs="?",
-                        default=Path("models/guofish_25.8M_51.9p.pt"),
+                        default=Path("models/guofish2_25.6M_54.8p.pt"),
                         help="Path to model checkpoint")
     parser.add_argument("--mcts", action="store_true",
                         help="Use MCTS search instead of raw policy")
@@ -440,76 +465,49 @@ def main():
         else:
             print(f"Opening book not found at {args.book_path}, playing without book")
 
-    # Ask the user which side to play
+    # Outer restart loop — any input prompt can raise RestartGame to land back here.
     while True:
-        side_input = input("Play as white or black? [w/b]: ").strip().lower()
-        if side_input in ("w", "white"):
-            human_side = chess.WHITE
-            break
-        if side_input in ("b", "black"):
-            human_side = chess.BLACK
-            break
-        print("Please enter 'w' or 'b'.")
+        try:
+            # Ask the user which side to play
+            while True:
+                side_input = prompt("Play as white or black? [w/b]: ").lower()
+                if side_input in ("w", "white"):
+                    human_side = chess.WHITE
+                    break
+                if side_input in ("b", "black"):
+                    human_side = chess.BLACK
+                    break
+                print("Please enter 'w' or 'b'.")
 
-    board = chess.Board()
-    print("\nStarting game. Enter moves in SAN (e.g. e4, Nf3, O-O).")
-    print("To inject an engine move, enter two moves: 'e4 e5' (your move, then engine's).")
-    print("Type 'undo' to rewind one full move, 'quit' to stop.\n")
+            board = chess.Board()
+            print("\nStarting game. Enter moves in SAN (e.g. e4, Nf3, O-O).")
+            print("To inject an engine move, enter two moves: 'e4 e5' (your move, then engine's).")
+            print("Type 'undo' to rewind one full move, 'new' to start a new game, 'quit' to stop.\n")
 
-    def play_engine_move() -> bool:
-        """Probe book, else run engine search. Returns False if no legal moves."""
-        book_move = probe_opening_book(book_reader, board)
-        if book_move is not None:
-            print(f"Engine plays: {board.san(book_move)}  [book]\n")
-            board.push(book_move)
-            return True
-        move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-        if move is None:
-            print("Engine has no legal moves!")
-            return False
-        print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
-        board.push(move)
-        return True
-
-    # If the engine plays white, make its opening move first (with injection option)
-    if human_side == chess.BLACK:
-        first_move_input = input("Engine's first move (press Enter for engine choice): ").strip()
-        if first_move_input:
-            try:
-                move = board.parse_san(first_move_input)
-                print(f"Engine plays: {board.san(move)}  [injected]\n")
+            def play_engine_move() -> bool:
+                """Probe book, else run engine search. Returns False if no legal moves."""
+                book_move = probe_opening_book(book_reader, board)
+                if book_move is not None:
+                    print(f"Engine plays: {board.san(book_move)}  [book]\n")
+                    board.push(book_move)
+                    return True
+                move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+                if move is None:
+                    print("Engine has no legal moves!")
+                    return False
+                print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
                 board.push(move)
-            except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
-                print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
-                if not play_engine_move():
-                    return
-        else:
-            if not play_engine_move():
-                return
+                return True
 
-    while True:
-        raw = input("Your move: ").strip()
-        if raw.lower() in ("quit", "exit"):
-            print("Quitting.")
-            return
+            def end_game() -> None:
+                """Ask whether to play again. Returns via RestartGame if yes, else exits main()."""
+                if not ask_play_again():
+                    raise SystemExit(0)
+                raise RestartGame()
 
-        # Handle undo command
-        if raw.lower() in ("undo", "back"):
-            if len(board.move_stack) >= 2:
-                # Undo both player and engine moves
-                undone_engine = board.pop()
-                undone_player = board.pop()
-                print(f"Undid: {undone_player} (you), {undone_engine} (engine)")
-                print(board)
-                print()
-            elif len(board.move_stack) == 1 and human_side == chess.BLACK:
-                # Undo just the engine's first move (playing as black)
-                undone_engine = board.pop()
-                print(f"Undid engine's first move: {undone_engine}")
-                print(board)
-                print()
-                # Re-prompt for engine's first move
-                first_move_input = input("Engine's first move (press Enter for engine choice): ").strip()
+            # If the engine plays white, make its opening move first (with injection option)
+            if human_side == chess.BLACK:
+                first_move_input = prompt("Engine's first move (press Enter for engine choice): ")
                 if first_move_input:
                     try:
                         move = board.parse_san(first_move_input)
@@ -518,59 +516,98 @@ def main():
                     except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
                         print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
                         if not play_engine_move():
-                            return
+                            end_game()
                 else:
                     if not play_engine_move():
-                        return
-            else:
-                print("Nothing to undo.")
-            continue
+                        end_game()
 
-        # Split input to check for injected engine move
-        parts = raw.split()
-        if not parts:
-            continue
+            while True:
+                raw = prompt("Your move: ")
+                if raw.lower() in ("quit", "exit"):
+                    print("Quitting.")
+                    return
 
-        # Parse user's move (first part)
-        try:
-            human_move = board.parse_san(parts[0])
-        except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
-            print(f"Could not parse '{parts[0]}' as a legal move ({type(e).__name__}). Try again.")
-            continue
+                # Handle undo command
+                if raw.lower() in ("undo", "back"):
+                    if len(board.move_stack) >= 2:
+                        # Undo both player and engine moves
+                        undone_engine = board.pop()
+                        undone_player = board.pop()
+                        print(f"Undid: {undone_player} (you), {undone_engine} (engine)")
+                        print(board)
+                        print()
+                    elif len(board.move_stack) == 1 and human_side == chess.BLACK:
+                        # Undo just the engine's first move (playing as black)
+                        undone_engine = board.pop()
+                        print(f"Undid engine's first move: {undone_engine}")
+                        print(board)
+                        print()
+                        # Re-prompt for engine's first move
+                        first_move_input = prompt("Engine's first move (press Enter for engine choice): ")
+                        if first_move_input:
+                            try:
+                                move = board.parse_san(first_move_input)
+                                print(f"Engine plays: {board.san(move)}  [injected]\n")
+                                board.push(move)
+                            except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
+                                print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
+                                if not play_engine_move():
+                                    end_game()
+                        else:
+                            if not play_engine_move():
+                                end_game()
+                    else:
+                        print("Nothing to undo.")
+                    continue
 
-        board.push(human_move)
+                # Split input to check for injected engine move
+                parts = raw.split()
+                if not parts:
+                    continue
 
-        if board.is_game_over():
-            outcome = board.outcome()
-            print(f"Game over: {outcome.result() if outcome else 'unknown'}")
-            if board.is_checkmate():
-                print("You win by checkmate!")
-            return
+                # Parse user's move (first part)
+                try:
+                    human_move = board.parse_san(parts[0])
+                except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
+                    print(f"Could not parse '{parts[0]}' as a legal move ({type(e).__name__}). Try again.")
+                    continue
 
-        # Check for injected engine move (second part)
-        injected_move = None
-        if len(parts) >= 2:
-            try:
-                injected_move = board.parse_san(parts[1])
-            except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
-                print(f"Could not parse injected move '{parts[1]}' ({type(e).__name__}). Engine will play normally.")
+                board.push(human_move)
+
+                if board.is_game_over():
+                    outcome = board.outcome()
+                    print(f"Game over: {outcome.result() if outcome else 'unknown'}")
+                    if board.is_checkmate():
+                        print("You win by checkmate!")
+                    end_game()
+
+                # Check for injected engine move (second part)
                 injected_move = None
+                if len(parts) >= 2:
+                    try:
+                        injected_move = board.parse_san(parts[1])
+                    except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
+                        print(f"Could not parse injected move '{parts[1]}' ({type(e).__name__}). Engine will play normally.")
+                        injected_move = None
 
-        if injected_move is not None:
-            # Use injected move instead of engine search
-            print(f"Engine plays: {board.san(injected_move)}  [injected]\n")
-            board.push(injected_move)
-        else:
-            # Normal engine move (book first, then search)
-            if not play_engine_move():
-                return
+                if injected_move is not None:
+                    # Use injected move instead of engine search
+                    print(f"Engine plays: {board.san(injected_move)}  [injected]\n")
+                    board.push(injected_move)
+                else:
+                    # Normal engine move (book first, then search)
+                    if not play_engine_move():
+                        end_game()
 
-        if board.is_game_over():
-            outcome = board.outcome()
-            print(f"Game over: {outcome.result() if outcome else 'unknown'}")
-            if board.is_checkmate():
-                print("Engine wins by checkmate!")
-            return
+                if board.is_game_over():
+                    outcome = board.outcome()
+                    print(f"Game over: {outcome.result() if outcome else 'unknown'}")
+                    if board.is_checkmate():
+                        print("Engine wins by checkmate!")
+                    end_game()
+        except RestartGame:
+            print("\n--- Starting new game ---\n")
+            continue
 
 
 if __name__ == "__main__":
