@@ -13,6 +13,7 @@ Usage:
 """
 
 import math
+import os
 import threading
 import time
 from collections import defaultdict
@@ -175,8 +176,12 @@ class MCTSNode:
                 self.is_expanded = True
                 return
 
-            # Isolate, move to CPU, convert to float32, and Softmax
-            legal_logits = policy[legal_indices].float().cpu()
+            # Slice out logits for legal moves only, then softmax.
+            # Policy is already on CPU (evaluator does bulk D2H before distributing).
+            # .float() handles the GPU bf16 case; on CPU it's a no-op cast.
+            legal_logits = policy[legal_indices]
+            if legal_logits.dtype != torch.float32:
+                legal_logits = legal_logits.float()
             legal_probs = torch.softmax(legal_logits, dim=0).tolist()
 
             # Map the properly scaled probabilities to the children
@@ -215,21 +220,41 @@ class BatchedEvaluator:
 
     def __init__(self, model: torch.nn.Module, device: torch.device,
                  max_batch_size: int = 128, min_batch_size: int = 8,
-                 batch_timeout_ms: float = 50.0, seq_length: int = 68):
+                 batch_timeout_ms: float = 50.0, seq_length: int = 68,
+                 inline: bool = False):
         self.model = model
         self.device = device
         self.max_batch_size = max_batch_size
         self.min_batch_size = min_batch_size  # Wait for at least this many
         self.batch_timeout = batch_timeout_ms / 1000.0  # Convert to seconds
         self.seq_length = seq_length  # Tokenization scheme (65 or 68)
+        # When inline=True, workers call eval_inline() directly instead of going through
+        # the queue. Used on CPU where batching is counterproductive and thread handoffs
+        # dominate the per-sim cost.
+        self.inline = inline
 
         self.request_queue: Queue[EvalRequest] = Queue()
         self.running = False
         self.thread: Optional[threading.Thread] = None
+        # Stats lock — incremented by all workers in inline mode
+        self._stats_lock = threading.Lock()
 
         # Stats
         self.total_evals = 0
         self.total_batches = 0
+
+    def eval_inline(self, tokens: torch.Tensor) -> tuple[torch.Tensor, float]:
+        """Synchronous single-position evaluation. Used in inline mode (CPU).
+
+        Each worker calls this on its own thread; PyTorch releases the GIL during
+        the forward pass, so N workers run N parallel forward passes on N cores.
+        """
+        with torch.no_grad():
+            policy_logits, values = self.model(tokens.unsqueeze(0))
+        with self._stats_lock:
+            self.total_evals += 1
+            self.total_batches += 1
+        return policy_logits[0], values[0].item()
 
     def start(self):
         """Start the evaluator thread."""
@@ -416,14 +441,19 @@ class MCTSWorker:
             # Cache hit - use cached policy and value
             policy, nn_value = cached
         else:
-            # Cache miss - submit to evaluator
             tokens = board_to_tokens(board, self.evaluator.seq_length)
-            request = EvalRequest(node=node, tokens=tokens)
-            self.evaluator.submit(request)
-            request.event.wait()  # Block until evaluated
 
-            policy = request.policy
-            nn_value = request.value if request.value is not None else 0.0
+            if self.evaluator.inline:
+                # CPU path: run forward pass on this worker's thread (no queueing).
+                # PyTorch releases the GIL during the forward, so workers run in parallel.
+                policy, nn_value = self.evaluator.eval_inline(tokens)
+            else:
+                # GPU path: submit to batched evaluator
+                request = EvalRequest(node=node, tokens=tokens)
+                self.evaluator.submit(request)
+                request.event.wait()  # Block until evaluated
+                policy = request.policy
+                nn_value = request.value if request.value is not None else 0.0
 
             # Store in cache (policy logits, not softmax'd)
             if policy is not None:
@@ -463,11 +493,21 @@ class ParallelMCTS:
         # (set by ChessTransformerV1/V2 in play.py)
         self.seq_length: int = getattr(model, 'seq_length', 68)
 
-        # Auto-tune workers: more workers helps fill batches despite GIL on GPU.
-        # On CPU, more workers just thrash the GIL - keep it small.
+        # Auto-tune workers based on hardware.
+        # GPU: many workers feed the batched evaluator despite the GIL (forward pass
+        #      releases it, so workers can build up requests in parallel).
+        # CPU: one worker per core, each runs its own forward pass inline. Pin
+        #      torch.set_num_threads(1) so N workers don't oversubscribe — true
+        #      parallelism comes from N workers, not intra-op threading.
         if num_workers is None:
-            num_workers = 32 if device.type == 'cuda' else 2
+            num_workers = 32 if device.type == 'cuda' else (os.cpu_count() or 4)
         self.num_workers = num_workers
+
+        if device.type == 'cpu':
+            # Each worker's forward pass uses one thread; parallelism comes from
+            # running num_workers forward passes concurrently. Without this, every
+            # forward pass tries to fan out across all cores and they all collide.
+            torch.set_num_threads(1)
 
         # Auto-tune batch size based on hardware.
         # On CPU, batching provides little benefit (forward pass scales linearly),
@@ -476,7 +516,7 @@ class ParallelMCTS:
             if device.type == 'cuda':
                 max_batch_size = 1024  # GPU can handle large batches
             else:
-                max_batch_size = 4  # CPU - minimal batching
+                max_batch_size = 1  # CPU runs inline (no batching)
 
         # Min batch size - on CPU, don't wait for batches to fill.
         # On GPU, larger min batches improve utilization.
@@ -493,7 +533,8 @@ class ParallelMCTS:
             max_batch_size=max_batch_size,
             min_batch_size=min_batch_size,
             batch_timeout_ms=batch_timeout_ms,
-            seq_length=self.seq_length
+            seq_length=self.seq_length,
+            inline=(device.type == 'cpu'),
         )
 
         # Transposition cache for NN evaluations (persists across searches)
@@ -617,8 +658,9 @@ class ParallelMCTS:
         stats = defaultdict(int)
         completion_event = threading.Event()
 
-        # Start evaluator (keeps running across searches)
-        self.evaluator.start()
+        # Start evaluator (keeps running across searches). No-op in inline mode.
+        if not self.evaluator.inline:
+            self.evaluator.start()
 
         # Start workers
         workers = []
@@ -715,7 +757,8 @@ class ParallelMCTS:
             stats = defaultdict(int)
             completion_event = threading.Event()
 
-            self.evaluator.start()
+            if not self.evaluator.inline:
+                self.evaluator.start()
 
             workers = []
             for i in range(self.num_workers):
@@ -769,34 +812,30 @@ TOKEN_CLS = 40
 
 
 def board_to_tokens_v1(board: chess.Board) -> torch.Tensor:
-    """V1: 65 tokens (64 squares + side-to-move)."""
-    tokens = []
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece is None:
-            tokens.append(0)
-        else:
-            offset = 0 if piece.color else 6
-            tokens.append(piece.piece_type + offset)
-    tokens.append(13 if board.turn else 14)
-    return torch.tensor(tokens, dtype=torch.long)
+    """V1: 65 tokens (64 squares + side-to-move).
+
+    Iterates only occupied squares via piece_map() — empty squares stay zero from
+    the preallocated tensor, avoiding 64 piece_at() calls per leaf.
+    """
+    tokens = torch.zeros(65, dtype=torch.long)
+    for square, piece in board.piece_map().items():
+        offset = 0 if piece.color else 6
+        tokens[square] = piece.piece_type + offset
+    tokens[64] = 13 if board.turn else 14
+    return tokens
 
 
 def board_to_tokens_v2(board: chess.Board) -> torch.Tensor:
     """V2: 68 tokens (64 squares + side + castling + ep + CLS)."""
-    tokens = []
+    tokens = torch.zeros(68, dtype=torch.long)
 
-    # Positions 0-63: piece placement
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece is None:
-            tokens.append(0)
-        else:
-            offset = 0 if piece.color else 6
-            tokens.append(piece.piece_type + offset)
+    # Positions 0-63: piece placement (only occupied squares; empties stay 0)
+    for square, piece in board.piece_map().items():
+        offset = 0 if piece.color else 6
+        tokens[square] = piece.piece_type + offset
 
     # Position 64: side to move
-    tokens.append(TOKEN_WHITE_TO_MOVE if board.turn else TOKEN_BLACK_TO_MOVE)
+    tokens[64] = TOKEN_WHITE_TO_MOVE if board.turn else TOKEN_BLACK_TO_MOVE
 
     # Position 65: castling rights (4-bit encoded)
     castling_bits = (
@@ -805,19 +844,18 @@ def board_to_tokens_v2(board: chess.Board) -> torch.Tensor:
         (2 if board.has_kingside_castling_rights(chess.BLACK) else 0) |
         (1 if board.has_queenside_castling_rights(chess.BLACK) else 0)
     )
-    tokens.append(TOKEN_CASTLING_BASE + castling_bits)
+    tokens[65] = TOKEN_CASTLING_BASE + castling_bits
 
     # Position 66: en passant target file
     if board.ep_square is not None:
-        ep_file = chess.square_file(board.ep_square)
-        tokens.append(TOKEN_EP_BASE + ep_file)
+        tokens[66] = TOKEN_EP_BASE + chess.square_file(board.ep_square)
     else:
-        tokens.append(TOKEN_EP_NONE)
+        tokens[66] = TOKEN_EP_NONE
 
     # Position 67: CLS token
-    tokens.append(TOKEN_CLS)
+    tokens[67] = TOKEN_CLS
 
-    return torch.tensor(tokens, dtype=torch.long)
+    return tokens
 
 
 def board_to_tokens(board: chess.Board, seq_length: int = 68) -> torch.Tensor:

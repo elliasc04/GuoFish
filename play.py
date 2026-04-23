@@ -13,8 +13,10 @@ import argparse
 import math
 import time
 from pathlib import Path
+from typing import Optional
 
 import chess
+import chess.polyglot
 import torch
 import torch.nn as nn
 
@@ -138,6 +140,24 @@ def load_model(checkpoint_path: Path, device: torch.device) -> nn.Module:
 
     model.load_state_dict(state_dict)
     model.eval()
+
+    if device.type == "cpu":
+        # Dynamic INT8 quantization on all Linear layers (FFN, attention out_proj,
+        # value/policy heads). Weights are stored as INT8 with per-batch activation
+        # quantization. Typically 2-4x faster on CPU with negligible accuracy loss.
+        seq_length = model.seq_length
+        model = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+        model.seq_length = seq_length
+
+        # After quantization, Linear.weight becomes a method (returns dequantized weight
+        # on demand) instead of a tensor attribute. nn.TransformerEncoderLayer's fast-path
+        # eligibility check iterates `tensor_args` and reads `.device.type`, which crashes
+        # on the methodified weights. Trip an earlier short-circuit in the fast-path check
+        # so the device probe never runs — the slow path uses self.activation (still the
+        # real GELU), so this only affects the fast-path decision, not the math.
+        for layer in model.transformer.layers:
+            layer.activation_relu_or_gelu = False
+
     return model
 
 
@@ -344,6 +364,18 @@ def pick_engine_move(model: nn.Module, board: chess.Board, device: torch.device,
     return move, stats
 
 
+def probe_opening_book(book_reader: Optional[chess.polyglot.MemoryMappedReader],
+                       board: chess.Board) -> Optional[chess.Move]:
+    """Look up current position in opening book. Returns weighted-random book move or None."""
+    if book_reader is None:
+        return None
+    try:
+        entry = book_reader.weighted_choice(board)
+        return entry.move
+    except IndexError:
+        return None
+
+
 def format_engine_stats(stats: dict) -> str:
     """Format engine stats for display."""
     parts = []
@@ -373,6 +405,10 @@ def main():
                         help="Number of MCTS simulations per move (default: 800)")
     parser.add_argument("--workers", type=int, default=None,
                         help="Number of MCTS worker threads (default: auto)")
+    parser.add_argument("--book", action="store_true",
+                        help="Use opening book for early moves")
+    parser.add_argument("--book-path", type=Path, default=Path("gm2001.bin"),
+                        help="Path to Polyglot opening book .bin file (default: gm2001.bin)")
     args = parser.parse_args()
 
     if not args.checkpoint.exists():
@@ -391,6 +427,19 @@ def main():
         print(f"MCTS enabled: {args.simulations} simulations, {mcts_engine.num_workers} workers, "
               f"batch size {mcts_engine.evaluator.min_batch_size}-{mcts_engine.evaluator.max_batch_size}")
 
+    # Initialize opening book if requested
+    book_reader: Optional[chess.polyglot.MemoryMappedReader] = None
+    if args.book:
+        if args.book_path.exists():
+            try:
+                book_reader = chess.polyglot.open_reader(str(args.book_path))
+                print(f"Opening book loaded: {args.book_path}")
+            except Exception as e:
+                print(f"Failed to load opening book {args.book_path}: {e}")
+                book_reader = None
+        else:
+            print(f"Opening book not found at {args.book_path}, playing without book")
+
     # Ask the user which side to play
     while True:
         side_input = input("Play as white or black? [w/b]: ").strip().lower()
@@ -407,6 +456,21 @@ def main():
     print("To inject an engine move, enter two moves: 'e4 e5' (your move, then engine's).")
     print("Type 'undo' to rewind one full move, 'quit' to stop.\n")
 
+    def play_engine_move() -> bool:
+        """Probe book, else run engine search. Returns False if no legal moves."""
+        book_move = probe_opening_book(book_reader, board)
+        if book_move is not None:
+            print(f"Engine plays: {board.san(book_move)}  [book]\n")
+            board.push(book_move)
+            return True
+        move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
+        if move is None:
+            print("Engine has no legal moves!")
+            return False
+        print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
+        board.push(move)
+        return True
+
     # If the engine plays white, make its opening move first (with injection option)
     if human_side == chess.BLACK:
         first_move_input = input("Engine's first move (press Enter for engine choice): ").strip()
@@ -417,19 +481,11 @@ def main():
                 board.push(move)
             except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
                 print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
-                move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-                if move is None:
-                    print("Engine has no legal moves!")
+                if not play_engine_move():
                     return
-                print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
-                board.push(move)
         else:
-            move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-            if move is None:
-                print("Engine has no legal moves!")
+            if not play_engine_move():
                 return
-            print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
-            board.push(move)
 
     while True:
         raw = input("Your move: ").strip()
@@ -461,19 +517,11 @@ def main():
                         board.push(move)
                     except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
                         print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
-                        move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-                        if move is None:
-                            print("Engine has no legal moves!")
+                        if not play_engine_move():
                             return
-                        print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
-                        board.push(move)
                 else:
-                    move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-                    if move is None:
-                        print("Engine has no legal moves!")
+                    if not play_engine_move():
                         return
-                    print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
-                    board.push(move)
             else:
                 print("Nothing to undo.")
             continue
@@ -513,13 +561,9 @@ def main():
             print(f"Engine plays: {board.san(injected_move)}  [injected]\n")
             board.push(injected_move)
         else:
-            # Normal engine move
-            engine_move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
-            if engine_move is None:
-                print("Engine has no legal moves - game over!")
+            # Normal engine move (book first, then search)
+            if not play_engine_move():
                 return
-            print(f"Engine plays: {board.san(engine_move)}  [{format_engine_stats(stats)}]\n")
-            board.push(engine_move)
 
         if board.is_game_over():
             outcome = board.outcome()
