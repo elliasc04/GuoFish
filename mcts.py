@@ -378,12 +378,21 @@ class MCTSWorker:
 
     def _work_loop(self):
         """Main work loop - select, expand, evaluate, backprop."""
-        while self.running:
-            # Check if we've hit the target
-            if self.stats['simulations'] >= self.target_sims:
-                self.completion_event.set()
-                break
-            self._run_simulation()
+        try:
+            while self.running:
+                # Check if we've hit the target
+                if self.stats['simulations'] >= self.target_sims:
+                    self.completion_event.set()
+                    break
+                self._run_simulation()
+        except Exception as e:
+            # Log to stderr so it's visible in Cutechess debug output.
+            # Set completion_event so the main thread doesn't hang forever.
+            import sys, traceback
+            print(f"[mcts worker {self.worker_id}] {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
+            self.completion_event.set()
 
     def _run_simulation(self):
         """Run one MCTS simulation."""
@@ -627,6 +636,11 @@ class ParallelMCTS:
             root = self.root
             # Defensive: ensure no stale virtual losses from previous search
             self._reset_virtual_loss(root)
+            # If this node was an unexplored leaf in the prior tree, it has no
+            # children yet. Expand now so max(root.children) doesn't return None
+            # (which would produce an illegal "0000" bestmove).
+            if not root.is_expanded:
+                self._expand_root(root, board)
         else:
             # Create fresh root
             root = MCTSNode()
@@ -736,6 +750,10 @@ class ParallelMCTS:
         if self.root is not None and self._root_hash == board_hash:
             root = self.root
             self._reset_virtual_loss(root)
+            # If this node was an unexplored leaf in the prior tree, expand now
+            # so root.children is populated before the search proceeds.
+            if not root.is_expanded:
+                self._expand_root(root, board)
         else:
             root = MCTSNode()
             self._expand_root(root, board)
