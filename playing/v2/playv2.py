@@ -401,6 +401,44 @@ def format_engine_stats(stats: dict) -> str:
     return " | ".join(parts)
 
 
+def format_move_history(board: chess.Board, last_n: int = 8) -> str:
+    """Return the last last_n plies of the game in PGN-style notation."""
+    moves = list(board.move_stack)
+    if not moves:
+        return "(start of game)"
+
+    # Replay from scratch to get SAN for each ply
+    tmp = chess.Board()
+    san_list = []
+    for move in moves:
+        san_list.append(tmp.san(move))
+        tmp.push(move)
+
+    start_ply = max(0, len(san_list) - last_n)
+    recent = san_list[start_ply:]
+
+    parts = []
+    move_num = (start_ply // 2) + 1
+    i = 0
+
+    if start_ply % 2 == 1:
+        # First shown ply is Black's move
+        parts.append(f"{move_num}...{recent[0]}")
+        i, move_num = 1, move_num + 1
+
+    while i < len(recent):
+        white = recent[i]
+        if i + 1 < len(recent):
+            parts.append(f"{move_num}.{white} {recent[i + 1]}")
+            i += 2
+        else:
+            parts.append(f"{move_num}.{white}")
+            i += 1
+        move_num += 1
+
+    return " ".join(parts)
+
+
 class RestartGame(Exception):
     """Raised from any input prompt to abort the current game and start a new one."""
 
@@ -543,12 +581,14 @@ def main():
                         undone_player = board.pop()
                         print(f"Undid: {undone_player} (you), {undone_engine} (engine)")
                         print(board)
+                        print(f"History: {format_move_history(board)}")
                         print()
                     elif len(board.move_stack) == 1 and human_side == chess.BLACK:
                         # Undo just the engine's first move (playing as black)
                         undone_engine = board.pop()
                         print(f"Undid engine's first move: {undone_engine}")
                         print(board)
+                        print(f"History: {format_move_history(board)}")
                         print()
                         # Re-prompt for engine's first move
                         first_move_input = prompt("Engine's first move (press Enter for engine choice): ")
