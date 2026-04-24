@@ -1,26 +1,32 @@
 """UCI (Universal Chess Interface) protocol wrapper for Guofish2 chess engine.
 
 Usage:
-    python uci_wrapper.py
+    python uci_wrapper.py                                      # auto-detect latest checkpoint
+    python uci_wrapper.py --model models/guofish2_25.6M_54.8p.pt
 
 This allows the engine to be used with UCI-compatible GUIs and tournament
 managers like Cutechess, Arena, or lichess-bot.
 """
 
+import argparse
+import contextlib
 import glob
+import io
 import os
 import sys
+import traceback
 from typing import Optional
 
 import chess
-import chess.polyglot
 import torch
 
 from mcts import ParallelMCTS
 from play import load_model, ChessTransformerV2
 
-# Opening book path (Polyglot .bin format)
-OPENING_BOOK_PATH = "gm2001.bin"
+
+def err(msg: str):
+    """Print to stderr (visible in Cutechess debug log; does not pollute UCI stdout)."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 def log(msg: str):
@@ -56,7 +62,12 @@ def find_latest_checkpoint(models_dir: str = "models") -> Optional[str]:
 class UCIEngine:
     """UCI protocol handler for Guofish2."""
 
-    def __init__(self):
+    def __init__(self, model_path: Optional[str] = None, num_workers: int = 32,
+                 sim_cap: int = 10000):
+        # Optional explicit checkpoint path; if None, auto-detects latest.
+        self.model_path: Optional[str] = model_path
+        self.num_workers: int = num_workers
+        self.sim_cap: int = sim_cap
         self.model: Optional[torch.nn.Module] = None
         self.mcts: Optional[ParallelMCTS] = None
         self.device: Optional[torch.device] = None
@@ -65,32 +76,6 @@ class UCIEngine:
         # Track if we're continuing from the same game (for tree reuse)
         self._last_position_fen: Optional[str] = None
         self._last_moves: list[str] = []
-
-        # Opening book (lazy loaded)
-        self._book_reader: Optional[chess.polyglot.MemoryMappedReader] = None
-        self._book_loaded = False
-
-    def _probe_book(self) -> Optional[chess.Move]:
-        """Look up current position in opening book. Returns best move or None."""
-        # Lazy load the opening book
-        if not self._book_loaded:
-            self._book_loaded = True
-            if os.path.exists(OPENING_BOOK_PATH):
-                try:
-                    self._book_reader = chess.polyglot.open_reader(OPENING_BOOK_PATH)
-                except Exception:
-                    self._book_reader = None
-
-        if self._book_reader is None:
-            return None
-
-        try:
-            # Get weighted random move from book (more natural play)
-            entry = self._book_reader.weighted_choice(self.board)
-            return entry.move
-        except IndexError:
-            # Position not in book
-            return None
 
     def handle_uci(self):
         """Respond to 'uci' command with engine identification."""
@@ -106,32 +91,46 @@ class UCIEngine:
 
     def _initialize_engine(self):
         """Load the model and set up MCTS."""
-        # Determine device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Force CUDA - UCI wrapper is GPU-only.
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available - uci_wrapper.py requires a GPU.")
+        self.device = torch.device("cuda")
 
-        # Find and load checkpoint (auto-detects V1 vs V2 architecture)
-        checkpoint_path = find_latest_checkpoint()
+        # Use explicit model path if provided, else auto-detect latest checkpoint
+        if self.model_path is not None:
+            if not os.path.exists(self.model_path):
+                raise FileNotFoundError(f"Model checkpoint not found: {self.model_path}")
+            checkpoint_path = self.model_path
+        else:
+            checkpoint_path = find_latest_checkpoint()
+
+        err(f"[init] device={self.device} checkpoint={checkpoint_path}")
+
+        # load_model prints to stdout (corrupts UCI stream). Redirect to stderr.
+        buf = io.StringIO()
         if checkpoint_path is None:
             # Fall back to random weights if no checkpoint found
             self.model = ChessTransformerV2().to(self.device)
             self.model.eval()
         else:
             from pathlib import Path
-            self.model = load_model(Path(checkpoint_path), self.device)
+            with contextlib.redirect_stdout(buf):
+                self.model = load_model(Path(checkpoint_path), self.device)
+        for line in buf.getvalue().splitlines():
+            err(f"[load_model] {line}")
 
-        # Apply torch.compile for inference optimization (PyTorch 2.0+)
-        try:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
-        except Exception:
-            # torch.compile may not be available or may fail on some systems
-            pass
+        # NOTE: torch.compile(mode="reduce-overhead") removed - it hangs on Windows
+        # due to missing/flaky Triton support. Eager mode is fast enough on GPU.
 
-        # Initialize parallel MCTS
+        # Initialize parallel MCTS. num_workers is configurable so CuteChess can
+        # scale it down when running many concurrent games (otherwise N games ×
+        # 32 workers thrashes the GIL and cores).
         self.mcts = ParallelMCTS(
             model=self.model,
             device=self.device,
-            num_workers=32 if self.device.type == 'cuda' else 8,
+            num_workers=self.num_workers,
         )
+        err(f"[init] MCTS ready (workers={self.num_workers}, sim_cap={self.sim_cap})")
 
     def handle_ucinewgame(self):
         """Handle 'ucinewgame' command - reset state for a new game."""
@@ -242,18 +241,12 @@ class UCIEngine:
             movetime <ms> - Time for this move
             infinite - Search until 'stop' (not implemented, uses default)
         """
-        # Check opening book first
-        book_move = self._probe_book()
-        if book_move is not None:
-            log(f"bestmove {book_move.uci()}")
-            return
-
-        # Out of book - use MCTS
+        # Opening book disabled - uci_wrapper.py is eval-only, openings come from Cutechess.
         if self.mcts is None:
             self._initialize_engine()
 
         # Parse arguments
-        num_simulations = 800  # Default fallback
+        num_simulations = 5000  # Default fallback
 
         i = 0
         while i < len(args):
@@ -275,10 +268,16 @@ class UCIEngine:
                 i += 1
 
         # Clamp simulations to reasonable range
-        num_simulations = max(1, min(num_simulations, 100000))
+        num_simulations = max(1, min(num_simulations, self.sim_cap))
 
         # Run search
         best_move = self.mcts.search(self.board, num_simulations=num_simulations)
+
+        # Emit evaluation info for Cutechess adjudication.
+        # last_best_child_q is in [-1.0, 1.0] from engine's perspective; scale to centipawns.
+        q_value = self.mcts.last_best_child_q
+        cp_score = int(q_value * 1000)
+        log(f"info depth 1 score cp {cp_score}")
 
         if best_move is not None:
             log(f"bestmove {best_move.uci()}")
@@ -288,8 +287,6 @@ class UCIEngine:
 
     def handle_quit(self):
         """Clean shutdown."""
-        if self._book_reader is not None:
-            self._book_reader.close()
         if self.mcts is not None:
             self.mcts.shutdown()
         sys.exit(0)
@@ -331,14 +328,33 @@ class UCIEngine:
                     # Options not implemented yet - silently ignore
                     pass
                 # Unknown commands are silently ignored (UCI spec compliant)
-            except Exception:
-                # Catch any errors to prevent crashes during tournament play
-                # UCI protocol doesn't have a standard error reporting mechanism
-                pass
+            except Exception as e:
+                # Log errors to stderr (visible in Cutechess debug output).
+                # Still emit a fallback bestmove for 'go' so Cutechess doesn't hang.
+                err(f"[error] command={command} exception={type(e).__name__}: {e}")
+                err(traceback.format_exc())
+                if command == "go":
+                    # Pick any legal move so the game can continue / be adjudicated
+                    fallback = next(iter(self.board.legal_moves), None)
+                    if fallback is not None:
+                        log(f"bestmove {fallback.uci()}")
+                    else:
+                        log("bestmove 0000")
 
 
 def main():
-    engine = UCIEngine()
+    parser = argparse.ArgumentParser(description="UCI wrapper for Guofish2")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to model checkpoint (default: auto-detect latest)")
+    parser.add_argument("--workers", type=int, default=32,
+                        help="MCTS worker threads per engine instance. Lower this when "
+                             "running many concurrent games (default: 32)")
+    parser.add_argument("--sim-cap", type=int, default=10000,
+                        help="Upper bound on 'go nodes N' (default: 10000)")
+    args = parser.parse_args()
+
+    engine = UCIEngine(model_path=args.model, num_workers=args.workers,
+                       sim_cap=args.sim_cap)
     engine.run()
 
 
