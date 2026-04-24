@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import sys
 import time
 from multiprocessing import Pool
 
@@ -8,10 +9,17 @@ import torch
 
 import chess
 import chess.pgn
-import pgn_parallel  # worker lives in a .py module (spawn semantics on Windows)
 
-PGN_PATH = Path('data/lichess_elite_2020-08.pgn')
-OUT_DIR  = Path('data/processed')
+# Make the project root importable so spawned workers can resolve
+# data.pgn_parallel on Windows (which uses spawn-style multiprocessing).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from data import pgn_parallel  # worker lives in a .py module (spawn semantics on Windows)
+
+PGN_PATH = _PROJECT_ROOT / 'data' / 'processed' / 'lichess_elite_2020-08.pgn'
+OUT_DIR  = _PROJECT_ROOT / 'data' / 'processed'
 
 NUM_GAMES = 150000
 
@@ -86,9 +94,10 @@ if __name__ == '__main__':
     print(f"  Vocab size: {pgn_parallel.VOCAB_SIZE}")
     print(f"  Token range in data: [{tokens_tensor.min().item()}, {tokens_tensor.max().item()}]")
 
+    out_path = _PROJECT_ROOT / 'data' / 'processed' / 'lichess_processed_dataset.pt'
     torch.save({
         'tokens': tokens_tensor,
         'moves':  moves_tensor,
         'values': values_tensor,
-    }, 'data/lichess_processed_dataset.pt')
-    print("\nSaved tensors to lichess_processed_dataset.pt")
+    }, out_path)
+    print(f"\nSaved tensors to {out_path}")

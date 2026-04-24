@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,9 @@ import torch.optim as optim
 from torch.amp.autocast_mode import autocast
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader, TensorDataset
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 # --- Model Definition ---
@@ -72,7 +76,8 @@ def log(msg: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Train ChessTransformer")
-    parser.add_argument("--data", type=str, default="data/lichess_processed_dataset_150k.pt",
+    parser.add_argument("--data", type=str,
+                        default=str(_PROJECT_ROOT / "data" / "processed" / "lichess_processed_dataset_150k.pt"),
                         help="Path to processed dataset")
     parser.add_argument("--epochs", type=int, default=15, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=768, help="Batch size")
@@ -86,7 +91,8 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     # Create models directory
-    os.makedirs('models', exist_ok=True)
+    models_dir = _PROJECT_ROOT / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Load Data ---
     log(f"Loading data from {args.data}...")
@@ -307,7 +313,7 @@ def main():
             if val_avg_loss < best_val_loss:
                 best_val_loss = val_avg_loss
                 params_str = f"{num_params // 1000}k" if num_params < 1_000_000 else f"{num_params / 1_000_000:.1f}M"
-                checkpoint_path = f"models/guofish2_{params_str}_{val_acc:.1f}p.pt"
+                checkpoint_path = str(models_dir / f"guofish2_{params_str}_{val_acc:.1f}p.pt")
 
                 torch.save({
                     'epoch': epoch + 1,

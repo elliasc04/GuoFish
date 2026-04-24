@@ -12,17 +12,18 @@ import torch
 import torch.nn as nn
 
 
-CHECKPOINT_PATH = Path("chess_transformer_best.pt")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+CHECKPOINT_PATH = _PROJECT_ROOT / "models" / "chess_transformer_25.8M_50.5pct.pt"
 
 
 # --- Model definition (must match training) ---
 
 class ChessTransformer(nn.Module):
-    def __init__(self, vocab_size=13, d_model=256, nhead=8, num_layers=8, dropout=0.1, head_dim=128):
+    def __init__(self, vocab_size=15, d_model=512, nhead=8, num_layers=8, dropout=0.1, head_dim=256):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.emb_dropout = nn.Dropout(dropout)
-        self.pos_encoder = nn.Parameter(torch.randn(1, 64, d_model) * 0.02)
+        self.pos_encoder = nn.Parameter(torch.randn(1, 65, d_model) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
             dropout=dropout, batch_first=True, norm_first=True,
@@ -41,10 +42,13 @@ class ChessTransformer(nn.Module):
         x = self.embedding(x) + self.pos_encoder
         x = self.emb_dropout(x)
         x = self.transformer(x)
+        # Value head: mean pool all 65 tokens
         pooled_state = x.mean(dim=1)
         value = self.value_head(pooled_state).squeeze(-1)
-        from_feats = self.from_proj(x)
-        to_feats = self.to_proj(x)
+        # Policy head: only use first 64 tokens (board squares)
+        x_squares = x[:, :64, :]
+        from_feats = self.from_proj(x_squares)
+        to_feats = self.to_proj(x_squares)
         policy_logits = torch.bmm(from_feats, to_feats.transpose(1, 2)) * self.logit_scale
         policy_logits = policy_logits.view(x.size(0), 4096)
         if legal_move_mask is not None:
@@ -63,6 +67,8 @@ def board_to_tokens(board: chess.Board) -> torch.Tensor:
         else:
             offset = 0 if piece.color else 6
             tokens.append(piece.piece_type + offset)
+    # 65th token: 13 = White to move, 14 = Black to move
+    tokens.append(13 if board.turn else 14)
     return torch.tensor(tokens, dtype=torch.long)
 
 

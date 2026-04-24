@@ -7,7 +7,7 @@ Architecture:
 - Virtual loss prevents workers from all exploring the same path
 
 Usage:
-    from mcts import ParallelMCTS
+    from core.mcts import ParallelMCTS
     mcts = ParallelMCTS(model, device, num_workers=8)
     best_move = mcts.search(board, num_simulations=800)
 """
@@ -889,17 +889,20 @@ def board_to_tokens(board: chess.Board, seq_length: int = 68) -> torch.Tensor:
 def main():
     """Demo: run MCTS on starting position with tree reuse."""
     import sys
-    sys.path.insert(0, '.')
+    from pathlib import Path
+    _project_root = Path(__file__).resolve().parent.parent
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
 
     # Try to load the model
-    from train import ChessTransformer
+    from training.train import ChessTransformer
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Check for trained model
     import glob
-    model_files = glob.glob("models/guofish_*.pt")
+    model_files = glob.glob(str(_project_root / "models" / "guofish_*.pt"))
 
     if model_files:
         # Load latest model

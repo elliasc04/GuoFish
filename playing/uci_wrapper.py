@@ -15,13 +15,24 @@ import io
 import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Optional
 
 import chess
 import torch
 
-from mcts import ParallelMCTS
-from play import load_model, ChessTransformerV2
+# Make the project root importable when this file is run as a script
+# (python playing/uci_wrapper.py) rather than as a module.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from core.mcts import ParallelMCTS
+from playing.v2.playv2 import load_model, ChessTransformerV2
+
+
+MODELS_DIR = _PROJECT_ROOT / "models"
+OPENING_BOOK_PATH = _PROJECT_ROOT / "assets" / "gm2001.bin"
 
 
 def err(msg: str):
@@ -34,8 +45,10 @@ def log(msg: str):
     print(msg, flush=True)
 
 
-def find_latest_checkpoint(models_dir: str = "models") -> Optional[str]:
+def find_latest_checkpoint(models_dir: Optional[str] = None) -> Optional[str]:
     """Find the most recent checkpoint file by modification time."""
+    if models_dir is None:
+        models_dir = str(MODELS_DIR)
     patterns = [
         os.path.join(models_dir, "guofish2_*.pt"),
         os.path.join(models_dir, "guofish_*.pt"),

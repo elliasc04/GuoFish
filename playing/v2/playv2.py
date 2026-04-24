@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -19,6 +20,12 @@ import chess
 import chess.polyglot
 import torch
 import torch.nn as nn
+
+# Make the project root importable when this file is run as a script
+# (python playing/play.py) rather than as a module.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 # --- Model definitions ---
@@ -422,7 +429,7 @@ def ask_play_again() -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Play chess against ChessTransformer")
     parser.add_argument("checkpoint", type=Path, nargs="?",
-                        default=Path("models/guofish2_25.6M_54.8p.pt"),
+                        default=_PROJECT_ROOT / "models" / "guofish2_25.6M_54.8p.pt",
                         help="Path to model checkpoint")
     parser.add_argument("--mcts", action="store_true",
                         help="Use MCTS search instead of raw policy")
@@ -432,8 +439,9 @@ def main():
                         help="Number of MCTS worker threads (default: auto)")
     parser.add_argument("--book", action="store_true",
                         help="Use opening book for early moves")
-    parser.add_argument("--book-path", type=Path, default=Path("gm2001.bin"),
-                        help="Path to Polyglot opening book .bin file (default: gm2001.bin)")
+    parser.add_argument("--book-path", type=Path,
+                        default=_PROJECT_ROOT / "assets" / "gm2001.bin",
+                        help="Path to Polyglot opening book .bin file (default: assets/gm2001.bin)")
     args = parser.parse_args()
 
     if not args.checkpoint.exists():
@@ -446,7 +454,7 @@ def main():
     # Initialize MCTS if requested
     mcts_engine = None
     if args.mcts:
-        from mcts import ParallelMCTS
+        from core.mcts import ParallelMCTS
         # Let ParallelMCTS auto-tune workers unless explicitly specified
         mcts_engine = ParallelMCTS(model, device, num_workers=args.workers)
         print(f"MCTS enabled: {args.simulations} simulations, {mcts_engine.num_workers} workers, "
