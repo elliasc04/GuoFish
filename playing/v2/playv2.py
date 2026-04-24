@@ -530,12 +530,31 @@ def main():
             print("To inject an engine move, enter two moves: 'e4 e5' (your move, then engine's).")
             print("Type 'undo' to rewind one full move, 'new' to start a new game, 'quit' to stop.\n")
 
+            def mcts_apply(move: chess.Move) -> None:
+                """Advance the MCTS tree to match the board. No-op if MCTS not in use."""
+                if mcts_engine is not None:
+                    mcts_engine.apply_move(move)
+
+            def start_ponder() -> None:
+                """Start background MCTS on the predicted user reply, if possible."""
+                if mcts_engine is None or board.is_game_over():
+                    return
+                # ParallelMCTS.ponder_start auto-selects top-1 or top-K
+                # branches based on root-visit confidence.
+                mcts_engine.ponder_start(board)
+
+            def stop_ponder() -> None:
+                if mcts_engine is not None:
+                    mcts_engine.ponder_stop()
+
             def play_engine_move() -> bool:
                 """Probe book, else run engine search. Returns False if no legal moves."""
                 book_move = probe_opening_book(book_reader, board)
                 if book_move is not None:
                     print(f"Engine plays: {board.san(book_move)}  [book]\n")
                     board.push(book_move)
+                    mcts_apply(book_move)
+                    start_ponder()
                     return True
                 move, stats = pick_engine_move(model, board, device, mcts_engine, args.simulations)
                 if move is None:
@@ -543,6 +562,8 @@ def main():
                     return False
                 print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
                 board.push(move)
+                mcts_apply(move)
+                start_ponder()
                 return True
 
             def end_game() -> None:
@@ -559,6 +580,8 @@ def main():
                         move = board.parse_san(first_move_input)
                         print(f"Engine plays: {board.san(move)}  [injected]\n")
                         board.push(move)
+                        mcts_apply(move)
+                        start_ponder()
                     except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
                         print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
                         if not play_engine_move():
@@ -569,6 +592,9 @@ def main():
 
             while True:
                 raw = prompt("Your move: ")
+                # Stop any pondering before mutating board/tree in response to input.
+                # Ponder was running in the background while prompt() blocked.
+                stop_ponder()
                 if raw.lower() in ("quit", "exit"):
                     print("Quitting.")
                     return
@@ -579,6 +605,9 @@ def main():
                         # Undo both player and engine moves
                         undone_engine = board.pop()
                         undone_player = board.pop()
+                        # Tree has no inverse of apply_move; rebuild from scratch next search.
+                        if mcts_engine is not None:
+                            mcts_engine.reset()
                         print(f"Undid: {undone_player} (you), {undone_engine} (engine)")
                         print(board)
                         print(f"History: {format_move_history(board)}")
@@ -586,6 +615,8 @@ def main():
                     elif len(board.move_stack) == 1 and human_side == chess.BLACK:
                         # Undo just the engine's first move (playing as black)
                         undone_engine = board.pop()
+                        if mcts_engine is not None:
+                            mcts_engine.reset()
                         print(f"Undid engine's first move: {undone_engine}")
                         print(board)
                         print(f"History: {format_move_history(board)}")
@@ -597,6 +628,8 @@ def main():
                                 move = board.parse_san(first_move_input)
                                 print(f"Engine plays: {board.san(move)}  [injected]\n")
                                 board.push(move)
+                                mcts_apply(move)
+                                start_ponder()
                             except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError) as e:
                                 print(f"Could not parse '{first_move_input}' ({type(e).__name__}). Engine will choose.")
                                 if not play_engine_move():
@@ -621,6 +654,7 @@ def main():
                     continue
 
                 board.push(human_move)
+                mcts_apply(human_move)
 
                 if board.is_game_over():
                     outcome = board.outcome()
@@ -642,6 +676,8 @@ def main():
                     # Use injected move instead of engine search
                     print(f"Engine plays: {board.san(injected_move)}  [injected]\n")
                     board.push(injected_move)
+                    mcts_apply(injected_move)
+                    start_ponder()
                 else:
                     # Normal engine move (book first, then search)
                     if not play_engine_move():
@@ -654,6 +690,11 @@ def main():
                         print("Engine wins by checkmate!")
                     end_game()
         except RestartGame:
+            # Stop any in-flight pondering and drop the old game's tree before
+            # starting fresh. RestartGame can be raised mid-prompt so ponder
+            # may still be running at this point.
+            if mcts_engine is not None:
+                mcts_engine.reset()
             print("\n--- Starting new game ---\n")
             continue
 

@@ -14,6 +14,7 @@ Usage:
 
 import math
 import os
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -380,7 +381,11 @@ class MCTSWorker:
         """Main work loop - select, expand, evaluate, backprop."""
         try:
             while self.running:
-                # Check if we've hit the target
+                # External termination signal (e.g. ponder_stop). Must come
+                # before the target_sims check so pondering — which targets an
+                # effectively infinite sim count — can be interrupted.
+                if self.completion_event.is_set():
+                    break
                 if self.stats['simulations'] >= self.target_sims:
                     self.completion_event.set()
                     break
@@ -560,25 +565,81 @@ class ParallelMCTS:
         self.last_root_q = 0.0  # Q-value of root after search (from side-to-move perspective)
         self.last_best_child_q = 0.0  # Q-value of best move
 
+        # Pondering state. A background thread runs MCTS simulations on a
+        # predicted-opponent-reply subtree between searches. All tree-mutating
+        # methods below call ponder_stop() first, so callers don't need to.
+        self._pondering: bool = False
+        self._ponder_thread: Optional[threading.Thread] = None
+        self._ponder_stop_event: Optional[threading.Event] = None
+        # Instrumentation: hold the predicted branches and a stats dict
+        # across the ponder lifecycle so apply_move() can log hit/miss +
+        # total sim count. A list because confidence-gated multi-PV may
+        # ponder several candidate replies. Cleared on the next
+        # ponder_start() (once the previous ponder has been consumed) or on
+        # reset().
+        self._ponder_predicted_moves: list[chess.Move] = []
+        self._ponder_stats: Optional[defaultdict] = None
+
     def shutdown(self):
         """Stop the evaluator thread. Call when done with MCTS."""
+        self.ponder_stop()
         self.evaluator.stop()
 
     def clear_cache(self):
         """Clear the transposition cache."""
+        self.ponder_stop()
         self.cache.clear()
 
     def reset(self):
         """Clear the persistent tree. Call at start of a new game."""
+        self.ponder_stop()
         self.root = None
         self.root_board = None
         self._root_hash = None
+        self._ponder_predicted_moves = []
+        self._ponder_stats = None
 
     def apply_move(self, move: chess.Move):
         """
         Advance the tree by the given move, preserving the relevant subtree.
         Call this after a move is played to enable tree reuse.
         """
+        self.ponder_stop()
+
+        # Log outcome of the just-completed ponder (if any): did the opponent
+        # play any of the moves we predicted, and how many sims did ponder add?
+        if self._ponder_predicted_moves:
+            sims = self._ponder_stats['simulations'] if self._ponder_stats is not None else 0
+            hit = move in self._ponder_predicted_moves
+            def _san(m: chess.Move, b: Optional[chess.Board]) -> str:
+                try:
+                    return b.san(m) if b is not None else m.uci()
+                except Exception:
+                    return m.uci()
+            preds = ",".join(_san(m, self.root_board) for m in self._ponder_predicted_moves)
+            actual_str = _san(move, self.root_board)
+            # Diagnostic: show the current visit_count on each pondered
+            # sub-root (the node that will be promoted if the user played
+            # that branch). If these are near-zero on a hit, ponder work
+            # didn't transfer and the next search will be slow.
+            branch_visits_parts: list[str] = []
+            if self.root is not None:
+                for m in self._ponder_predicted_moves:
+                    child = self.root.children.get(m)
+                    v = child.visit_count if child is not None else -1
+                    branch_visits_parts.append(f"{_san(m, self.root_board)}:{v}v")
+            # Also show the visit_count of the actually-played move's
+            # child — this is what the next search will see as existing_visits.
+            actual_child = self.root.children.get(move) if self.root is not None else None
+            actual_visits = actual_child.visit_count if actual_child is not None else -1
+            print(f"[ponder] end: predicted=[{preds}] actual={actual_str} "
+                  f"hit={hit} sims={sims} "
+                  f"branch_visits=[{', '.join(branch_visits_parts)}] "
+                  f"actual_visits={actual_visits}",
+                  file=sys.stderr, flush=True)
+            self._ponder_predicted_moves = []
+            self._ponder_stats = None
+
         if self.root is None or self.root_board is None or move not in self.root.children:
             # Nothing to reuse
             self.root = None
@@ -628,6 +689,7 @@ class ParallelMCTS:
         Returns:
             Best move according to MCTS, or None if no legal moves
         """
+        self.ponder_stop()
         board_hash = chess.polyglot.zobrist_hash(board)
 
         # Check if we can reuse the existing tree
@@ -744,6 +806,7 @@ class ParallelMCTS:
         Returns:
             Dictionary mapping moves to visit count proportions
         """
+        self.ponder_stop()
         board_hash = chess.polyglot.zobrist_hash(board)
 
         # Check if we can reuse the existing tree
@@ -815,6 +878,164 @@ class ParallelMCTS:
         self.last_best_child_q = best_child.q_value  # child.q is from engine's view -> as-is
 
         return policy
+
+    # === Pondering ===
+    # Between turns, grow the subtree under the predicted opponent reply. If
+    # the opponent plays the predicted move, the next search starts with
+    # thousands of visits already in place (via apply_move promoting the
+    # pondered child). Otherwise the transposition cache still carries over.
+
+    def predict_opponent_move(self) -> Optional[chess.Move]:
+        """Most-visited child of the current root — i.e. the opponent's most-likely reply.
+
+        Intended to be called after apply_move(engine_move), when self.root is
+        at an opponent-to-move position and its children are opponent replies.
+        """
+        if self.root is None or not self.root.children:
+            return None
+        return max(self.root.children.items(), key=lambda x: x[1].visit_count)[0]
+
+    def ponder_start(self, board: chess.Board,
+                     confidence_threshold: float = 0.7,
+                     max_branches: int = 2):
+        """Begin background MCTS on the predicted opponent reply(ies).
+
+        Confidence-gated multi-PV: if the top child's share of root visits is
+        at least `confidence_threshold`, ponder only that child (top-1). Else
+        ponder up to `max_branches` children, with workers allocated
+        proportionally to each child's root-visit share.
+
+        Pass `max_branches=1` to force single-PV, or `confidence_threshold=0.0`
+        to always split. No-op if already pondering or the tree isn't set up.
+        """
+        if self._pondering:
+            return
+        if self.root is None or not self.root.children:
+            return
+
+        # Rank children by root visits (same criterion as search's bestmove).
+        children_sorted = sorted(self.root.children.items(),
+                                 key=lambda x: x[1].visit_count, reverse=True)
+        total_root_visits = sum(c.visit_count for _, c in children_sorted)
+        if total_root_visits == 0:
+            return  # tree too shallow to predict anything
+
+        top_share = children_sorted[0][1].visit_count / total_root_visits
+
+        # Confidence gate: high-confidence top-1 keeps all workers on one
+        # branch (best ROI when prediction is right). Low-confidence splits
+        # across top-K.
+        if top_share >= confidence_threshold or max_branches <= 1:
+            selected = children_sorted[:1]
+        else:
+            selected = children_sorted[:max_branches]
+
+        # Allocate workers proportionally to selected branches' visit counts.
+        # Each branch gets at least 1 worker. Rounding drift is absorbed by
+        # the highest-visit branch.
+        weights = [c.visit_count for _, c in selected]
+        total_w = sum(weights) or 1
+        worker_counts = [max(1, int(round(self.num_workers * w / total_w)))
+                         for w in weights]
+        drift = self.num_workers - sum(worker_counts)
+        if drift != 0:
+            biggest = max(range(len(weights)), key=lambda i: weights[i])
+            worker_counts[biggest] = max(1, worker_counts[biggest] + drift)
+
+        # Build the per-branch ponder setup: expand unexpanded leaves and
+        # compute the board position each branch is rooted at.
+        branches: list[tuple[chess.Move, MCTSNode, chess.Board, int]] = []
+        for (move, node), n_workers in zip(selected, worker_counts):
+            bboard = board.copy()
+            bboard.push(move)
+            if not node.is_expanded:
+                self._expand_root(node, bboard)
+            branches.append((move, node, bboard, n_workers))
+
+        # Log the decision so the user can see the confidence gate in action.
+        def _san(m: chess.Move, b: Optional[chess.Board]) -> str:
+            try:
+                return b.san(m) if b is not None else m.uci()
+            except Exception:
+                return m.uci()
+        parts = [f"{_san(m, self.root_board)}({n}w,{c.visit_count}v)"
+                 for (m, c), n in zip(selected, worker_counts)]
+        mode = "single" if len(branches) == 1 else f"multi-{len(branches)}"
+        print(f"[ponder] start {mode}: top_confidence={top_share:.0%} "
+              f"branches=[{', '.join(parts)}]",
+              file=sys.stderr, flush=True)
+
+        # Keep predicted moves + stats dict alive past ponder_stop so that
+        # apply_move() can read them to log the outcome.
+        self._ponder_predicted_moves = [m for m, _, _, _ in branches]
+        self._ponder_stats = defaultdict(int)
+
+        self._ponder_stop_event = threading.Event()
+        self._pondering = True
+        self._ponder_thread = threading.Thread(
+            target=self._ponder_run,
+            args=(branches, self._ponder_stop_event, self._ponder_stats),
+            daemon=True,
+        )
+        self._ponder_thread.start()
+
+    def _ponder_run(self,
+                    branches: list[tuple[chess.Move, MCTSNode, chess.Board, int]],
+                    stop_event: threading.Event, stats: defaultdict):
+        """Background thread body: spawn workers across `branches` until `stop_event` is set.
+
+        Each branch is (move, sub_root, sub_board, num_workers_for_branch).
+        Workers share the stop_event and stats dict; they share the
+        transposition cache too, so transpositions across branches
+        deduplicate automatically.
+        """
+        try:
+            for _, node, _, _ in branches:
+                self._reset_virtual_loss(node)
+
+            if not self.evaluator.inline:
+                self.evaluator.start()
+
+            workers = []
+            worker_id = 0
+            for _, node, bboard, n_workers in branches:
+                for _ in range(n_workers):
+                    worker = MCTSWorker(
+                        worker_id=worker_id,
+                        root=node,
+                        root_board=bboard,
+                        evaluator=self.evaluator,
+                        cache=self.cache,
+                        stats=stats,
+                        # Effectively unbounded — stop_event is the real terminator.
+                        target_sims=10**18,
+                        completion_event=stop_event,
+                    )
+                    worker.start()
+                    workers.append(worker)
+                    worker_id += 1
+
+            stop_event.wait()
+
+            for worker in workers:
+                worker.stop()
+        except Exception as e:
+            import traceback
+            print(f"[mcts ponder] {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
+
+    def ponder_stop(self):
+        """Stop background pondering if active. Safe to call when not pondering."""
+        if not self._pondering:
+            return
+        if self._ponder_stop_event is not None:
+            self._ponder_stop_event.set()
+        if self._ponder_thread is not None:
+            self._ponder_thread.join()
+        self._pondering = False
+        self._ponder_thread = None
+        self._ponder_stop_event = None
 
 
 # === Board Tokenization ===

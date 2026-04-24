@@ -76,11 +76,15 @@ class UCIEngine:
     """UCI protocol handler for Guofish2."""
 
     def __init__(self, model_path: Optional[str] = None, num_workers: int = 32,
-                 sim_cap: int = 10000):
+                 sim_cap: int = 10000, ponder: bool = False):
         # Optional explicit checkpoint path; if None, auto-detects latest.
         self.model_path: Optional[str] = model_path
         self.num_workers: int = num_workers
         self.sim_cap: int = sim_cap
+        # Pondering is off by default. Enabling it during Cutechess ELO runs
+        # makes concurrent games fight for the same GPU/CPU budget between
+        # turns, hurting Stockfish's fixed-time results.
+        self.ponder: bool = ponder
         self.model: Optional[torch.nn.Module] = None
         self.mcts: Optional[ParallelMCTS] = None
         self.device: Optional[torch.device] = None
@@ -163,6 +167,12 @@ class UCIEngine:
             position fen <fen>
             position fen <fen> moves e2e4 e7e5 ...
         """
+        # Stop any in-flight pondering before mutating board/tree. Defensive:
+        # ParallelMCTS.apply_move/reset also call ponder_stop internally, but
+        # stopping up-front avoids racing on self.board.
+        if self.mcts is not None:
+            self.mcts.ponder_stop()
+
         if not args:
             return
 
@@ -257,6 +267,7 @@ class UCIEngine:
         # Opening book disabled - uci_wrapper.py is eval-only, openings come from Cutechess.
         if self.mcts is None:
             self._initialize_engine()
+        assert self.mcts is not None  # narrowed — _initialize_engine always assigns it
 
         # Parse arguments
         num_simulations = 5000  # Default fallback
@@ -297,6 +308,30 @@ class UCIEngine:
         else:
             # No legal moves - should not happen in normal play
             log("bestmove 0000")
+            return
+
+        # === Pondering (optional) ===
+        # When enabled, commit our move to the tree, predict the opponent's
+        # reply, and start background MCTS on that subtree. If the opponent
+        # plays the predicted move, the next 'position' command's apply_move
+        # promotes a subtree with thousands of ponder-added visits.
+        #
+        # Off by default: during concurrent Cutechess ELO runs, background
+        # pondering across N games all contends for the same GPU/CPU and
+        # distorts Stockfish's fixed-time results. Enable with --ponder for
+        # single-game or interactive use.
+        if self.ponder:
+            self.board.push(best_move)
+            self.mcts.apply_move(best_move)
+            # Keep _last_moves in sync so the next 'position' command's
+            # tree-reuse check (prefix match against incoming moves_list)
+            # still holds.
+            self._last_moves.append(best_move.uci())
+
+            if not self.board.is_game_over():
+                # ParallelMCTS.ponder_start auto-selects top-1 or top-K
+                # branches based on root-visit confidence.
+                self.mcts.ponder_start(self.board)
 
     def handle_quit(self):
         """Clean shutdown."""
@@ -364,10 +399,15 @@ def main():
                              "running many concurrent games (default: 32)")
     parser.add_argument("--sim-cap", type=int, default=10000,
                         help="Upper bound on 'go nodes N' (default: 10000)")
+    parser.add_argument("--ponder", action="store_true",
+                        help="Ponder on the predicted opponent reply between "
+                             "turns. Off by default: concurrent Cutechess ELO "
+                             "runs should leave this off so background work "
+                             "from one game doesn't steal compute from another.")
     args = parser.parse_args()
 
     engine = UCIEngine(model_path=args.model, num_workers=args.workers,
-                       sim_cap=args.sim_cap)
+                       sim_cap=args.sim_cap, ponder=args.ponder)
     engine.run()
 
 
