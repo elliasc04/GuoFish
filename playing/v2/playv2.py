@@ -168,6 +168,13 @@ def load_model(checkpoint_path: Path, device: torch.device) -> nn.Module:
     return model
 
 
+# --- ANSI color codes for console output ---
+
+GREEN = "\033[92m"
+RED = "\033[91m"
+RESET = "\033[0m"
+
+
 # --- Token constants for V2 architecture ---
 
 TOKEN_WHITE_TO_MOVE = 13
@@ -551,7 +558,7 @@ def main():
                 """Probe book, else run engine search. Returns False if no legal moves."""
                 book_move = probe_opening_book(book_reader, board)
                 if book_move is not None:
-                    print(f"Engine plays: {board.san(book_move)}  [book]\n")
+                    print(f"{RED}Engine plays: {board.san(book_move)}{RESET}  [book]\n")
                     board.push(book_move)
                     mcts_apply(book_move)
                     start_ponder()
@@ -560,7 +567,7 @@ def main():
                 if move is None:
                     print("Engine has no legal moves!")
                     return False
-                print(f"Engine plays: {board.san(move)}  [{format_engine_stats(stats)}]\n")
+                print(f"{RED}Engine plays: {board.san(move)}{RESET}  [{format_engine_stats(stats)}]\n")
                 board.push(move)
                 mcts_apply(move)
                 start_ponder()
@@ -578,7 +585,7 @@ def main():
                 if first_move_input:
                     try:
                         move = board.parse_san(first_move_input)
-                        print(f"Engine plays: {board.san(move)}  [injected]\n")
+                        print(f"{RED}Engine plays: {board.san(move)}{RESET}  [injected]\n")
                         board.push(move)
                         mcts_apply(move)
                         start_ponder()
@@ -591,7 +598,7 @@ def main():
                         end_game()
 
             while True:
-                raw = prompt("Your move: ")
+                raw = prompt(f"{GREEN}Your move: {RESET}")
                 # Stop any pondering before mutating board/tree in response to input.
                 # Ponder was running in the background while prompt() blocked.
                 stop_ponder()
@@ -626,7 +633,7 @@ def main():
                         if first_move_input:
                             try:
                                 move = board.parse_san(first_move_input)
-                                print(f"Engine plays: {board.san(move)}  [injected]\n")
+                                print(f"{RED}Engine plays: {board.san(move)}{RESET}  [injected]\n")
                                 board.push(move)
                                 mcts_apply(move)
                                 start_ponder()
@@ -674,7 +681,7 @@ def main():
 
                 if injected_move is not None:
                     # Use injected move instead of engine search
-                    print(f"Engine plays: {board.san(injected_move)}  [injected]\n")
+                    print(f"{RED}Engine plays: {board.san(injected_move)}{RESET}  [injected]\n")
                     board.push(injected_move)
                     mcts_apply(injected_move)
                     start_ponder()
