@@ -120,7 +120,8 @@ class MCTSNode:
     """A node in the MCTS tree with virtual loss support."""
 
     __slots__ = ['parent', 'move', 'prior', 'children', 'visit_count',
-                 'value_sum', 'virtual_loss', 'is_expanded', 'lock']
+                 'value_sum', 'virtual_loss', 'is_expanded', 'lock',
+                 'is_terminal', 'terminal_value']
 
     def __init__(self, parent: Optional['MCTSNode'] = None,
                  move: Optional[chess.Move] = None, prior: float = 0.0):
@@ -132,6 +133,11 @@ class MCTSNode:
         self.value_sum = 0.0
         self.virtual_loss = 0  # In-flight penalty
         self.is_expanded = False
+        # Cached terminal state — once a leaf is detected as game-over, store
+        # the result so future sims that reach this node skip the (expensive)
+        # board.is_game_over() / board.result() recomputation.
+        self.is_terminal = False
+        self.terminal_value = 0.0
         self.lock = threading.Lock()
 
     @property
@@ -191,7 +197,7 @@ class MCTSNode:
 
             self.is_expanded = True
 
-    def select_child(self) -> 'MCTSNode':
+    def select_child(self) -> 'MCTSNode | None':
         """Select child with highest UCB score."""
         parent_visits = self.effective_visits
         best_score = float('-inf')
@@ -329,7 +335,7 @@ class BatchedEvaluator:
 
         # Forward pass
         with torch.no_grad():
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
+            with torch.amp.autocast_mode.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
                 policy_logits, values = self.model(tokens_batch)
 
         # Bulk D2H transfer - move entire tensors to CPU before iterating
@@ -411,6 +417,7 @@ class MCTSWorker:
         while node.is_expanded and node.children:
             node.apply_virtual_loss()
             node = node.select_child()
+            assert node is not None  # loop condition guarantees children exist
             path.append(node)
             board.push(node.move)
             depth += 1
@@ -426,7 +433,23 @@ class MCTSWorker:
 
         node.apply_virtual_loss()
 
-        # === Check terminal state ===
+        # === Cached terminal (fast path) ===
+        # If this leaf was previously identified as terminal, just backprop the
+        # cached mover-perspective value
+        if node.is_terminal:
+            for n in path:
+                n.revert_virtual_loss()
+            node.backpropagate(node.terminal_value)
+            # Mate-in-one short-circuit: a root-child (depth==1) that is
+            # terminal with value +1 from the mover's perspective is a
+            # winning move for us. Signal search() to take it immediately.
+            if depth == 1 and node.terminal_value == 1.0 and node.move is not None:
+                self.stats['mating_move'] = node.move
+                self.completion_event.set()
+            self.stats['simulations'] += 1
+            return
+
+        # === Check terminal state (slow path, first visit only) ===
         if board.is_game_over():
             result = board.result()
             # Value must be from MOVER's perspective (who moved TO this node, i.e., opponent of board.turn)
@@ -440,10 +463,22 @@ class MCTSWorker:
             else:
                 value = 0.0
 
+            # Cache result so subsequent visits hit the fast path above.
+            # Setting is_expanded=True is harmless: selection bails on the
+            # empty children dict before reaching this node again.
+            with node.lock:
+                node.is_terminal = True
+                node.terminal_value = value
+                node.is_expanded = True
+
             # Revert virtual loss and backprop
             for n in path:
                 n.revert_virtual_loss()
             node.backpropagate(value)
+            if depth == 1 and value == 1.0 and node.move is not None:
+                self.stats['mating_move'] = node.move
+                self.completion_event.set()
+            self.stats['simulations'] += 1
             return
 
         # === Expansion & Evaluation ===
@@ -676,7 +711,7 @@ class ParallelMCTS:
             child.prior = (1 - epsilon) * child.prior + epsilon * n
 
     def search(self, board: chess.Board, num_simulations: int = 800,
-               time_limit: float = None, add_dirichlet_noise: bool = False) -> Optional[chess.Move]:
+               time_limit: float = 0.0, add_dirichlet_noise: bool = False) -> Optional[chess.Move]:
         """
         Run MCTS search and return the best move.
 
@@ -764,6 +799,15 @@ class ParallelMCTS:
         for worker in workers:
             worker.stop()
 
+        # Mate-in-one short-circuit: a worker found a root-child that's
+        # terminal with a winning value for us. Return it directly with a
+        # mate-equivalent score so UCI cp reporting reflects the win.
+        mating_move = stats.get('mating_move')
+        if mating_move is not None and mating_move in root.children:
+            self.last_root_q = 1.0
+            self.last_best_child_q = 1.0
+            return mating_move
+
         # Select best move (most visited)
         best_move, best_child = max(root.children.items(), key=lambda x: x[1].visit_count)
 
@@ -781,7 +825,7 @@ class ParallelMCTS:
         tokens = board_to_tokens(board, self.seq_length).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
+            with torch.amp.autocast_mode.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
                 policy_logits, value = self.model(tokens)
 
         legal_moves = list(board.legal_moves)
@@ -860,6 +904,18 @@ class ParallelMCTS:
 
             for worker in workers:
                 worker.stop()
+
+            # Mate-in-one short-circuit: a worker found a winning terminal at
+            # depth 1. The visit distribution at this point is unreliable
+            # (mate detection fires completion_event after a single visit on
+            # the mating child while other children have already accumulated
+            # many visits from earlier sims). Return a one-hot policy on the
+            # mating move so callers like pick_engine_move's argmax pick it.
+            mating_move = stats.get('mating_move')
+            if mating_move is not None and mating_move in root.children:
+                self.last_root_q = 1.0
+                self.last_best_child_q = 1.0
+                return {mating_move: 1.0}
 
         # Return normalized visit counts
         total_visits = sum(child.visit_count for child in root.children.values())
