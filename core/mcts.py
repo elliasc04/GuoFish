@@ -1063,8 +1063,9 @@ class ParallelMCTS:
                         evaluator=self.evaluator,
                         cache=self.cache,
                         stats=stats,
-                        # Effectively unbounded — stop_event is the real terminator.
-                        target_sims=10**18,
+                        # Cap pondering total sims to prevent unbounded tree
+                        # growth
+                        target_sims=15000 if self.device.type == 'cuda' else 5000,
                         completion_event=stop_event,
                     )
                     worker.start()
