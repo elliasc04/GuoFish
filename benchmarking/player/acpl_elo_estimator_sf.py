@@ -64,7 +64,7 @@ def score_to_cp(score: chess.engine.PovScore, perspective: chess.Color) -> int:
     pov = score.pov(perspective)
     if pov.is_mate():
         mate_in = pov.mate()
-        return MATE_SCORE_CP if mate_in > 0 else -MATE_SCORE_CP
+        return MATE_SCORE_CP if mate_in and mate_in > 0 else -MATE_SCORE_CP
     cp = pov.score()
     return cp if cp is not None else 0
 

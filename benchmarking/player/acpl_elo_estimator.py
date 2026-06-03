@@ -28,7 +28,7 @@ from pathlib import Path
 import chess
 import chess.pgn
 
-from core.mcts import ParallelMCTS
+from core.mctsv1 import ParallelMCTS
 from playing.v2.playv2 import load_model
 
 
