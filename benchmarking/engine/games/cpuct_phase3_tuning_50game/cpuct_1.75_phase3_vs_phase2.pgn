@@ -1,0 +1,1927 @@
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "E32"]
+[GameDuration "00:01:26"]
+[GameEndTime "2026-05-31T19:07:43.782 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:06:16.947 Central Daylight Time"]
+[Opening "Nimzo-Indian"]
+[PlyCount "97"]
+[TimeControl "inf"]
+[Variation "Classical variation"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} e6 {book} 3. Nc3 {book} Bb4 {book}
+4. Qc2 {book} O-O {book} 5. a3 {+0.43/1 2.3s} Bxc3+ {-0.68/1 2.3s}
+6. Qxc3 {+0.29/1 1.1s} b6 {-0.72/1 0.24s} 7. Nf3 {+0.23/1 1.1s}
+Bb7 {-1.04/1 1.4s} 8. Bg5 {+1.07/1 1.5s} h6 {-1.26/1 0.84s}
+9. Bh4 {+1.20/1 1.4s} d6 {-0.92/1 1.2s} 10. e3 {+0.87/1 1.2s}
+Nbd7 {-0.63/1 0.99s} 11. Be2 {+0.86/1 1.3s} g5 {+0.68/1 1.4s}
+12. Bg3 {-1.05/1 1.8s} Ne4 {+1.30/1 1.7s} 13. Qc2 {-0.77/1 0.76s}
+f5 {+1.17/1 0.35s} 14. Nd2 {-1.12/1 0.39s} Nxd2 {+1.68/1 0.89s}
+15. Qxd2 {-1.56/1 1.6s} Bxg2 {+1.45/1 0.60s} 16. Rg1 {-1.44/1 0.43s}
+Bb7 {+1.16/1 0.44s} 17. O-O-O {+0.64/1 1.5s} Qf6 {+0.34/1 1.6s}
+18. h4 {+1.81/1 1.8s} g4 {-1.16/1 1.5s} 19. f3 {+2.87/1 1.3s} h5 {-1.59/1 1.1s}
+20. e4 {+2.41/1 0.59s} f4 {+2.33/1 1.5s} 21. Bf2 {+2.03/1 1.6s}
+g3 {+4.33/1 1.4s} 22. Bxg3 {-1.72/1 1.2s} fxg3 {+4.23/1 0.51s}
+23. Rxg3+ {-2.57/1 0.60s} Kf7 {+4.69/1 0.20s} 24. Rg5 {-3.17/1 0.43s}
+Rg8 {+4.57/1 1.1s} 25. e5 {+1.98/1 1.9s} Qh8 {+4.29/1 2.0s}
+26. Qf4+ {-2.55/1 1.2s} Ke7 {+4.18/1 1.5s} 27. Qg3 {-0.58/1 1.4s}
+dxe5 {+3.62/1 1.4s} 28. dxe5 {-2.75/1 1.9s} Raf8 {+4.59/1 1.2s}
+29. b4 {-2.80/1 0.88s} Qh6 {+7.54/1 1.5s} 30. f4 {-6.29/1 1.8s}
+Rxg5 {+5.07/1 1.4s} 31. hxg5 {-7.24/1 1.3s} Qg6 {+3.79/1 0.40s}
+32. Rd4 {-6.58/1 0.73s} Be4 {+7.20/1 2.0s} 33. Qe3 {-5.89/1 1.5s}
+Bf5 {+6.13/1 1.4s} 34. Qf3 {-2.25/1 1.3s} Rd8 {+5.76/1 1.3s}
+35. Qc6 {-1.18/1 1.7s} h4 {+4.47/1 1.2s} 36. Qxc7 {-0.23/1 0.67s}
+h3 {+4.67/1 0.46s} 37. Bf3 {+0.56/1 0.60s} h2 {+4.01/1 1.7s}
+38. Bc6 {+4.88/1 0.96s} Qe8 {-2.82/1 1.1s} 39. Rd2 {+4.81/1 0.85s}
+Qh5 {-3.27/1 0.34s} 40. Rxd7+ {+4.42/1 0.33s} Rxd7 {-3.41/1 0.19s}
+41. Qxd7+ {+4.45/1 0.27s} Kf8 {+3.42/1 0.004s} 42. Qd8+ {-4.57/1 0.002s}
+Kg7 {-3.22/1 0.17s} 43. Qf6+ {+4.27/1 0.16s} Kh7 {-3.24/1 0.14s}
+44. Qe7+ {+4.42/1 0.36s} Kh8 {-3.27/1 0.15s} 45. Qf8+ {+4.26/1 0.29s}
+Kh7 {-3.34/1 0.47s} 46. Qe7+ {+4.44/1 0.30s} Kg8 {-3.14/1 0.12s}
+47. Qd8+ {+4.33/1 0.14s} Kg7 {-3.26/1 0.15s} 48. Qf6+ {+4.17/1 0.15s}
+Kh7 {-3.17/1 0.27s} 49. Qe7+ {+4.39/1 0.27s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "E32"]
+[GameDuration "00:01:07"]
+[GameEndTime "2026-05-31T19:07:24.967 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:06:17.252 Central Daylight Time"]
+[Opening "Nimzo-Indian"]
+[PlyCount "61"]
+[TimeControl "inf"]
+[Variation "Classical variation"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} e6 {book} 3. Nc3 {book} Bb4 {book}
+4. Qc2 {book} O-O {book} 5. a3 {+0.88/1 2.3s} Bxc3+ {-0.23/1 2.3s}
+6. Qxc3 {+0.72/1 0.74s} d5 {-0.13/1 0.20s} 7. Bg5 {+0.54/1 1.3s}
+dxc4 {+0.49/1 1.8s} 8. Qxc4 {+0.75/1 1.5s} h6 {-0.33/1 1.5s}
+9. Bh4 {+0.55/1 1.4s} b5 {+0.50/1 1.7s} 10. Qd3 {+0.10/1 1.6s} c5 {+0.49/1 1.7s}
+11. dxc5 {+1.93/1 2.1s} Nbd7 {-1.04/1 1.5s} 12. c6 {+4.52/1 1.4s}
+Ne5 {-3.56/1 1.6s} 13. Qxd8 {+4.17/1 1.1s} Rxd8 {-3.41/1 1.2s}
+14. Rc1 {+4.34/1 0.28s} Rd6 {-3.63/1 1.1s} 15. e3 {+4.51/1 1.7s}
+a6 {-4.11/1 1.8s} 16. c7 {+5.57/1 1.4s} Ra7 {-5.32/1 1.7s}
+17. Bg3 {+5.45/1 1.7s} Rc6 {-4.19/1 1.9s} 18. Rxc6 {+2.55/1 1.5s}
+Nxc6 {-1.83/1 1.2s} 19. Nf3 {+1.99/1 1.1s} Ne4 {-0.99/1 1.4s}
+20. Bd3 {+0.81/1 0.95s} Nxg3 {+0.41/1 1.6s} 21. hxg3 {-0.05/1 1.1s}
+Rxc7 {+0.38/1 0.50s} 22. Ke2 {+0.15/1 0.19s} Na5 {+0.64/1 0.98s}
+23. Rd1 {-0.32/1 1.6s} Bb7 {+1.17/1 1.9s} 24. b4 {-0.76/1 1.7s}
+Nb3 {+2.12/1 1.7s} 25. Bb1 {-1.78/1 1.9s} Kf8 {+2.80/1 1.8s}
+26. Rd6 {-2.56/1 1.6s} Ke7 {+2.09/1 1.6s} 27. Rb6 {-1.12/1 1.3s}
+Nc1+ {+1.24/1 1.3s} 28. Kd2 {-1.83/1 0.50s} Nb3+ {+1.69/1 0.44s}
+29. Ke2 {-1.16/1 0.43s} Nc1+ {+1.28/1 0.19s} 30. Kd2 {-1.65/1 0.16s}
+Nb3+ {+1.65/1 0.37s} 31. Ke2 {-1.17/1 0.18s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "D85"]
+[GameDuration "00:00:54"]
+[GameEndTime "2026-05-31T19:07:11.893 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:06:17.087 Central Daylight Time"]
+[Opening "Gruenfeld"]
+[PlyCount "50"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Modern Exchange variation"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} g6 {book} 3. Nc3 {book} d5 {book}
+4. cxd5 {book} Nxd5 {book} 5. e4 {+0.21/1 2.0s} Nxc3 {+0.55/1 1.7s}
+6. bxc3 {+0.03/1 0.48s} Bg7 {+0.29/1 0.22s} 7. Nf3 {+0.16/1 0.60s}
+c5 {0.00/1 1.2s} 8. Bb5+ {+0.39/1 1.0s} Bd7 {-0.22/1 1.5s} 9. Be2 {+0.66/1 1.3s}
+O-O {-1.06/1 1.1s} 10. O-O {+0.99/1 1.5s} Nc6 {-1.05/1 1.1s}
+11. Rb1 {+1.79/1 1.8s} b6 {-1.39/1 1.6s} 12. d5 {+1.83/1 1.7s}
+Ne5 {-1.55/1 1.6s} 13. Nxe5 {+2.36/1 1.5s} Bxe5 {-1.73/1 1.3s}
+14. Bh6 {+3.39/1 0.34s} Re8 {-3.42/1 1.1s} 15. Qd2 {+4.95/1 1.6s}
+e6 {-4.90/1 1.2s} 16. f4 {+4.93/1 1.4s} Bg7 {-4.76/1 1.4s}
+17. Bxg7 {+4.68/1 0.70s} Kxg7 {-4.73/1 0.79s} 18. d6 {+5.08/1 0.21s}
+Bc6 {-5.28/1 0.35s} 19. e5 {+5.74/1 1.3s} Qd7 {-6.02/1 1.2s}
+20. h4 {+5.83/1 1.5s} h5 {-5.45/1 2.0s} 21. Bd3 {+6.21/1 1.8s}
+Qb7 {-6.01/1 1.6s} 22. c4 {+6.40/1 2.0s} Be4 {-6.85/1 1.9s}
+23. Rbe1 {+7.19/1 2.0s} Bxd3 {-6.59/1 1.8s} 24. Qxd3 {+6.90/1 1.5s}
+Rad8 {-6.43/1 0.37s} 25. Qg3 {+7.42/1 1.5s}
+Qa6 {-6.14/1 1.8s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "D86"]
+[GameDuration "00:01:26"]
+[GameEndTime "2026-05-31T19:07:43.875 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:06:17.219 Central Daylight Time"]
+[Opening "Gruenfeld"]
+[PlyCount "90"]
+[TimeControl "inf"]
+[Variation "Exchange, Classical variation"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} g6 {book} 3. Nc3 {book} d5 {book}
+4. cxd5 {book} Nxd5 {book} 5. e4 {-0.22/1 2.1s} Nxc3 {0.00/1 1.9s}
+6. bxc3 {-0.24/1 0.64s} Bg7 {+0.06/1 0.20s} 7. Bc4 {-0.10/1 0.39s}
+c5 {+0.16/1 1.3s} 8. Ne2 {+0.04/1 0.90s} O-O {0.00/1 0.67s}
+9. Be3 {0.00/1 0.66s} Nc6 {0.00/1 1.5s} 10. O-O {+0.09/1 0.93s}
+Na5 {+0.01/1 1.3s} 11. Bd3 {-0.09/1 1.2s} b6 {+0.24/1 1.4s}
+12. Qd2 {+0.38/1 0.50s} Bb7 {-0.45/1 1.7s} 13. Bh6 {+1.31/1 1.5s}
+e6 {-0.07/1 1.5s} 14. Bxg7 {-0.24/1 1.4s} Kxg7 {+0.18/1 1.5s}
+15. Rad1 {-0.35/1 0.84s} Rc8 {+0.76/1 1.3s} 16. Qf4 {-0.46/1 1.7s}
+cxd4 {+0.62/1 1.7s} 17. cxd4 {-1.36/1 1.8s} Nc4 {+1.31/1 1.2s}
+18. Rc1 {-1.65/1 1.2s} Nb2 {+0.94/1 1.5s} 19. Rxc8 {-1.25/1 1.4s}
+Nxd3 {+4.76/1 1.4s} 20. Qe3 {-4.74/1 1.8s} Qxc8 {+5.07/1 2.0s}
+21. Qxd3 {-4.71/1 1.7s} Ba6 {+5.35/1 0.33s} 22. Qd2 {-4.67/1 0.43s}
+Qc4 {+5.21/1 0.88s} 23. Re1 {-4.95/1 0.74s} Rc8 {+5.78/1 0.87s}
+24. h4 {-5.23/1 1.1s} Qc2 {+5.23/1 1.7s} 25. Qe3 {-4.39/1 1.5s}
+Bxe2 {+4.54/1 0.97s} 26. Rxe2 {-3.31/1 1.9s} Qc1+ {+4.53/1 1.6s}
+27. Kh2 {-2.87/1 0.90s} Qxe3 {+4.01/1 1.2s} 28. fxe3 {-2.01/1 0.89s}
+Rc3 {+2.99/1 1.00s} 29. Kg3 {-1.96/1 1.2s} b5 {+3.05/1 1.4s}
+30. Kf4 {-1.16/1 0.97s} b4 {+2.40/1 1.2s} 31. Ke5 {+0.09/1 1.3s}
+Kf8 {-0.13/1 1.8s} 32. Kf6 {+1.89/1 1.4s} a5 {-1.71/1 1.2s}
+33. d5 {+3.38/1 0.93s} Ke8 {-1.46/1 1.3s} 34. d6 {+3.18/1 1.1s}
+a4 {-2.31/1 1.3s} 35. e5 {+3.21/1 0.54s} b3 {-2.51/1 1.1s}
+36. axb3 {+3.97/1 0.69s} axb3 {-3.08/1 0.59s} 37. e4 {+5.33/1 0.17s}
+h5 {-4.76/1 0.94s} 38. Rb2 {+6.26/1 1.3s} Re3 {-5.43/1 1.1s}
+39. Rb1 {+6.52/1 0.80s} Rg3 {-6.67/1 1.2s} 40. Rb2 {+6.43/1 0.46s}
+Rc3 {-5.46/1 0.52s} 41. Rb1 {+6.39/1 0.47s} Re3 {-5.98/1 0.69s}
+42. Rb2 {+6.50/1 0.54s} Rc3 {-5.75/1 0.34s} 43. Rb1 {+6.41/1 0.14s}
+Rg3 {-6.71/1 0.45s} 44. Rb2 {+6.38/1 0.17s} Re3 {-5.59/1 0.29s}
+45. Rb1 {+6.73/1 0.28s} Rg3 {-6.73/1 0.32s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "0-1"]
+[ECO "C54"]
+[GameDuration "00:01:01"]
+[GameEndTime "2026-05-31T19:07:18.766 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:06:17.252 Central Daylight Time"]
+[Opening "Giuoco Piano"]
+[PlyCount "57"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Moeller (Therkatz) attack"]
+
+1. e4 {book} e5 {book} 2. Nf3 {book} Nc6 {book} 3. Bc4 {book} Bc5 {book}
+4. c3 {book} Nf6 {book} 5. d4 {+2.53/1 2.3s} exd4 {-2.73/1 2.5s}
+6. cxd4 {+2.34/1 0.82s} Bb4+ {-1.50/1 1.0s} 7. Nc3 {+1.83/1 0.64s}
+Nxe4 {-1.18/1 0.27s} 8. O-O {+1.07/1 0.71s} Bxc3 {-0.85/1 0.58s}
+9. d5 {+1.08/1 0.58s} Ne5 {+1.71/1 0.68s} 10. bxc3 {-1.11/1 0.89s}
+Nxc4 {+2.28/1 1.2s} 11. Re1 {-2.48/1 0.74s} Nd6 {+6.39/1 1.5s}
+12. Ng5 {-4.31/1 1.1s} O-O {+4.85/1 1.6s} 13. Nxe4 {-3.29/1 1.5s}
+Nxe4 {+4.74/1 0.39s} 14. Rxe4 {-3.26/1 0.32s} d6 {+4.72/1 0.21s}
+15. Qf3 {-2.87/1 0.47s} f5 {+4.60/1 1.8s} 16. Re1 {-3.36/1 1.7s}
+Qf6 {+4.42/1 1.5s} 17. Bf4 {-3.88/1 1.5s} Bd7 {+4.96/1 1.4s}
+18. a4 {-3.93/1 1.5s} Rae8 {+4.88/1 1.8s} 19. a5 {-4.76/1 1.8s}
+Re4 {+6.35/1 1.8s} 20. h3 {-5.71/1 1.8s} Rfe8 {+6.00/1 1.9s}
+21. Rxe4 {-5.21/1 1.7s} Rxe4 {+6.07/1 1.2s} 22. Rb1 {-5.29/1 1.1s}
+b6 {+5.64/1 0.84s} 23. Be3 {-5.00/1 1.1s} Qe5 {+6.52/1 1.3s}
+24. Bd4 {-5.98/1 1.6s} Qxd5 {+6.85/1 1.5s} 25. Qg3 {-6.44/1 1.2s}
+Qf7 {+7.48/1 1.3s} 26. Qg5 {-6.47/1 1.5s} Re8 {+7.60/1 2.0s}
+27. axb6 {-7.30/1 1.8s} axb6 {+7.62/1 1.7s} 28. Ra1 {-7.71/1 1.3s}
+h6 {+8.16/1 0.51s} 29. Qg3 {-8.27/1 1.4s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "0-1"]
+[ECO "C53"]
+[GameDuration "00:01:18"]
+[GameEndTime "2026-05-31T19:07:35.508 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:06:17.252 Central Daylight Time"]
+[Opening "Giuoco Piano"]
+[PlyCount "73"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. e4 {book} e5 {book} 2. Nf3 {book} Nc6 {book} 3. Bc4 {book} Bc5 {book}
+4. c3 {book} Nf6 {book} 5. d3 {+1.42/1 2.0s} O-O {-0.92/1 1.8s}
+6. Bb3 {+0.28/1 1.1s} d5 {-0.22/1 1.6s} 7. Nbd2 {-0.16/1 1.1s} a5 {-0.18/1 1.2s}
+8. O-O {+0.13/1 1.0s} dxe4 {-0.08/1 1.4s} 9. dxe4 {0.00/1 1.6s}
+Qe7 {+0.26/1 1.4s} 10. h3 {-0.35/1 0.95s} h6 {+0.45/1 1.7s}
+11. Re1 {-0.50/1 1.3s} Be6 {+0.48/1 1.5s} 12. Nf1 {-0.36/1 1.4s}
+Rfd8 {+0.18/1 1.9s} 13. Qc2 {+0.16/1 1.7s} b5 {+0.14/1 1.6s}
+14. Be3 {+0.38/1 1.6s} Bxe3 {+0.36/1 1.9s} 15. Nxe3 {-0.82/1 1.7s}
+a4 {+0.75/1 1.3s} 16. Bxe6 {-0.60/1 0.33s} Qxe6 {+0.38/1 0.66s}
+17. Nf5 {-1.01/1 0.36s} Ne7 {+1.28/1 1.9s} 18. Nxe7+ {-1.09/1 1.7s}
+Qxe7 {+1.31/1 1.5s} 19. Rad1 {-0.98/1 1.1s} Qe6 {+1.82/1 1.2s}
+20. a3 {-1.42/1 1.5s} c5 {+1.51/1 1.9s} 21. Qe2 {-0.55/1 1.7s} c4 {+1.15/1 1.7s}
+22. Qe3 {+0.68/1 1.3s} Nh5 {-0.28/1 1.4s} 23. Qc5 {+2.93/1 1.5s}
+Nf4 {-0.28/1 1.9s} 24. Qxe5 {+0.34/1 1.5s} Rxd1 {+2.98/1 1.1s}
+25. Rxd1 {-3.24/1 1.3s} Qxe5 {+3.74/1 1.1s} 26. Nxe5 {-3.41/1 0.23s}
+Re8 {+3.91/1 0.24s} 27. Nf3 {-3.47/1 0.20s} Rxe4 {+4.14/1 1.1s}
+28. Nd4 {-3.27/1 1.3s} Re5 {+4.14/1 1.6s} 29. g3 {-2.19/1 1.2s}
+Nd3 {+4.05/1 1.5s} 30. Rd2 {-2.64/1 1.1s} Re1+ {+3.81/1 0.62s}
+31. Kg2 {-4.23/1 1.6s} Rb1 {+3.26/1 1.3s} 32. Nxb5 {-5.98/1 0.75s}
+Ne1+ {+9.15/1 1.2s} 33. Kf1 {-9.26/1 0.96s} Nf3+ {+9.82/1 0.63s}
+34. Ke2 {-9.77/1 0.69s} Nxd2 {+9.97/1 0.59s} 35. Kxd2 {-9.80/1 0.29s}
+Rxb2+ {+9.97/1 0.23s} 36. Ke3 {-9.80/1 0.18s} Rxb5 {+9.96/1 0.63s}
+37. Kd4 {-9.76/1 0.56s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "E46"]
+[GameDuration "00:01:24"]
+[GameEndTime "2026-05-31T19:07:42.085 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:06:17.220 Central Daylight Time"]
+[Opening "Nimzo-Indian"]
+[PlyCount "70"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Reshevsky variation"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} e6 {book} 3. Nc3 {book} Bb4 {book}
+4. e3 {book} O-O {book} 5. Ne2 {+0.69/1 2.2s} d5 {-0.51/1 2.4s}
+6. a3 {+0.32/1 1.5s} Be7 {-0.59/1 0.87s} 7. Nf4 {+0.38/1 0.81s}
+b6 {-0.89/1 1.6s} 8. cxd5 {+0.86/1 1.8s} exd5 {-1.02/1 1.2s}
+9. Be2 {+1.08/1 0.73s} Bb7 {-1.33/1 1.0s} 10. O-O {+1.26/1 1.4s}
+Nbd7 {-1.15/1 0.81s} 11. b4 {+1.26/1 1.7s} c6 {-0.13/1 1.2s}
+12. Bb2 {+0.87/1 1.5s} Re8 {-0.37/1 1.00s} 13. Rc1 {+0.67/1 1.6s}
+Bd6 {+0.01/1 1.4s} 14. Nd3 {+0.03/1 1.7s} Rc8 {+0.61/1 1.6s}
+15. h3 {+0.47/1 1.7s} Qe7 {+0.44/1 1.7s} 16. Re1 {+0.70/1 1.9s}
+Nf8 {+0.28/1 1.9s} 17. Ne5 {+1.31/1 1.8s} Bxe5 {+2.07/1 1.8s}
+18. dxe5 {-1.05/1 2.0s} Qxe5 {+1.72/1 0.67s} 19. a4 {-0.02/1 0.32s}
+Ng6 {+1.56/1 1.4s} 20. a5 {-0.65/1 1.8s} Qg5 {+2.95/1 1.9s}
+21. axb6 {-2.57/1 1.7s} axb6 {+2.99/1 1.9s} 22. Na4 {-3.24/1 1.6s}
+Nh4 {+2.70/1 0.81s} 23. Bg4 {-3.91/1 1.4s} h5 {+3.40/1 1.5s}
+24. Bxf6 {-4.32/1 2.0s} gxf6 {+3.93/1 0.75s} 25. Bf3 {-4.11/1 0.57s}
+Ra8 {+3.33/1 0.73s} 26. Nxb6 {-3.82/1 1.4s} Ra2 {+3.12/1 1.3s}
+27. g3 {-4.83/1 1.7s} Re5 {+2.61/1 1.2s} 28. Bh1 {-2.70/1 0.72s}
+Rf5 {+1.17/1 0.95s} 29. Re2 {-0.95/1 1.9s} Ra3 {-0.08/1 1.2s}
+30. Ra1 {+2.05/1 1.0s} Rxf2 {-3.57/1 1.9s} 31. Kxf2 {+6.72/1 1.9s}
+Qf5+ {-6.89/1 1.6s} 32. Kg1 {+7.40/1 1.1s} Qxh3 {-7.68/1 1.2s}
+33. Rxa3 {+8.71/1 1.5s} Qxg3+ {-8.87/1 1.6s} 34. Rg2 {+9.25/1 0.79s}
+Nxg2 {-9.14/1 0.49s} 35. Bxg2 {+9.35/1 0.80s}
+h4 {-9.40/1 0.72s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "E46"]
+[GameDuration "00:01:18"]
+[GameEndTime "2026-05-31T19:08:30.002 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:07:11.897 Central Daylight Time"]
+[Opening "Nimzo-Indian"]
+[PlyCount "70"]
+[TimeControl "inf"]
+[Variation "Reshevsky variation"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} e6 {book} 3. Nc3 {book} Bb4 {book}
+4. e3 {book} O-O {book} 5. Ne2 {+0.87/1 1.9s} d5 {-0.25/1 2.0s}
+6. a3 {+0.63/1 1.7s} Be7 {-0.29/1 0.85s} 7. Ng3 {+0.49/1 0.70s}
+c5 {-0.13/1 1.8s} 8. dxc5 {+0.40/1 1.6s} Bxc5 {-0.26/1 1.3s}
+9. b4 {+1.03/1 1.5s} Be7 {-0.49/1 1.5s} 10. Bb2 {+1.01/1 0.96s}
+a5 {-0.63/1 1.4s} 11. b5 {+0.07/1 1.3s} dxc4 {+0.15/1 1.3s}
+12. Bxc4 {-0.65/1 0.71s} Nbd7 {+0.23/1 1.2s} 13. O-O {-0.69/1 0.92s}
+b6 {+0.82/1 1.3s} 14. Qe2 {-1.30/1 0.76s} Bb7 {+1.19/1 1.5s}
+15. Rfd1 {-1.12/1 1.0s} Rc8 {+1.46/1 0.83s} 16. Rac1 {-1.39/1 1.1s}
+Qc7 {+0.90/1 1.6s} 17. Ba2 {-1.38/1 0.88s} Qb8 {+1.46/1 1.5s}
+18. Bb1 {-0.42/1 1.2s} Rfd8 {+0.80/1 1.8s} 19. Nce4 {+0.86/1 1.7s}
+Rxc1 {+0.27/1 1.8s} 20. Rxc1 {+0.12/1 1.6s} a4 {+0.61/1 0.51s}
+21. h3 {+1.03/1 2.0s} h6 {+0.20/1 2.0s} 22. Rc4 {+2.01/1 1.9s}
+Qa8 {-2.17/1 2.0s} 23. Qc2 {+2.31/1 1.9s} Nxe4 {-2.70/1 1.9s}
+24. Nxe4 {+3.30/1 1.6s} f5 {-3.33/1 1.2s} 25. Rxa4 {+3.00/1 1.4s}
+Qb8 {-3.01/1 1.6s} 26. Ng3 {+3.81/1 1.3s} Nc5 {-3.44/1 1.7s}
+27. Rd4 {+3.93/1 1.5s} Bf6 {-2.15/1 1.6s} 28. Rxd8+ {+3.59/1 1.2s}
+Qxd8 {-2.47/1 1.1s} 29. Bxf6 {+3.43/1 0.29s} Qxf6 {-1.50/1 0.87s}
+30. Ba2 {+3.45/1 0.90s} Kh7 {-1.63/1 1.4s} 31. a4 {+3.13/1 1.6s}
+Qa1+ {-2.29/1 1.6s} 32. Kh2 {+3.17/1 1.4s} Qe5 {-2.01/1 0.68s}
+33. Kg1 {+3.20/1 0.36s} Qa1+ {-2.40/1 0.31s} 34. Kh2 {+3.19/1 0.19s}
+Qe5 {-2.01/1 0.35s} 35. Kg1 {+3.12/1 0.18s}
+Qa1+ {-2.37/1 0.30s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "A81"]
+[GameDuration "00:01:18"]
+[GameEndTime "2026-05-31T19:08:37.679 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:07:18.773 Central Daylight Time"]
+[Opening "Dutch defense"]
+[PlyCount "76"]
+[TimeControl "inf"]
+
+1. d4 {book} f5 {book} 2. g3 {book} Nf6 {book} 3. Bg2 {book} g6 {book}
+4. Nf3 {book} Bg7 {book} 5. c4 {+2.28/1 1.6s} O-O {-2.20/1 2.2s}
+6. O-O {+2.15/1 1.3s} d6 {-2.18/1 0.50s} 7. Nc3 {+2.25/1 1.3s}
+Qe8 {-2.27/1 0.74s} 8. d5 {+2.57/1 1.8s} a5 {-1.81/1 1.5s} 9. Nd4 {+2.44/1 1.7s}
+Na6 {-1.88/1 1.6s} 10. b3 {+2.65/1 1.4s} Nc5 {-2.58/1 1.2s}
+11. Rb1 {+2.75/1 1.9s} Bd7 {-2.35/1 1.7s} 12. a3 {+2.21/1 1.7s}
+c6 {-1.33/1 1.4s} 13. b4 {+1.03/1 1.7s} axb4 {-1.08/1 1.6s}
+14. axb4 {+1.16/1 1.5s} Nce4 {-0.65/1 0.44s} 15. Bb2 {+1.38/1 0.27s}
+Nxc3 {-0.78/1 1.1s} 16. Bxc3 {+0.64/1 1.5s} cxd5 {-0.09/1 0.83s}
+17. cxd5 {+0.38/1 1.00s} Ne4 {+0.59/1 1.2s} 18. Bb2 {+0.46/1 1.1s}
+Qf7 {+0.87/1 1.2s} 19. f3 {+0.39/1 1.4s} Nf6 {+1.67/1 1.4s}
+20. e4 {-0.12/1 1.4s} fxe4 {+1.90/1 0.47s} 21. fxe4 {-0.40/1 0.78s}
+Qe8 {+2.11/1 0.17s} 22. Qe2 {-0.59/1 0.39s} Ng4 {+3.13/1 1.5s}
+23. Rxf8+ {-2.73/1 1.7s} Qxf8 {+4.13/1 1.3s} 24. Rf1 {-3.93/1 1.2s}
+Qe8 {+5.09/1 0.89s} 25. Ne6 {-4.41/1 1.6s} Bxe6 {+5.32/1 1.7s}
+26. dxe6 {-4.99/1 1.7s} Bxb2 {+5.24/1 0.49s} 27. Qxg4 {-4.63/1 0.95s}
+Bf6 {+4.82/1 1.5s} 28. e5 {-2.60/1 1.8s} Bxe5 {+2.48/1 1.6s}
+29. Bxb7 {-1.51/1 1.1s} Rb8 {+1.05/1 1.1s} 30. Qf3 {-0.78/1 1.2s}
+Bf6 {+0.81/1 1.0s} 31. Bc6 {-0.29/1 1.1s} Qd8 {+0.72/1 0.34s}
+32. b5 {-0.51/1 0.58s} Qb6+ {+0.81/1 0.54s} 33. Kg2 {-0.74/1 0.86s}
+Qd4 {+0.99/1 0.94s} 34. Qe2 {+0.37/1 1.5s} Kg7 {+0.19/1 1.6s}
+35. Rf4 {-0.33/1 1.4s} Qa1 {+0.55/1 1.2s} 36. Rf1 {-0.63/1 1.1s}
+Qd4 {+0.19/1 0.49s} 37. Rf4 {-0.39/1 0.45s} Qa1 {+0.56/1 0.31s}
+38. Rf1 {-0.60/1 0.40s} Qd4 {+0.22/1 0.51s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "A81"]
+[GameDuration "00:00:57"]
+[GameEndTime "2026-05-31T19:08:22.501 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:07:24.967 Central Daylight Time"]
+[Opening "Dutch defense"]
+[PlyCount "48"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. d4 {book} f5 {book} 2. g3 {book} Nf6 {book} 3. Bg2 {book} g6 {book}
+4. Nf3 {book} Bg7 {book} 5. O-O {+2.17/1 1.8s} O-O {-2.15/1 1.7s}
+6. c4 {+2.28/1 0.61s} d6 {-2.04/1 1.2s} 7. Nc3 {+2.09/1 1.1s} c6 {-2.30/1 1.0s}
+8. Re1 {+3.11/1 1.9s} Ne4 {-2.24/1 2.0s} 9. Qc2 {+2.79/1 2.0s}
+Nxc3 {-2.10/1 1.8s} 10. Qxc3 {+2.78/1 0.91s} c5 {-1.57/1 1.1s}
+11. Be3 {+2.98/1 1.5s} Nc6 {-2.46/1 1.7s} 12. Rad1 {+3.20/1 1.3s}
+cxd4 {-3.51/1 1.5s} 13. Nxd4 {+4.04/1 1.7s} Bd7 {-3.84/1 1.6s}
+14. c5 {+5.84/1 1.2s} f4 {-5.10/1 1.9s} 15. gxf4 {+7.43/1 2.0s}
+dxc5 {-7.20/1 1.8s} 16. Qxc5 {+8.04/1 1.5s} Qc8 {-5.96/1 2.0s}
+17. Nxc6 {+6.35/1 1.8s} Bxc6 {-5.52/1 1.6s} 18. Bxc6 {+6.10/1 1.2s}
+bxc6 {-5.07/1 1.2s} 19. Qxe7 {+6.38/1 0.49s} Qg4+ {-5.87/1 1.3s}
+20. Kh1 {+6.70/1 1.3s} Rae8 {-6.78/1 1.2s} 21. Qd7 {+7.77/1 1.2s}
+Qxd7 {-7.49/1 1.3s} 22. Rxd7 {+8.17/1 1.9s} Bxb2 {-7.99/1 1.2s}
+23. Rb1 {+8.87/1 0.82s} Bf6 {-8.58/1 1.4s} 24. Rbb7 {+9.06/1 1.5s}
+Rb8 {-8.65/1 1.3s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "A40"]
+[GameDuration "00:01:08"]
+[GameEndTime "2026-05-31T19:08:44.361 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:07:35.513 Central Daylight Time"]
+[Opening "Queen's pawn"]
+[PlyCount "66"]
+[TimeControl "inf"]
+
+1. d4 {book} e6 {book} 2. Nf3 {book} d5 {book} 3. c4 {book} Nd7 {book}
+4. Nc3 {book} Ngf6 {book} 5. cxd5 {+1.50/1 2.2s} exd5 {-1.39/1 1.8s}
+6. Bf4 {+1.41/1 1.1s} c6 {-1.44/1 1.1s} 7. e3 {+1.44/1 1.1s} Be7 {-1.43/1 0.79s}
+8. h3 {+1.85/1 1.4s} O-O {-1.76/1 1.9s} 9. Bd3 {+1.89/1 1.4s}
+Re8 {-1.83/1 0.82s} 10. O-O {+1.77/1 0.95s} Nf8 {-1.69/1 0.99s}
+11. Qc2 {+1.76/1 1.4s} Ng6 {-2.06/1 1.2s} 12. Bh2 {+2.16/1 1.7s}
+Bd6 {-2.20/1 1.5s} 13. Bxd6 {+1.79/1 1.4s} Qxd6 {-1.87/1 1.1s}
+14. Rab1 {+1.98/1 0.36s} a5 {-2.14/1 0.50s} 15. a3 {+2.02/1 1.8s}
+Bd7 {-2.14/1 0.71s} 16. Na4 {+1.97/1 1.9s} Ne4 {-1.83/1 2.1s}
+17. Nb6 {+2.68/1 1.5s} Rad8 {-3.47/1 1.9s} 18. Nxd7 {+3.27/1 1.7s}
+Rxd7 {-3.61/1 1.8s} 19. b4 {+3.34/1 1.3s} axb4 {-3.78/1 0.95s}
+20. axb4 {+3.80/1 0.86s} Rc7 {-3.55/1 0.60s} 21. b5 {+2.38/1 1.9s}
+cxb5 {-1.62/1 1.8s} 22. Qb3 {+1.37/1 1.5s} Nc3 {-2.03/1 1.1s}
+23. Bxb5 {+2.36/1 1.2s} Rec8 {-2.23/1 1.2s} 24. Rb2 {+2.77/1 1.6s}
+Nxb5 {-1.87/1 0.95s} 25. Qxb5 {+1.84/1 1.2s} h6 {-1.58/1 0.70s}
+26. Qb6 {+2.18/1 1.0s} Qe7 {-1.62/1 1.2s} 27. Rb5 {+2.41/1 1.9s}
+Qd7 {-2.63/1 1.8s} 28. Rfb1 {+2.40/1 1.5s} Rc1+ {-3.21/1 1.4s}
+29. Rxc1 {+2.82/1 1.6s} Rxc1+ {-2.74/1 1.5s} 30. Kh2 {+2.78/1 0.53s}
+Rc2 {-2.24/1 0.12s} 31. Kg1 {+2.79/1 0.40s} Rc1+ {-2.87/1 0.40s}
+32. Kh2 {+2.82/1 0.25s} Rc2 {-2.56/1 0.15s} 33. Kg1 {+2.84/1 0.13s}
+Rc1+ {-2.77/1 0.14s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "A40"]
+[GameDuration "00:01:10"]
+[GameEndTime "2026-05-31T19:08:53.021 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:07:42.095 Central Daylight Time"]
+[Opening "Queen's pawn"]
+[PlyCount "67"]
+[TimeControl "inf"]
+
+1. d4 {book} e6 {book} 2. Nf3 {book} d5 {book} 3. c4 {book} Nd7 {book}
+4. Nc3 {book} Ngf6 {book} 5. Bg5 {+1.44/1 1.6s} h6 {-1.08/1 2.0s}
+6. Bh4 {+1.20/1 1.8s} dxc4 {-0.69/1 1.5s} 7. e4 {+0.45/1 1.4s} b5 {+0.61/1 1.5s}
+8. e5 {-1.26/1 1.3s} g5 {+1.52/1 1.6s} 9. Nxg5 {-2.00/1 0.80s}
+hxg5 {+1.93/1 1.7s} 10. Bxg5 {-1.88/1 1.5s} Bb7 {+2.06/1 0.26s}
+11. exf6 {-2.01/1 0.62s} a6 {+2.01/1 1.1s} 12. d5 {-1.60/1 0.60s}
+Nxf6 {+2.16/1 1.8s} 13. dxe6 {-0.71/1 2.0s} Qxd1+ {+0.60/1 1.7s}
+14. Rxd1 {-0.32/1 1.7s} Be7 {+1.11/1 1.4s} 15. a4 {-0.51/1 0.55s}
+Bc6 {+2.06/1 1.2s} 16. exf7+ {-2.45/1 1.2s} Kxf7 {+2.19/1 1.3s}
+17. h4 {-2.14/1 0.78s} Rae8 {+2.25/1 1.3s} 18. axb5 {-3.74/1 1.7s}
+axb5 {+2.90/1 1.7s} 19. f3 {-3.01/1 1.1s} Bb4+ {+2.52/1 0.83s}
+20. Kd2 {-2.08/1 1.3s} Nd5 {+2.95/1 2.0s} 21. Kc2 {-1.51/1 1.5s}
+Ne3+ {+2.78/1 0.74s} 22. Bxe3 {-2.02/1 0.75s} Rxe3 {+2.47/1 0.49s}
+23. h5 {-1.47/1 0.13s} Bd6 {+2.33/1 0.76s} 24. Rh4 {-0.90/1 1.1s}
+Rh6 {+2.24/1 1.5s} 25. Ne4 {-2.43/1 1.6s} Be5 {+3.57/1 1.9s}
+26. Ng5+ {-4.53/1 1.7s} Ke7 {+4.73/1 1.7s} 27. Ne4 {-2.75/1 1.8s}
+Rb3 {+3.35/1 1.5s} 28. Nc3 {-0.67/1 1.2s} Bf6 {+2.38/1 1.4s}
+29. Rh3 {-0.40/1 0.79s} Be5 {+1.95/1 1.2s} 30. g4 {+1.15/1 1.7s}
+Kf6 {+0.79/1 1.7s} 31. Rd8 {+1.76/1 1.2s} Ke7 {+0.57/1 0.64s}
+32. Rd1 {+1.31/1 0.43s} Kf6 {+0.75/1 0.25s} 33. Rd8 {+1.41/1 0.16s}
+Ke7 {+0.79/1 0.51s} 34. Rd1 {+0.80/1 0.27s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "0-1"]
+[ECO "E12"]
+[GameDuration "00:01:58"]
+[GameEndTime "2026-05-31T19:09:41.913 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:07:43.782 Central Daylight Time"]
+[Opening "Queen's Indian"]
+[PlyCount "115"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Petrosian system"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} e6 {book} 3. Nf3 {book} b6 {book}
+4. a3 {book} Bb7 {book} 5. Nc3 {+1.06/1 2.1s} d5 {-0.64/1 2.1s}
+6. cxd5 {+0.51/1 1.2s} Nxd5 {+0.04/1 1.6s} 7. e4 {-0.80/1 1.6s}
+Nxc3 {+0.38/1 1.9s} 8. bxc3 {+0.41/1 1.6s} Bxe4 {+0.27/1 0.20s}
+9. Ne5 {+1.44/1 0.35s} Bd5 {+0.75/1 0.83s} 10. Qh5 {-0.19/1 1.8s}
+g6 {+3.21/1 2.0s} 11. Bg5 {-1.09/1 1.9s} Be7 {+1.68/1 1.9s}
+12. Bxe7 {+0.82/1 1.6s} Qxe7 {+0.31/1 0.67s} 13. Qh6 {+0.42/1 0.85s}
+Nd7 {-0.14/1 0.18s} 14. Bb5 {+2.38/1 1.5s} c6 {-1.62/1 1.3s}
+15. Nxc6 {+2.80/1 1.6s} Bxc6 {-1.12/1 1.6s} 16. Bxc6 {+1.77/1 0.94s}
+Rc8 {-0.53/1 0.58s} 17. Bb5 {+1.47/1 0.25s} Qf8 {-0.18/1 0.74s}
+18. Qe3 {+0.29/1 1.2s} Qd6 {+0.46/1 1.3s} 19. O-O {-0.31/1 1.3s}
+O-O {+0.66/1 0.84s} 20. c4 {-0.10/1 0.91s} Nf6 {+0.21/1 0.67s}
+21. h3 {+0.64/1 1.3s} Rfd8 {-0.88/1 1.2s} 22. Rfd1 {+1.19/1 1.3s}
+Kg7 {-0.97/1 0.94s} 23. a4 {+2.04/1 1.4s} Qc7 {-0.81/1 1.5s}
+24. a5 {+0.70/1 1.6s} bxa5 {+0.91/1 1.7s} 25. Qc3 {+0.47/1 1.5s}
+Nd5 {+2.47/1 1.3s} 26. Qb2 {+0.55/1 1.5s} Nb6 {+0.53/1 1.7s}
+27. d5+ {+2.34/1 2.1s} e5 {-1.71/1 1.8s} 28. Rac1 {+3.56/1 0.52s}
+Qd6 {-3.43/1 1.9s} 29. f4 {+4.99/1 1.7s} f6 {-5.43/1 1.8s}
+30. fxe5 {+5.75/1 1.3s} Qxe5 {-4.90/1 0.49s} 31. Qf2 {+6.06/1 0.86s}
+Qg5 {-4.97/1 0.76s} 32. h4 {+5.47/1 1.8s} Qf5 {-4.52/1 1.9s}
+33. Qxf5 {+6.57/1 1.6s} gxf5 {-5.79/1 1.4s} 34. Bc6 {+7.14/1 0.72s}
+a4 {-6.78/1 0.43s} 35. c5 {+7.34/1 1.9s} Nd7 {-6.73/1 1.3s}
+36. Bxd7 {+7.21/1 0.54s} Rxd7 {-6.27/1 1.0s} 37. c6 {+7.06/1 1.1s}
+Rd6 {-5.75/1 0.92s} 38. Ra1 {+7.11/1 1.1s} a5 {-5.50/1 1.0s}
+39. Kf2 {+6.24/1 1.4s} Rcd8 {-4.88/1 1.3s} 40. Rxa4 {+5.70/1 1.7s}
+Rxd5 {-4.34/1 0.77s} 41. Rxd5 {+4.88/1 0.73s} Rxd5 {-4.10/1 0.36s}
+42. Rc4 {+5.06/1 0.17s} Rd8 {-4.11/1 0.19s} 43. c7 {+4.50/1 0.25s}
+Rc8 {-2.76/1 0.70s} 44. Ke3 {+3.77/1 0.69s} Kf7 {-2.00/1 0.86s}
+45. Kf4 {+2.73/1 0.94s} Ke6 {-1.51/1 0.84s} 46. Rc6+ {+1.92/1 1.1s}
+Kd7 {-1.03/1 1.1s} 47. Rxf6 {+0.96/1 1.3s} Rxc7 {-0.71/1 0.55s}
+48. Rxf5 {+1.06/1 1.2s} a4 {-0.24/1 0.85s} 49. Ra5 {+0.99/1 1.1s}
+Rc4+ {+0.08/1 0.44s} 50. Kg5 {+0.64/1 0.48s} Kc6 {+1.33/1 0.28s}
+51. Ra7 {-0.17/1 0.97s} Kb6 {+2.12/1 1.6s} 52. Rxh7 {-1.05/1 1.3s}
+a3 {+1.76/1 0.80s} 53. Rh8 {-1.78/1 0.83s} a2 {+7.32/1 1.2s}
+54. Ra8 {-6.94/1 1.5s} Rc5+ {+8.16/1 0.71s} 55. Kg6 {-7.60/1 0.36s}
+Ra5 {+8.36/1 0.87s} 56. Rxa5 {-8.56/1 1.1s} Kxa5 {+8.61/1 0.53s}
+57. h5 {-9.00/1 0.44s} a1=Q {+8.97/1 0.15s}
+58. h6 {-9.44/1 0.37s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "E12"]
+[GameDuration "00:01:20"]
+[GameEndTime "2026-05-31T19:09:04.874 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:07:43.882 Central Daylight Time"]
+[Opening "Queen's Indian"]
+[PlyCount "76"]
+[TimeControl "inf"]
+[Variation "Petrosian system"]
+
+1. d4 {book} Nf6 {book} 2. c4 {book} e6 {book} 3. Nf3 {book} b6 {book}
+4. a3 {book} Bb7 {book} 5. Nc3 {+1.03/1 2.0s} d5 {-0.72/1 2.1s}
+6. Bg5 {+0.89/1 1.1s} Be7 {-0.64/1 1.6s} 7. e3 {+0.65/1 1.1s} O-O {-0.43/1 1.5s}
+8. Rc1 {+0.39/1 1.1s} c5 {+0.13/1 2.0s} 9. cxd5 {-0.07/1 1.8s}
+Nxd5 {+0.01/1 1.5s} 10. Bxe7 {-0.06/1 1.1s} Qxe7 {+0.07/1 0.69s}
+11. dxc5 {+0.29/1 0.47s} bxc5 {+0.11/1 1.2s} 12. Be2 {+0.63/1 1.4s}
+Nd7 {+0.07/1 1.3s} 13. O-O {+0.48/1 1.2s} Nxc3 {-0.26/1 1.3s}
+14. Rxc3 {+0.71/1 1.6s} Rfd8 {-0.17/1 1.4s} 15. Qc2 {+0.84/1 1.3s}
+Rac8 {-0.63/1 1.5s} 16. Rc1 {+1.24/1 1.5s} h6 {-0.61/1 1.7s}
+17. Qa4 {+1.18/1 2.0s} Bxf3 {+0.08/1 2.0s} 18. Bxf3 {+1.01/1 1.6s}
+Ne5 {+0.10/1 1.3s} 19. Be2 {+1.19/1 1.0s} Rd2 {-0.52/1 1.2s}
+20. R3c2 {+1.65/1 0.93s} Qd8 {-0.17/1 1.3s} 21. h3 {+2.07/1 1.5s}
+c4 {-0.95/1 2.0s} 22. Qxa7 {+3.36/1 1.8s} g6 {-1.52/1 1.6s}
+23. Qa4 {+3.77/1 1.2s} Rb8 {-1.45/1 1.8s} 24. Bxc4 {+4.51/1 2.2s}
+Rxb2 {-3.03/1 1.4s} 25. Rxb2 {+4.47/1 0.79s} Rxb2 {-3.78/1 1.3s}
+26. Bf1 {+4.45/1 1.3s} Qd2 {-4.45/1 0.36s} 27. Rc8+ {+5.05/1 0.73s}
+Kg7 {-5.13/1 0.98s} 28. Qf4 {+5.31/1 0.22s} Qd6 {-4.98/1 0.19s}
+29. Qd4 {+5.24/1 1.0s} Qxd4 {-4.38/1 1.3s} 30. exd4 {+4.63/1 1.0s}
+Nd7 {-4.19/1 0.19s} 31. Rc7 {+4.75/1 0.16s} Nb6 {-4.30/1 0.95s}
+32. Rb7 {+5.43/1 1.6s} Kf6 {-4.29/1 0.96s} 33. g3 {+5.28/1 0.76s}
+g5 {-4.55/1 1.5s} 34. Kg2 {+4.68/1 1.1s} h5 {-3.56/1 1.7s}
+35. Kf3 {+4.01/1 1.3s} Rb3+ {-3.92/1 1.0s} 36. Kg2 {+4.23/1 0.70s}
+Rb2 {-3.60/1 0.36s} 37. Kf3 {+4.07/1 0.12s} Rb3+ {-3.90/1 0.23s}
+38. Kg2 {+4.28/1 0.33s} Rb2 {-3.63/1 0.27s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "C03"]
+[GameDuration "00:00:54"]
+[GameEndTime "2026-05-31T19:09:16.540 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:08:22.507 Central Daylight Time"]
+[Opening "French"]
+[PlyCount "54"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Tarrasch"]
+
+1. e4 {book} e6 {book} 2. d4 {book} d5 {book} 3. Nd2 {book} a6 {book}
+4. Ngf3 {book} Nf6 {book} 5. e5 {+2.76/1 1.8s} Nfd7 {-2.73/1 1.7s}
+6. c3 {+2.59/1 0.54s} c5 {-2.51/1 0.81s} 7. Bd3 {+2.42/1 1.1s}
+Nc6 {-2.38/1 0.25s} 8. O-O {+2.23/1 1.1s} g5 {-1.30/1 0.92s}
+9. Nb3 {+2.46/1 2.0s} g4 {-3.27/1 1.8s} 10. Ng5 {+4.00/1 1.8s} c4 {-2.68/1 1.4s}
+11. Bxh7 {+4.76/1 0.62s} cxb3 {-3.13/1 0.88s} 12. Qxg4 {+3.84/1 1.2s}
+Qe7 {-3.12/1 0.44s} 13. axb3 {+3.73/1 0.87s} Bh6 {-2.79/1 1.2s}
+14. Bc2 {+3.59/1 1.3s} Nf8 {-3.85/1 1.6s} 15. f4 {+4.76/1 1.7s}
+Bd7 {-4.67/1 1.5s} 16. f5 {+4.36/1 1.7s} exf5 {-3.60/1 1.6s}
+17. Bxf5 {+4.26/1 1.3s} Rg8 {-3.35/1 0.53s} 18. h4 {+4.60/1 0.97s}
+Bxf5 {-3.27/1 0.73s} 19. Rxf5 {+4.50/1 1.7s} Ne6 {-1.59/1 0.99s}
+20. Qh5 {+1.54/1 1.3s} Bxg5 {-0.22/1 0.50s} 21. Bxg5 {+2.29/1 0.77s}
+Nxg5 {+0.98/1 0.62s} 22. Rxg5 {+4.05/1 0.51s} O-O-O {-4.02/1 1.8s}
+23. Qg4+ {+8.00/1 1.6s} Qd7 {-8.05/1 1.2s} 24. Rxg8 {+9.75/1 1.4s}
+Kc7 {-9.57/1 1.3s} 25. Qxd7+ {+9.98/1 1.3s} Rxd7 {-9.93/1 1.0s}
+26. h5 {+9.97/1 0.86s} Ne7 {-9.87/1 0.70s} 27. Rg7 {+9.93/1 1.5s}
+Nf5 {-9.85/1 1.6s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "C03"]
+[GameDuration "00:00:32"]
+[GameEndTime "2026-05-31T19:09:02.784 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:08:30.002 Central Daylight Time"]
+[Opening "French"]
+[PlyCount "36"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Tarrasch"]
+
+1. e4 {book} e6 {book} 2. d4 {book} d5 {book} 3. Nd2 {book} a6 {book}
+4. Ngf3 {book} Nf6 {book} 5. e5 {+2.85/1 1.6s} Nfd7 {-2.69/1 1.6s}
+6. Bd3 {+2.85/1 0.47s} c5 {-2.43/1 1.0s} 7. c3 {+2.48/1 0.81s}
+Nc6 {-2.38/1 0.19s} 8. O-O {+2.08/1 0.67s} g5 {-0.70/1 1.4s}
+9. Nb3 {+2.18/1 1.6s} g4 {-2.82/1 2.0s} 10. Ng5 {+3.63/1 1.5s} c4 {-3.85/1 1.2s}
+11. Bxh7 {+3.20/1 0.78s} cxb3 {-3.94/1 0.96s} 12. Qxg4 {+3.59/1 0.63s}
+Qe7 {-2.93/1 0.98s} 13. f4 {+5.09/1 0.53s} Nb6 {-5.12/1 1.8s}
+14. axb3 {+7.11/1 1.9s} Bd7 {-6.82/1 1.8s} 15. f5 {+6.68/1 1.7s}
+exf5 {-6.31/1 1.6s} 16. Bxf5 {+6.66/1 0.78s} O-O-O {-6.68/1 1.1s}
+17. Bxd7+ {+7.09/1 0.60s} Qxd7 {-6.79/1 1.6s} 18. Qxd7+ {+6.98/1 0.88s}
+Rxd7 {-7.29/1 0.96s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "B29"]
+[GameDuration "00:00:21"]
+[GameEndTime "2026-05-31T19:08:59.561 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:08:37.679 Central Daylight Time"]
+[Opening "Sicilian"]
+[PlyCount "24"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Nimzowitsch-Rubinstein variation"]
+
+1. e4 {book} c5 {book} 2. Nf3 {book} Nf6 {book} 3. e5 {book} Nd5 {book}
+4. Nc3 {book} Nc7 {book} 5. d4 {+3.35/1 2.2s} cxd4 {-4.04/1 2.1s}
+6. Qxd4 {+3.48/1 0.37s} Nc6 {-4.72/1 0.65s} 7. Qh4 {+4.55/1 0.88s}
+Ne6 {-4.96/1 0.87s} 8. Be3 {+6.21/1 1.9s} g6 {-6.26/1 1.8s}
+9. O-O-O {+6.72/1 1.7s} Bg7 {-7.05/1 1.6s} 10. Bh6 {+6.76/1 0.98s}
+Bxh6+ {-6.77/1 1.3s} 11. Qxh6 {+7.06/1 2.0s} Qa5 {-7.19/1 1.5s}
+12. Bc4 {+7.67/1 0.66s} Nxe5 {-7.61/1 1.3s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "B29"]
+[GameDuration "00:00:44"]
+[GameEndTime "2026-05-31T19:09:28.426 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:08:44.370 Central Daylight Time"]
+[Opening "Sicilian"]
+[PlyCount "42"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Nimzowitsch-Rubinstein variation"]
+
+1. e4 {book} c5 {book} 2. Nf3 {book} Nf6 {book} 3. e5 {book} Nd5 {book}
+4. Nc3 {book} Nc7 {book} 5. d4 {+4.07/1 2.1s} cxd4 {-3.33/1 2.0s}
+6. Qxd4 {+4.53/1 0.54s} Nc6 {-3.81/1 0.87s} 7. Qh4 {+5.15/1 0.84s}
+h6 {-3.97/1 1.0s} 8. Bc4 {+4.05/1 1.9s} e6 {-4.11/1 2.1s} 9. Qg3 {+4.07/1 1.7s}
+b5 {-3.09/1 1.8s} 10. Bd3 {+4.55/1 1.9s} Bb7 {-3.21/1 1.5s}
+11. O-O {+4.69/1 1.6s} Nb4 {-3.21/1 1.5s} 12. Be4 {+3.72/1 1.3s}
+Bxe4 {-3.75/1 1.5s} 13. Nxe4 {+1.97/1 1.5s} Nxc2 {-4.52/1 0.71s}
+14. Rb1 {+1.54/1 0.23s} Nd5 {-0.18/1 1.4s} 15. Bd2 {+1.44/1 0.35s}
+Rc8 {-0.30/1 0.80s} 16. Rbc1 {+1.78/1 1.7s} Rc6 {-0.90/1 1.5s}
+17. Nd6+ {+5.70/1 1.7s} Bxd6 {-6.50/1 1.8s} 18. Qxg7 {+7.21/1 1.2s}
+Rf8 {-6.69/1 0.44s} 19. exd6 {+7.27/1 0.99s} Qf6 {-6.88/1 0.48s}
+20. Qg3 {+7.76/1 0.23s} Qg6 {-6.85/1 1.3s} 21. Ne5 {+7.22/1 2.0s}
+Qxg3 {-7.71/1 1.5s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "A13"]
+[GameDuration "00:00:50"]
+[GameEndTime "2026-05-31T19:09:43.357 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:08:53.021 Central Daylight Time"]
+[Opening "English Opening"]
+[PlyCount "49"]
+[TimeControl "inf"]
+
+1. c4 {book} e6 {book} 2. d4 {book} d5 {book} 3. Nc3 {book} Be7 {book}
+4. Nf3 {book} Nf6 {book} 5. Bf4 {+1.21/1 2.1s} O-O {-1.07/1 2.0s}
+6. e3 {+1.26/1 1.7s} b6 {-1.31/1 0.61s} 7. cxd5 {+1.31/1 1.7s}
+exd5 {-1.62/1 1.3s} 8. Bd3 {+1.21/1 1.3s} Bb7 {-1.75/1 0.87s}
+9. O-O {+1.67/1 1.6s} c5 {-1.41/1 0.86s} 10. Rc1 {+1.61/1 1.3s}
+Nc6 {-1.37/1 1.0s} 11. a3 {+1.37/1 1.7s} Rc8 {-1.91/1 1.3s}
+12. Bf5 {+2.97/1 1.8s} Ra8 {-2.39/1 1.9s} 13. Ne5 {+2.81/1 1.3s}
+Bd6 {-1.87/1 1.6s} 14. Nb5 {+2.70/1 1.9s} Bb8 {-1.88/1 2.0s}
+15. Qf3 {+2.60/1 1.8s} Re8 {-0.55/1 1.9s} 16. Ng4 {+3.87/1 2.2s}
+a6 {-3.53/1 2.0s} 17. Bg5 {+7.14/1 1.9s} axb5 {-6.92/1 1.9s}
+18. Bxf6 {+7.87/1 1.4s} gxf6 {-7.68/1 1.0s} 19. Qh3 {+8.31/1 1.3s}
+Kf8 {-5.26/1 0.60s} 20. Qh6+ {+7.38/1 0.80s} Ke7 {-4.91/1 0.35s}
+21. Qxf6+ {+7.30/1 0.28s} Kf8 {-5.00/1 0.14s} 22. Qh6+ {+7.57/1 0.13s}
+Ke7 {-5.74/1 0.65s} 23. Qf6+ {+7.36/1 0.50s} Kf8 {-5.52/1 0.44s}
+24. Qh6+ {+7.57/1 0.39s} Ke7 {-6.00/1 0.43s}
+25. Qf6+ {+7.25/1 0.32s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "A13"]
+[GameDuration "00:01:34"]
+[GameEndTime "2026-05-31T19:10:33.984 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:08:59.561 Central Daylight Time"]
+[Opening "English Opening"]
+[PlyCount "82"]
+[TimeControl "inf"]
+
+1. c4 {book} e6 {book} 2. d4 {book} d5 {book} 3. Nc3 {book} Be7 {book}
+4. Nf3 {book} Nf6 {book} 5. Bf4 {+1.22/1 1.9s} O-O {-1.09/1 2.1s}
+6. e3 {+1.17/1 1.3s} c5 {-1.28/1 1.2s} 7. dxc5 {+1.45/1 1.3s}
+Bxc5 {-1.25/1 1.3s} 8. cxd5 {+2.34/1 0.91s} exd5 {-1.51/1 1.9s}
+9. Be2 {+2.15/1 1.4s} Nc6 {-1.58/1 1.2s} 10. O-O {+1.83/1 1.2s}
+a6 {-1.38/1 0.92s} 11. Rc1 {+1.64/1 0.99s} Ba7 {-1.29/1 1.8s}
+12. h3 {+1.64/1 1.2s} Re8 {-0.94/1 1.7s} 13. Qb3 {+3.24/1 1.6s}
+Na5 {-2.45/1 1.9s} 14. Qa3 {+3.24/1 1.8s} Nc6 {-2.58/1 1.6s}
+15. Rfd1 {+2.53/1 1.8s} Be6 {-2.07/1 1.6s} 16. Na4 {+2.20/1 0.65s}
+Qa5 {-1.58/1 1.9s} 17. Nc5 {+2.54/1 2.0s} Qxa3 {-2.44/1 1.8s}
+18. bxa3 {+2.14/1 1.1s} Bxc5 {-1.82/1 0.63s} 19. Rxc5 {+1.85/1 0.38s}
+Ne4 {-1.39/1 0.55s} 20. Rc2 {+1.56/1 0.70s} Rac8 {-0.88/1 1.2s}
+21. Rdc1 {+1.52/1 1.3s} Bd7 {-1.17/1 1.8s} 22. Nd2 {+2.93/1 1.9s}
+Nxd2 {-2.68/1 1.9s} 23. Rxd2 {+2.64/1 1.9s} Nd4 {+1.15/1 1.5s}
+24. Rxc8 {-0.49/1 1.9s} Nxe2+ {+1.21/1 1.4s} 25. Rxe2 {-1.04/1 0.40s}
+Rxc8 {+1.29/1 0.22s} 26. Rb2 {-1.29/1 0.31s} b5 {+1.68/1 1.2s}
+27. Rd2 {-1.71/1 1.3s} Be6 {+2.09/1 1.4s} 28. Bd6 {-1.52/1 1.4s}
+f6 {+1.69/1 1.3s} 29. Bb4 {-1.42/1 1.2s} Rc1+ {+1.55/1 1.5s}
+30. Kh2 {-1.45/1 1.3s} Kf7 {+1.67/1 1.1s} 31. Kg3 {-1.70/1 0.70s}
+g5 {+2.33/1 1.4s} 32. h4 {-1.91/1 1.2s} Kg6 {+2.64/1 1.5s} 33. f3 {-2.05/1 1.5s}
+h5 {+2.92/1 1.7s} 34. Be7 {-2.60/1 1.2s} Rc4 {+3.61/1 1.5s}
+35. hxg5 {-3.56/1 1.5s} fxg5 {+3.67/1 1.1s} 36. Kf2 {-3.33/1 1.1s}
+h4 {+3.97/1 1.3s} 37. g4 {-2.62/1 1.2s} Rc1 {+4.60/1 1.6s}
+38. Kg2 {-4.17/1 1.7s} Rc3 {+5.01/1 1.4s} 39. Kf2 {-4.37/1 0.98s}
+Rc1 {+4.62/1 0.62s} 40. Kg2 {-4.18/1 0.42s} Rc3 {+5.01/1 0.49s}
+41. Kf2 {-4.48/1 0.47s} Rc1 {+4.59/1 0.20s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "A04"]
+[GameDuration "00:01:07"]
+[GameEndTime "2026-05-31T19:10:10.403 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:09:02.784 Central Daylight Time"]
+[Opening "Reti Opening"]
+[PlyCount "54"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. Nf3 {book} d6 {book} 2. g3 {book} e5 {book} 3. Bg2 {book} f5 {book}
+4. d3 {book} Nf6 {book} 5. c4 {+1.14/1 1.4s} Be7 {-1.76/1 1.8s}
+6. O-O {+1.20/1 1.3s} O-O {-1.76/1 1.0s} 7. b4 {+1.81/1 1.4s} Qe8 {-1.75/1 1.5s}
+8. Nc3 {+2.05/1 1.6s} Qh5 {-2.27/1 1.3s} 9. a4 {+2.84/1 2.1s} a5 {-1.94/1 1.7s}
+10. b5 {+1.86/1 2.0s} Nbd7 {-0.83/1 1.7s} 11. d4 {+1.76/1 1.3s}
+e4 {-1.53/1 2.1s} 12. Ng5 {+2.04/1 2.0s} Nb6 {-2.57/1 2.0s}
+13. Qb3 {+2.59/1 1.6s} Kh8 {-2.90/1 1.1s} 14. f3 {+3.29/1 1.8s}
+h6 {-2.90/1 1.1s} 15. Nh3 {+3.29/1 1.3s} g5 {-3.51/1 0.97s}
+16. fxe4 {+3.14/1 1.5s} fxe4 {-2.25/1 1.9s} 17. Nf2 {+2.26/1 1.6s}
+Bf5 {-2.18/1 0.91s} 18. h3 {+2.81/1 0.90s} Bg6 {-0.89/1 1.6s}
+19. Ba3 {+1.40/1 2.0s} Rae8 {-1.44/1 1.9s} 20. c5 {+2.15/1 1.7s}
+Nbd7 {-2.74/1 1.3s} 21. Ncxe4 {+5.22/1 1.9s} Nxe4 {-4.92/1 1.9s}
+22. Nxe4 {+6.12/1 1.9s} Qxe2 {-5.02/1 1.1s} 23. Rfe1 {+7.55/1 1.2s}
+Qh5 {-7.97/1 1.4s} 24. cxd6 {+8.58/1 1.3s} cxd6 {-8.68/1 1.2s}
+25. Nxd6 {+9.20/1 0.72s} Bxd6 {-9.28/1 0.97s} 26. Bxd6 {+9.22/1 0.79s}
+Rf6 {-9.03/1 0.35s} 27. Rxe8+ {+9.00/1 1.6s}
+Bxe8 {-8.96/1 1.8s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "A04"]
+[GameDuration "00:01:05"]
+[GameEndTime "2026-05-31T19:10:10.749 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:09:04.874 Central Daylight Time"]
+[Opening "Reti Opening"]
+[PlyCount "60"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. Nf3 {book} d6 {book} 2. g3 {book} e5 {book} 3. Bg2 {book} f5 {book}
+4. d3 {book} Nf6 {book} 5. O-O {+1.10/1 1.7s} Be7 {-0.99/1 1.9s}
+6. c4 {+1.75/1 1.2s} O-O {-1.36/1 0.95s} 7. Nc3 {+1.82/1 0.72s}
+a5 {-1.06/1 1.4s} 8. Rb1 {+1.97/1 1.1s} c6 {-1.55/1 1.5s} 9. a3 {+1.81/1 1.8s}
+Na6 {-1.88/1 1.6s} 10. b4 {+1.44/1 1.3s} axb4 {-1.61/1 1.6s}
+11. axb4 {+1.40/1 0.44s} Nc7 {-1.56/1 0.51s} 12. b5 {+1.54/1 1.2s}
+Ne6 {-1.11/1 1.4s} 13. bxc6 {+3.54/1 1.6s} bxc6 {-2.47/1 1.9s}
+14. Nh4 {+4.76/1 0.43s} Ng4 {-2.53/1 1.0s} 15. Bxc6 {+4.56/1 1.9s}
+Ra6 {-3.48/1 1.6s} 16. Bb5 {+5.44/1 0.74s} Ra8 {-4.64/1 1.0s}
+17. Nf3 {+5.26/1 1.4s} Bb7 {-3.58/1 1.5s} 18. Nd5 {+4.04/1 1.3s}
+Nf6 {-3.37/1 1.4s} 19. d4 {+5.26/1 1.6s} Nxd5 {-3.41/1 2.1s}
+20. cxd5 {+4.29/1 2.0s} Bxd5 {-3.21/1 0.94s} 21. dxe5 {+4.24/1 0.30s}
+Be4 {-3.00/1 0.39s} 22. Bd3 {+4.31/1 0.70s} d5 {-3.19/1 1.3s}
+23. Be3 {+4.11/1 1.4s} f4 {-3.26/1 1.5s} 24. Bb6 {+4.92/1 1.3s}
+Qc8 {-4.33/1 1.2s} 25. Rc1 {+5.69/1 0.96s} Qe8 {-5.61/1 1.2s}
+26. Bxe4 {+6.47/1 1.2s} dxe4 {-6.85/1 1.2s} 27. Qd5 {+7.19/1 0.57s}
+Qf7 {-7.41/1 0.44s} 28. Qxe4 {+7.62/1 1.3s} Rab8 {-7.61/1 1.6s}
+29. Rc6 {+8.72/1 1.6s} fxg3 {-8.84/1 1.7s} 30. hxg3 {+9.16/1 1.8s}
+h6 {-8.87/1 1.5s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "C03"]
+[GameDuration "00:01:06"]
+[GameEndTime "2026-05-31T19:10:23.084 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:09:16.544 Central Daylight Time"]
+[Opening "French"]
+[PlyCount "73"]
+[TimeControl "inf"]
+[Variation "Tarrasch"]
+
+1. e4 {book} e6 {book} 2. d4 {book} d5 {book} 3. Nd2 {book} a6 {book}
+4. Ngf3 {book} c5 {book} 5. exd5 {+1.27/1 1.8s} exd5 {-1.04/1 1.9s}
+6. dxc5 {+1.22/1 1.3s} Bxc5 {-1.04/1 0.96s} 7. Nb3 {+1.22/1 1.0s}
+Ba7 {-1.32/1 0.93s} 8. Bd3 {+0.93/1 1.5s} Ne7 {-0.97/1 1.0s}
+9. O-O {+0.99/1 1.5s} Nbc6 {-0.61/1 0.87s} 10. Re1 {+0.70/1 0.94s}
+O-O {-0.79/1 1.7s} 11. c3 {+0.95/1 1.7s} Bg4 {-1.04/1 1.5s}
+12. Bxh7+ {+5.23/1 2.0s} Kxh7 {-6.53/1 2.2s} 13. Ng5+ {+6.57/1 1.1s}
+Kg8 {-6.51/1 0.91s} 14. Qxg4 {+6.34/1 0.34s} Qd6 {-5.83/1 0.31s}
+15. Be3 {+6.69/1 0.86s} Bxe3 {-6.54/1 1.8s} 16. Rxe3 {+6.42/1 1.6s}
+Qg6 {-6.08/1 1.1s} 17. Rh3 {+6.44/1 0.61s} Nf5 {-4.52/1 1.3s}
+18. Nd4 {+4.93/1 1.8s} Nh6 {-3.75/1 1.5s} 19. Qf4 {+4.07/1 1.5s}
+Nxd4 {-3.62/1 0.92s} 20. Qxd4 {+5.16/1 1.4s} Qxg5 {-4.26/1 1.8s}
+21. Rg3 {+4.69/1 1.7s} Nf5 {-4.08/1 0.56s} 22. Rxg5 {+3.92/1 0.50s}
+Nxd4 {-3.90/1 0.43s} 23. cxd4 {+3.79/1 0.19s} Rfd8 {-3.64/1 0.17s}
+24. Rc1 {+3.74/1 0.56s} Rac8 {-3.48/1 1.00s} 25. Rxc8 {+4.04/1 1.5s}
+Rxc8 {-3.45/1 0.76s} 26. g3 {+3.94/1 0.73s} Rc2 {-3.55/1 0.67s}
+27. Rxd5 {+3.61/1 1.3s} Rxb2 {-3.54/1 0.32s} 28. a4 {+3.95/1 0.22s}
+Rb4 {-4.30/1 0.37s} 29. a5 {+4.70/1 1.4s} Kf8 {-4.29/1 1.1s}
+30. h4 {+4.61/1 1.1s} Ke7 {-3.81/1 1.5s} 31. Kg2 {+4.02/1 1.3s}
+Ke6 {-3.38/1 0.66s} 32. Rd8 {+3.43/1 1.1s} Rb5 {-3.56/1 1.1s}
+33. Rb8 {+4.52/1 1.1s} Kd5 {-4.01/1 0.59s} 34. Rf8 {+4.00/1 0.80s}
+Ke6 {-3.83/1 0.37s} 35. Rb8 {+4.54/1 0.40s} Kd5 {-4.00/1 0.23s}
+36. Rf8 {+4.00/1 0.35s} Ke6 {-3.76/1 0.45s}
+37. Rb8 {+4.54/1 0.30s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "0-1"]
+[ECO "C03"]
+[GameDuration "00:01:10"]
+[GameEndTime "2026-05-31T19:10:39.419 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:09:28.429 Central Daylight Time"]
+[Opening "French"]
+[PlyCount "67"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Tarrasch"]
+
+1. e4 {book} e6 {book} 2. d4 {book} d5 {book} 3. Nd2 {book} a6 {book}
+4. Ngf3 {book} c5 {book} 5. c3 {+2.17/1 1.9s} cxd4 {-1.42/1 1.7s}
+6. cxd4 {+2.02/1 1.8s} dxe4 {-1.41/1 1.2s} 7. Nxe4 {+1.40/1 1.2s}
+Bb4+ {-1.07/1 0.76s} 8. Bd2 {+1.58/1 1.6s} Bxd2+ {-1.15/1 1.5s}
+9. Qxd2 {+1.23/1 0.51s} Nf6 {-1.17/1 0.51s} 10. Bd3 {+1.31/1 0.44s}
+Nc6 {-0.64/1 1.3s} 11. O-O {+0.55/1 1.7s} O-O {-0.49/1 1.5s}
+12. Rad1 {+1.59/1 1.4s} b6 {-1.07/1 1.8s} 13. Nxf6+ {+2.43/1 1.6s}
+Qxf6 {-3.33/1 1.8s} 14. Be4 {+2.49/1 1.5s} Bb7 {-1.94/1 1.2s}
+15. Ne5 {+2.44/1 0.36s} Nxe5 {-1.94/1 1.1s} 16. Bxb7 {+1.94/1 1.1s}
+Rad8 {-0.97/1 0.92s} 17. Qb4 {+1.51/1 1.0s} Ng6 {-1.70/1 1.5s}
+18. Qxb6 {+2.47/1 1.8s} Nf4 {-2.23/1 1.7s} 19. Qxa6 {+4.02/1 1.4s}
+Rxd4 {-3.14/1 1.6s} 20. Rxd4 {+3.86/1 0.93s} Qxd4 {-2.82/1 0.91s}
+21. g3 {+3.94/1 0.55s} Nh3+ {-3.97/1 1.0s} 22. Kg2 {+5.02/1 1.4s}
+Qg4 {-4.26/1 1.2s} 23. Qd6 {+6.04/1 1.0s} h5 {-4.12/1 1.1s}
+24. Bf3 {+5.96/1 1.6s} Qf5 {-3.40/1 1.6s} 25. b4 {+5.63/1 0.63s}
+Rc8 {-3.24/1 1.6s} 26. a4 {+4.73/1 1.7s} Rc3 {-2.33/1 1.5s}
+27. Qd1 {+4.98/1 1.5s} Ng5 {-4.16/1 1.4s} 28. Bxh5 {+1.38/1 1.5s}
+Rd3 {+3.88/1 1.5s} 29. Qb1 {-2.60/1 0.67s} Qe4+ {+8.73/1 1.2s}
+30. f3 {-8.91/1 0.88s} Rd2+ {+9.17/1 0.38s} 31. Rf2 {-9.56/1 0.31s}
+Qxb1 {+9.56/1 0.92s} 32. Rxd2 {-9.64/1 1.0s} Qxb4 {+9.55/1 0.73s}
+33. Rd8+ {-9.62/1 0.73s} Kh7 {+9.55/1 1.3s}
+34. h4 {-9.53/1 0.82s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "0-1"]
+[ECO "D41"]
+[GameDuration "00:01:42"]
+[GameEndTime "2026-05-31T19:11:24.111 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:09:41.921 Central Daylight Time"]
+[Opening "Queen's Gambit declined"]
+[PlyCount "91"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Semi-Tarrasch, 5.cd"]
+
+1. d4 {book} d5 {book} 2. c4 {book} e6 {book} 3. Nc3 {book} Nf6 {book}
+4. Nf3 {book} c5 {book} 5. cxd5 {+1.02/1 1.9s} exd5 {-0.98/1 2.3s}
+6. Bg5 {+1.37/1 1.3s} Nc6 {-1.00/1 1.4s} 7. e3 {+1.23/1 1.7s} c4 {-1.13/1 1.3s}
+8. Bxf6 {+2.01/1 1.5s} gxf6 {-2.57/1 1.9s} 9. g3 {+2.06/1 0.75s}
+Be6 {-2.86/1 0.67s} 10. Bg2 {+2.60/1 1.7s} Qb6 {-2.09/1 1.3s}
+11. Qd2 {+2.49/1 1.8s} O-O-O {-4.03/1 1.7s} 12. O-O {+2.96/1 1.9s}
+h5 {-4.31/1 1.5s} 13. Nh4 {+4.45/1 1.5s} Bb4 {-4.56/1 1.6s}
+14. a3 {+4.04/1 1.7s} Bxc3 {-3.81/1 1.5s} 15. bxc3 {+3.67/1 1.7s}
+Na5 {-3.27/1 1.1s} 16. Rab1 {+3.63/1 0.80s} Nb3 {-3.61/1 1.1s}
+17. Qc2 {+3.27/1 1.4s} Qa5 {-3.73/1 1.3s} 18. e4 {+3.66/1 1.7s}
+dxe4 {-3.95/1 1.3s} 19. Bxe4 {+2.87/1 1.5s} Rhe8 {-2.57/1 1.2s}
+20. Rfe1 {+2.80/1 1.4s} Kb8 {-2.32/1 1.3s} 21. Ng2 {+3.13/1 2.1s}
+a6 {-3.18/1 1.9s} 22. h4 {+2.94/1 1.8s} Bd5 {-4.14/1 2.1s}
+23. Bxd5 {+3.41/1 2.0s} Qxd5 {-4.11/1 1.1s} 24. Ne3 {+3.75/1 0.47s}
+Qc6 {-3.82/1 0.41s} 25. d5 {+4.10/1 1.1s} Qc8 {-4.05/1 1.9s}
+26. Rbd1 {+4.47/1 1.8s} Re5 {-5.22/1 1.7s} 27. Qh7 {+5.54/1 1.8s}
+Qc7 {-5.73/1 1.5s} 28. d6 {+5.22/1 0.98s} Rxd6 {-1.06/1 1.5s}
+29. Rxd6 {+0.04/1 1.1s} Qxd6 {+0.04/1 0.39s} 30. Rd1 {-0.89/1 0.53s}
+Nd2 {+4.13/1 1.0s} 31. Qh6 {-2.69/1 1.3s} Nf3+ {+3.68/1 1.9s}
+32. Kf1 {-3.98/1 1.4s} Nd2+ {+3.42/1 0.93s} 33. Ke1 {+1.07/1 1.1s}
+Nf3+ {-1.88/1 1.6s} 34. Ke2 {+1.14/1 1.3s} Qc6 {-0.96/1 0.46s}
+35. Rd8+ {+0.21/1 0.46s} Ka7 {+0.27/1 1.2s} 36. Qf8 {-0.25/1 1.2s}
+Nh2 {+1.50/1 0.89s} 37. Kd2 {-2.09/1 0.93s} Ng4 {+4.50/1 1.1s}
+38. Rc8 {-2.60/1 0.95s} Qd7+ {+3.60/1 1.8s} 39. Kc1 {-4.29/1 1.0s}
+Nxe3 {+4.03/1 0.35s} 40. Rd8 {-4.30/1 0.42s} Qa4 {+5.95/1 0.72s}
+41. Ra8+ {-5.50/1 1.8s} Kb6 {+6.28/1 0.83s} 42. Qd8+ {-6.15/1 0.78s}
+Kb5 {+7.97/1 0.94s} 43. Qd7+ {-7.61/1 1.2s} Ka5 {+8.02/1 0.31s}
+44. Qd8+ {-7.71/1 0.41s} Kb5 {+8.07/1 0.42s} 45. Qd7+ {-7.64/1 0.21s}
+Ka5 {+8.08/1 0.21s} 46. Qd8+ {-7.77/1 0.23s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "D41"]
+[GameDuration "00:01:48"]
+[GameEndTime "2026-05-31T19:11:31.682 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:09:43.376 Central Daylight Time"]
+[Opening "Queen's Gambit declined"]
+[PlyCount "92"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Semi-Tarrasch, 5.cd"]
+
+1. d4 {book} d5 {book} 2. c4 {book} e6 {book} 3. Nc3 {book} Nf6 {book}
+4. Nf3 {book} c5 {book} 5. cxd5 {+1.23/1 2.1s} exd5 {-0.86/1 1.9s}
+6. g3 {+1.17/1 0.80s} Nc6 {-1.15/1 1.4s} 7. Bg2 {+1.18/1 1.2s}
+cxd4 {-1.62/1 1.0s} 8. Nxd4 {+2.58/1 1.9s} Bc5 {-1.54/1 1.4s}
+9. Nb3 {+2.69/1 0.74s} Bb6 {-1.87/1 1.3s} 10. Nxd5 {+2.78/1 0.81s}
+Nxd5 {-2.27/1 1.5s} 11. Qxd5 {+2.59/1 1.0s} Qxd5 {-2.08/1 0.94s}
+12. Bxd5 {+2.55/1 1.5s} Bh3 {-1.57/1 1.5s} 13. Be3 {+3.13/1 1.0s}
+Bxe3 {-3.21/1 1.9s} 14. fxe3 {+3.77/1 1.9s} Rc8 {-2.66/1 1.3s}
+15. Rc1 {+4.51/1 1.7s} Ke7 {-4.54/1 1.8s} 16. Bxc6 {+5.13/1 1.6s}
+Rxc6 {-4.25/1 1.8s} 17. Rxc6 {+4.69/1 1.2s} bxc6 {-4.04/1 0.69s}
+18. Kf2 {+4.61/1 0.28s} Rb8 {-3.64/1 1.0s} 19. Rc1 {+3.72/1 1.6s}
+Kd6 {-2.58/1 0.99s} 20. Rd1+ {+4.17/1 0.75s} Kc7 {-3.29/1 1.3s}
+21. Rd2 {+4.62/1 1.1s} Rb5 {-3.97/1 1.4s} 22. Nd4 {+4.63/1 1.9s}
+Ra5 {-3.58/1 1.8s} 23. a3 {+4.43/1 1.5s} c5 {-2.89/1 1.5s}
+24. Nf3 {+4.33/1 1.5s} f6 {-3.26/1 1.3s} 25. e4 {+4.57/1 1.5s}
+Rb5 {-3.89/1 1.5s} 26. e5 {+5.64/1 1.3s} fxe5 {-5.36/1 1.6s}
+27. Nxe5 {+5.68/1 0.98s} Be6 {-4.75/1 1.1s} 28. Ke3 {+5.60/1 0.62s}
+Rb3+ {-5.14/1 1.2s} 29. Kf4 {+6.13/1 0.98s} h6 {-5.85/1 1.3s}
+30. h4 {+6.55/1 1.5s} a5 {-6.09/1 1.7s} 31. g4 {+6.69/1 1.4s} Rh3 {-5.98/1 1.5s}
+32. h5 {+6.45/1 1.4s} Rh1 {-5.72/1 1.0s} 33. Rc2 {+6.12/1 1.3s}
+Kd6 {-5.22/1 1.3s} 34. Rd2+ {+5.66/1 1.4s} Ke7 {-5.29/1 0.71s}
+35. Rc2 {+5.36/1 0.82s} Rf1+ {-4.82/1 1.2s} 36. Nf3 {+5.11/1 1.5s}
+c4 {-4.25/1 1.3s} 37. Rd2 {+5.45/1 1.2s} a4 {-4.02/1 1.4s}
+38. Kg3 {+4.52/1 1.4s} Rc1 {-3.79/1 1.2s} 39. Kf4 {+4.52/1 1.5s}
+c3 {-4.03/1 1.1s} 40. bxc3 {+4.59/1 1.1s} Rxc3 {-4.43/1 1.2s}
+41. Rd3 {+4.82/1 0.19s} Rc4+ {-4.66/1 0.33s} 42. Rd4 {+6.30/1 1.2s}
+Rc2 {-6.23/1 1.6s} 43. Re4 {+7.51/1 1.2s} Rc3 {-8.35/1 0.86s}
+44. Nd4 {+9.47/1 1.5s} Rc4 {-8.97/1 1.6s} 45. Rxe6+ {+9.80/1 1.3s}
+Kf7 {-9.77/1 1.4s} 46. Re4 {+9.87/1 1.5s}
+Rc3 {-9.86/1 1.4s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "0-1"]
+[ECO "A40"]
+[GameDuration "00:01:02"]
+[GameEndTime "2026-05-31T19:11:12.452 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:10:10.403 Central Daylight Time"]
+[Opening "Queen's pawn"]
+[PlyCount "53"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. d4 {book} e6 {book} 2. c4 {book} f5 {book} 3. g3 {book} Nf6 {book}
+4. Bg2 {book} c6 {book} 5. Nf3 {+2.55/1 1.8s} d5 {-2.97/1 1.8s}
+6. O-O {+2.39/1 1.0s} Bd6 {-2.88/1 1.00s} 7. Nc3 {+2.41/1 1.3s}
+O-O {-2.39/1 1.3s} 8. Bf4 {+2.07/1 1.7s} Bxf4 {-1.86/1 1.3s}
+9. gxf4 {+1.49/1 1.5s} Nbd7 {-1.52/1 1.0s} 10. e3 {+1.54/1 1.2s}
+Ne4 {-2.11/1 1.5s} 11. Rc1 {+2.04/1 1.9s} Rf6 {-2.14/1 1.6s}
+12. b4 {+2.22/1 2.1s} Rg6 {-2.14/1 1.6s} 13. Kh1 {+1.13/1 1.8s}
+b6 {-0.02/1 1.7s} 14. Nxe4 {+0.87/1 2.0s} fxe4 {-0.87/1 2.1s}
+15. Ng5 {+2.06/1 1.9s} h6 {-0.18/1 0.97s} 16. Qh5 {+0.90/1 1.1s}
+Nf8 {+2.54/1 1.5s} 17. Nh3 {+0.05/1 1.4s} Ba6 {+3.55/1 0.52s}
+18. Rg1 {+0.42/1 1.9s} Bxc4 {+2.99/1 1.4s} 19. Bxe4 {-0.41/1 1.1s}
+Rxg1+ {+2.74/1 0.72s} 20. Rxg1 {-2.37/1 0.59s} dxe4 {+2.36/1 1.8s}
+21. Qxh6 {-4.02/1 0.72s} Qe7 {+1.73/1 0.43s} 22. f5 {-5.00/1 0.67s}
+Be2 {+7.98/1 1.3s} 23. Ng5 {-7.28/1 1.2s} exf5 {+7.79/1 1.5s}
+24. Qxc6 {-7.28/1 2.0s} Rd8 {+8.14/1 1.4s} 25. Qc2 {-7.05/1 1.1s}
+Bh5 {+8.32/1 1.4s} 26. Qc4+ {-8.02/1 1.3s} Kh8 {+8.18/1 1.6s}
+27. Rg3 {-7.49/1 1.2s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "A40"]
+[GameDuration "00:01:24"]
+[GameEndTime "2026-05-31T19:11:34.766 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:10:10.751 Central Daylight Time"]
+[Opening "Queen's pawn"]
+[PlyCount "73"]
+[TimeControl "inf"]
+
+1. d4 {book} e6 {book} 2. c4 {book} f5 {book} 3. g3 {book} Nf6 {book}
+4. Bg2 {book} c6 {book} 5. Nf3 {+2.90/1 1.8s} d5 {-2.43/1 1.7s}
+6. O-O {+2.88/1 0.66s} Bd6 {-2.39/1 1.0s} 7. Qc2 {+2.74/1 1.2s}
+O-O {-2.19/1 1.7s} 8. b3 {+2.38/1 1.4s} Nbd7 {-1.73/1 1.5s}
+9. Ba3 {+2.86/1 1.6s} Bxa3 {-1.58/1 2.0s} 10. Nxa3 {+1.46/1 1.7s}
+Qe7 {-1.34/1 0.50s} 11. Qb2 {+1.23/1 0.94s} b6 {-1.25/1 1.4s}
+12. Rac1 {+1.24/1 1.1s} Bb7 {-1.15/1 1.8s} 13. Rfd1 {+1.01/1 1.3s}
+Ne4 {-0.94/1 1.9s} 14. Nc2 {+1.72/1 1.8s} g5 {-0.89/1 1.7s}
+15. Nce1 {+2.24/1 1.9s} g4 {-1.19/1 1.8s} 16. Ne5 {+1.37/1 1.5s}
+Nxe5 {-1.10/1 1.5s} 17. dxe5 {+0.79/1 0.89s} c5 {-0.46/1 0.42s}
+18. cxd5 {+1.00/1 0.96s} exd5 {-0.80/1 1.8s} 19. Nd3 {+0.08/1 1.1s}
+d4 {+0.94/1 1.4s} 20. Nf4 {+0.38/1 1.4s} Qxe5 {-1.29/1 1.7s}
+21. b4 {+1.08/1 1.2s} Rab8 {-1.05/1 1.6s} 22. e3 {+2.42/1 0.70s}
+Rfd8 {-1.07/1 1.3s} 23. exd4 {+1.46/1 1.3s} cxd4 {-1.08/1 1.7s}
+24. Qb3+ {+0.54/1 1.2s} Kh8 {-1.24/1 1.7s} 25. Qf7 {+0.96/1 1.4s}
+Ng5 {+0.02/1 1.4s} 26. Qc7 {-1.37/1 1.3s} Qxc7 {+3.00/1 1.2s}
+27. Rxc7 {-2.73/1 0.97s} Be4 {+3.64/1 0.35s} 28. Rxa7 {-3.43/1 0.58s}
+d3 {+5.14/1 1.7s} 29. Rc7 {-4.76/1 1.3s} Rd4 {+4.91/1 1.6s}
+30. a3 {-5.03/1 1.7s} Rbd8 {+5.17/1 1.8s} 31. Kf1 {-4.58/1 1.7s}
+d2 {+6.45/1 1.9s} 32. Rc3 {-5.79/1 1.5s} Nf3 {+6.01/1 1.8s}
+33. h3 {-5.35/1 1.4s} Nh2+ {+5.76/1 1.3s} 34. Kg1 {-5.77/1 0.97s}
+Nf3+ {+5.96/1 0.71s} 35. Kf1 {-5.43/1 0.24s} Nh2+ {+5.08/1 0.88s}
+36. Kg1 {-5.80/1 0.23s} Nf3+ {+5.80/1 0.26s}
+37. Kf1 {-5.36/1 0.20s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "A13"]
+[GameDuration "00:01:30"]
+[GameEndTime "2026-05-31T19:11:53.569 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:10:23.084 Central Daylight Time"]
+[Opening "English Opening"]
+[PlyCount "73"]
+[TimeControl "inf"]
+
+1. c4 {book} e6 {book} 2. Nc3 {book} d5 {book} 3. d4 {book} Nf6 {book}
+4. Bg5 {book} Be7 {book} 5. e3 {+0.81/1 1.7s} O-O {-0.74/1 1.7s}
+6. Nf3 {+0.89/1 1.7s} h6 {-0.97/1 1.4s} 7. Bh4 {+0.83/1 1.6s} b6 {-0.72/1 1.5s}
+8. cxd5 {+0.71/1 1.6s} Nxd5 {-0.95/1 1.7s} 9. Bxe7 {+0.92/1 1.6s}
+Qxe7 {-1.17/1 0.63s} 10. Nxd5 {+1.35/1 1.2s} exd5 {-1.24/1 1.5s}
+11. Rc1 {+1.60/1 0.66s} Bb7 {-1.06/1 1.1s} 12. Be2 {+0.83/1 1.9s}
+c5 {-0.19/1 1.6s} 13. O-O {+0.31/1 1.5s} Nd7 {-0.14/1 1.1s}
+14. dxc5 {-0.34/1 1.5s} bxc5 {0.00/1 1.7s} 15. b4 {+1.30/1 1.6s}
+c4 {+0.02/1 1.9s} 16. Nd4 {+0.53/1 1.8s} g6 {+0.15/1 1.4s}
+17. Qd2 {+0.59/1 1.7s} Ne5 {-0.85/1 1.8s} 18. a4 {+1.64/1 2.1s}
+a6 {-0.98/1 1.8s} 19. Rfd1 {+1.02/1 1.7s} Rfd8 {-1.44/1 1.8s}
+20. h3 {+1.20/1 2.0s} Rac8 {-2.55/1 1.9s} 21. b5 {+1.99/1 2.0s}
+axb5 {-2.37/1 1.8s} 22. axb5 {+2.22/1 1.6s} Nd7 {-2.16/1 0.69s}
+23. Bg4 {+3.51/1 1.6s} Qd6 {-2.97/1 1.8s} 24. Bxd7 {+4.02/1 1.7s}
+Qxd7 {-3.88/1 1.9s} 25. Ra1 {+4.49/1 1.4s} Ra8 {-4.16/1 1.6s}
+26. Qb4 {+4.48/1 1.7s} h5 {-4.28/1 1.4s} 27. b6 {+6.13/1 1.9s}
+Qd6 {-4.14/1 1.8s} 28. Rxa8 {+5.46/1 1.7s} Qxb4 {+0.20/1 1.4s}
+29. Rxd8+ {+3.15/1 1.3s} Kg7 {+0.36/1 0.26s} 30. Rd7 {+3.25/1 0.20s}
+Qxb6 {+0.76/1 0.74s} 31. h4 {+2.81/1 1.2s} Ba6 {+2.71/1 1.2s}
+32. Ra1 {+2.45/1 1.5s} c3 {+2.65/1 1.6s} 33. g3 {+2.75/1 1.5s}
+Bc8 {+3.30/1 0.25s} 34. Re7 {+2.94/1 0.65s} Ba6 {+1.53/1 0.86s}
+35. Rd7 {+2.03/1 0.96s} Bc8 {+1.37/1 0.49s} 36. Re7 {+2.26/1 0.82s}
+Ba6 {+1.73/1 0.50s} 37. Rd7 {+2.74/1 0.14s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "A13"]
+[GameDuration "00:01:54"]
+[GameEndTime "2026-05-31T19:12:28.445 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:10:33.984 Central Daylight Time"]
+[Opening "English Opening"]
+[PlyCount "98"]
+[TimeControl "inf"]
+
+1. c4 {book} e6 {book} 2. Nc3 {book} d5 {book} 3. d4 {book} Nf6 {book}
+4. Bg5 {book} Be7 {book} 5. e3 {+0.80/1 1.0s} O-O {-0.65/1 1.9s}
+6. Nf3 {+1.08/1 0.99s} h6 {-0.67/1 1.8s} 7. Bh4 {+0.86/1 1.9s} c5 {-0.88/1 1.7s}
+8. dxc5 {+1.41/1 1.8s} Qa5 {-0.89/1 1.4s} 9. cxd5 {+2.89/1 1.8s}
+Nxd5 {-1.74/1 2.1s} 10. Bxe7 {+2.43/1 1.4s} Nxe7 {-1.14/1 0.79s}
+11. Bd3 {+2.63/1 0.31s} Qxc5 {-2.05/1 1.5s} 12. O-O {+2.79/1 1.7s}
+Nbc6 {-1.99/1 1.7s} 13. Rc1 {+2.63/1 1.4s} Rd8 {-1.78/1 1.5s}
+14. Qe2 {+2.17/1 1.2s} Qa5 {-1.44/1 1.5s} 15. Bb1 {+2.19/1 1.4s}
+Bd7 {-1.64/1 1.7s} 16. Rfd1 {+1.77/1 1.5s} Be8 {-0.98/1 1.7s}
+17. Qc2 {+1.69/1 1.6s} Ng6 {-0.77/1 1.6s} 18. a3 {+1.11/1 1.5s}
+Rxd1+ {-0.74/1 1.6s} 19. Rxd1 {+0.78/1 1.8s} Rd8 {-1.00/1 1.6s}
+20. Rxd8 {+1.55/1 1.9s} Qxd8 {-0.87/1 1.8s} 21. h3 {+1.18/1 1.0s}
+Nce7 {-0.44/1 1.6s} 22. Qd2 {+0.73/1 1.9s} Qxd2 {-1.18/1 2.1s}
+23. Nxd2 {+1.17/1 1.7s} Kf8 {-1.19/1 1.3s} 24. f4 {+1.55/1 1.3s}
+Bc6 {-1.49/1 1.5s} 25. Kf2 {+1.77/1 1.2s} Ke8 {-1.43/1 1.9s}
+26. g3 {+1.79/1 1.5s} Nf8 {-1.32/1 1.6s} 27. e4 {+2.08/1 1.3s}
+Nd7 {-1.85/1 1.4s} 28. Ke3 {+2.03/1 0.96s} Kd8 {-1.77/1 1.7s}
+29. b4 {+2.03/1 1.3s} a6 {-1.95/1 1.5s} 30. Nc4 {+2.11/1 1.6s}
+Kc7 {-1.98/1 1.6s} 31. Kd4 {+2.04/1 1.5s} b6 {-1.75/1 1.7s}
+32. e5 {+2.22/1 1.7s} f6 {-1.80/1 1.9s} 33. h4 {+1.57/1 1.7s} Bg2 {-0.54/1 1.6s}
+34. Be4 {+1.05/1 1.8s} Bxe4 {-0.38/1 1.6s} 35. Kxe4 {+0.54/1 1.4s}
+Nf5 {+0.95/1 1.0s} 36. Ne2 {+0.23/1 1.3s} h5 {-0.54/1 1.1s}
+37. Nd4 {+3.11/1 1.3s} Nxd4 {-3.04/1 1.6s} 38. Kxd4 {+3.08/1 0.80s}
+Nb8 {-2.55/1 0.56s} 39. Nd6 {+2.61/1 1.2s} Kd7 {-2.05/1 1.2s}
+40. Nc4 {+2.51/1 0.94s} Nc6+ {-1.44/1 1.1s} 41. Ke4 {+2.46/1 1.3s}
+b5 {-1.97/1 0.73s} 42. Nd6 {+2.53/1 0.51s} Ne7 {-2.53/1 0.81s}
+43. Nb7 {+4.14/1 0.99s} Nf5 {-2.99/1 1.2s} 44. Nc5+ {+3.73/1 0.40s}
+Ke7 {-3.05/1 0.38s} 45. Kf3 {+3.55/1 0.049s} Nd4+ {-2.87/1 0.089s}
+46. Ke4 {+3.28/1 0.18s} Ne2 {-2.71/1 0.23s} 47. Kf3 {+2.31/1 0.36s}
+Nd4+ {-2.29/1 0.26s} 48. Ke4 {+1.97/1 0.15s} Ne2 {-1.76/1 0.18s}
+49. Kf3 {+1.78/1 0.25s} Nd4+ {-1.74/1 0.29s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "A49"]
+[GameDuration "00:01:38"]
+[GameEndTime "2026-05-31T19:12:17.784 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:10:39.424 Central Daylight Time"]
+[Opening "King's Indian"]
+[PlyCount "93"]
+[TimeControl "inf"]
+[Variation "Fianchetto without c4"]
+
+1. d4 {book} Nf6 {book} 2. Nf3 {book} g6 {book} 3. g3 {book} Bg7 {book}
+4. Bg2 {book} O-O {book} 5. O-O {+0.98/1 1.8s} d5 {-0.68/1 2.1s}
+6. c4 {+0.84/1 1.6s} dxc4 {-0.59/1 1.4s} 7. Na3 {+0.86/1 1.2s} c3 {-0.73/1 1.5s}
+8. bxc3 {+0.71/1 1.8s} c5 {-0.62/1 0.57s} 9. Ne5 {+1.33/1 0.45s}
+Nbd7 {-1.01/1 1.4s} 10. Rb1 {+1.88/1 2.0s} Nxe5 {-2.70/1 2.2s}
+11. dxe5 {+2.85/1 1.8s} Ng4 {-3.04/1 1.6s} 12. Qxd8 {+3.58/1 0.78s}
+Rxd8 {-3.48/1 1.5s} 13. Bxb7 {+3.67/1 0.85s} Bxb7 {-3.56/1 0.47s}
+14. Rxb7 {+3.05/1 1.0s} Bxe5 {-2.77/1 0.33s} 15. Rxe7 {+2.90/1 1.1s}
+Bxc3 {-2.62/1 1.4s} 16. h3 {+2.85/1 1.1s} Nf6 {-2.55/1 0.95s}
+17. Nb5 {+2.69/1 1.6s} Bd2 {-2.69/1 0.84s} 18. Bb2 {+3.29/1 1.6s}
+Nd5 {+0.80/1 1.9s} 19. Rxa7 {-0.35/1 1.8s} Rxa7 {+2.28/1 0.86s}
+20. Nxa7 {-1.40/1 1.0s} c4 {+2.89/1 0.39s} 21. Nc6 {-1.71/1 0.48s}
+Rc8 {+3.63/1 1.1s} 22. Nd4 {-1.94/1 1.2s} c3 {+2.07/1 1.5s}
+23. Bc1 {-1.89/1 1.1s} Nb4 {+1.31/1 1.3s} 24. a4 {-1.11/1 1.3s}
+Rc4 {+0.29/1 1.7s} 25. Bxd2 {+4.86/1 1.6s} cxd2 {-4.96/1 1.9s}
+26. Nb3 {+5.32/1 0.55s} Nd5 {-3.86/1 0.44s} 27. a5 {+6.64/1 1.4s}
+Nc3 {-5.48/1 1.7s} 28. Nxd2 {+4.85/1 1.6s} Ra4 {-4.56/1 0.79s}
+29. Nb3 {+4.48/1 0.49s} Nxe2+ {-4.20/1 0.64s} 30. Kg2 {+4.21/1 1.3s}
+Ra3 {-2.90/1 0.61s} 31. Rb1 {+3.75/1 0.68s} Nc3 {-2.94/1 0.41s}
+32. Rb2 {+3.26/1 1.0s} Kf8 {-1.91/1 0.72s} 33. Kf1 {+3.13/1 0.72s}
+Ke7 {-2.25/1 1.4s} 34. Kg2 {+2.54/1 1.4s} Kd6 {-2.83/1 1.4s}
+35. Nd2 {+5.37/1 1.3s} Kd5 {-4.11/1 1.4s} 36. Rb7 {+4.67/1 1.7s}
+Rxa5 {-3.65/1 1.6s} 37. Rxf7 {+4.07/1 0.84s} Ra2 {-3.43/1 0.47s}
+38. Nf1 {+3.63/1 0.46s} Ne4 {-3.16/1 1.3s} 39. Ne3+ {+3.63/1 1.7s}
+Ke6 {-3.51/1 1.4s} 40. Rf4 {+3.97/1 1.3s} Nf6 {-3.51/1 1.1s}
+41. Rb4 {+3.75/1 1.5s} h5 {-3.76/1 1.7s} 42. h4 {+3.58/1 1.6s}
+Kf7 {-3.31/1 1.4s} 43. Rb7+ {+3.93/1 1.2s} Ke6 {-3.58/1 1.4s}
+44. Rb6+ {+3.77/1 0.81s} Kf7 {-3.62/1 0.70s} 45. Rb7+ {+3.88/1 0.46s}
+Ke6 {-3.63/1 0.26s} 46. Rb6+ {+3.77/1 0.46s} Kf7 {-3.62/1 0.32s}
+47. Rb7+ {+3.92/1 0.30s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "A49"]
+[GameDuration "00:00:50"]
+[GameEndTime "2026-05-31T19:12:03.281 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:11:12.452 Central Daylight Time"]
+[Opening "King's Indian"]
+[PlyCount "44"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Fianchetto without c4"]
+
+1. d4 {book} Nf6 {book} 2. Nf3 {book} g6 {book} 3. g3 {book} Bg7 {book}
+4. Bg2 {book} O-O {book} 5. O-O {+1.19/1 2.1s} d5 {-0.73/1 2.1s}
+6. c4 {+0.79/1 1.3s} dxc4 {-0.62/1 1.1s} 7. Na3 {+0.92/1 1.2s} c5 {-0.55/1 1.6s}
+8. Nxc4 {+1.23/1 2.0s} cxd4 {-1.07/1 1.8s} 9. Nxd4 {+2.24/1 1.5s}
+Nbd7 {-1.00/1 1.5s} 10. b3 {+2.26/1 1.6s} Nb6 {-1.54/1 2.0s}
+11. Bb2 {+2.19/1 0.80s} Nxc4 {-1.68/1 0.99s} 12. bxc4 {+2.16/1 0.50s}
+Qb6 {-1.86/1 0.35s} 13. Qb3 {+1.79/1 1.7s} Nd7 {-0.75/1 2.0s}
+14. Rfd1 {+2.02/1 1.6s} Nc5 {-1.48/1 1.7s} 15. Qa3 {+2.85/1 1.1s}
+Bg4 {-1.75/1 1.1s} 16. Rab1 {+2.91/1 1.7s} Rac8 {-2.50/1 2.0s}
+17. Ba1 {+4.91/1 1.8s} Qc7 {-5.18/1 1.9s} 18. Nb5 {+7.07/1 1.4s}
+Qb8 {-7.11/1 1.7s} 19. Bxg7 {+7.22/1 0.91s} Kxg7 {-7.68/1 1.3s}
+20. Nxa7 {+7.90/1 0.25s} Rc7 {-7.67/1 0.44s} 21. Nb5 {+7.66/1 0.77s}
+Rcc8 {-7.08/1 1.6s} 22. Qe3 {+7.57/1 1.6s}
+Be6 {-7.34/1 1.6s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "B90"]
+[GameDuration "00:01:23"]
+[GameEndTime "2026-05-31T19:12:47.779 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:11:24.111 Central Daylight Time"]
+[Opening "Sicilian"]
+[PlyCount "76"]
+[TimeControl "inf"]
+[Variation "Najdorf, Byrne (English) attack"]
+
+1. e4 {book} c5 {book} 2. Nf3 {book} d6 {book} 3. d4 {book} cxd4 {book}
+4. Nxd4 {book} Nf6 {book} 5. Nc3 {+1.45/1 2.1s} a6 {-1.47/1 2.0s}
+6. Be3 {+1.65/1 0.78s} e5 {-1.68/1 1.7s} 7. Nb3 {+1.42/1 1.4s}
+Be7 {-1.46/1 0.50s} 8. f3 {+1.38/1 1.2s} Be6 {-1.54/1 0.95s}
+9. Qd2 {+1.50/1 1.6s} O-O {-1.22/1 0.86s} 10. O-O-O {+1.56/1 1.4s}
+b5 {-1.29/1 1.1s} 11. g4 {+1.51/1 1.0s} b4 {-1.04/1 0.98s}
+12. Nd5 {+1.59/1 1.2s} Bxd5 {-1.22/1 0.74s} 13. exd5 {+1.37/1 1.1s}
+a5 {-1.42/1 0.76s} 14. Kb1 {+1.80/1 0.41s} a4 {-2.08/1 1.1s}
+15. Nc1 {+1.26/1 1.2s} Nbd7 {-1.72/1 0.72s} 16. g5 {+1.22/1 1.5s}
+Nh5 {-1.46/1 1.7s} 17. Bb5 {+1.81/1 1.1s} Nc5 {-2.04/1 0.83s}
+18. Qxb4 {+2.23/1 1.1s} Qc7 {-2.68/1 1.1s} 19. Nd3 {+4.33/1 1.9s}
+Nxd3 {-3.84/1 1.8s} 20. Rxd3 {+4.46/1 1.3s} Rfb8 {-4.28/1 0.93s}
+21. c4 {+4.73/1 0.69s} Qc8 {-4.08/1 0.49s} 22. Qd2 {+4.54/1 1.3s}
+Qf5 {-4.46/1 1.8s} 23. Ka1 {+5.11/1 1.5s} Qxf3 {-4.12/1 1.5s}
+24. Re1 {+4.43/1 1.8s} Bd8 {-4.40/1 1.5s} 25. Ba7 {+6.21/1 1.8s}
+Bxg5 {-6.90/1 2.0s} 26. Bxb8 {+7.94/1 1.7s} Qf5 {-6.66/1 1.6s}
+27. Qd1 {+7.28/1 1.9s} Rxb8 {-7.00/1 1.8s} 28. Rf3 {+6.50/1 1.1s}
+Nf4 {-5.42/1 1.4s} 29. Bxa4 {+5.94/1 1.7s} e4 {-3.35/1 1.5s}
+30. Rb3 {+4.07/1 1.7s} Rxb3 {-2.38/1 0.90s} 31. Qxb3 {+3.70/1 1.9s}
+g6 {-2.50/1 0.68s} 32. Rf1 {+3.98/1 0.40s} Qe5 {-2.07/1 1.2s}
+33. Qc3 {+3.50/1 1.2s} Qe7 {-1.65/1 0.67s} 34. c5 {+2.58/1 1.7s}
+dxc5 {+0.28/1 1.4s} 35. Qb3 {+1.78/1 1.6s} Qe5 {+0.07/1 1.3s}
+36. Qc3 {+1.94/1 1.0s} Qe7 {+0.08/1 0.62s} 37. Qb3 {+1.59/1 0.35s}
+Qe5 {-0.14/1 0.28s} 38. Qc3 {+1.97/1 0.56s}
+Qe7 {0.00/1 0.50s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "B96"]
+[GameDuration "00:00:46"]
+[GameEndTime "2026-05-31T19:12:18.244 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:11:31.687 Central Daylight Time"]
+[Opening "Sicilian"]
+[PlyCount "42"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Najdorf, 7.f4"]
+
+1. e4 {book} c5 {book} 2. Nf3 {book} d6 {book} 3. d4 {book} cxd4 {book}
+4. Nxd4 {book} Nf6 {book} 5. Nc3 {+1.34/1 2.1s} a6 {-1.43/1 1.9s}
+6. Bg5 {+1.74/1 0.87s} e6 {-1.55/1 1.9s} 7. f4 {+1.98/1 1.2s} h6 {-2.20/1 1.0s}
+8. Bh4 {+2.08/1 1.7s} Be7 {-2.22/1 1.6s} 9. Qf3 {+1.21/1 1.6s} e5 {-1.71/1 1.8s}
+10. Nf5 {+1.61/1 2.2s} Bxf5 {-0.88/1 1.5s} 11. exf5 {+1.22/1 0.68s}
+Nc6 {-0.61/1 0.36s} 12. O-O-O {+0.73/1 0.28s} Nd4 {+0.05/1 0.75s}
+13. Qf2 {+0.13/1 0.65s} Rc8 {+2.41/1 1.7s} 14. Bd3 {-3.18/1 1.7s}
+Qa5 {+2.99/1 1.8s} 15. Qe1 {-0.86/1 1.5s} Nd5 {+2.60/1 1.6s}
+16. Bxe7 {+3.66/1 1.7s} Nxc3 {-2.89/1 1.8s} 17. Bxd6 {+7.14/1 1.4s}
+Qxa2 {-7.13/1 1.5s} 18. Qxe5+ {+8.55/1 1.5s} Kd7 {-8.25/1 1.5s}
+19. Qe7+ {+8.63/1 0.62s} Kc6 {-7.93/1 1.3s} 20. bxc3 {+9.47/1 1.0s}
+Kb6 {-7.59/1 0.73s} 21. cxd4 {+9.80/1 2.0s}
+Qa1+ {-9.84/1 1.1s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "A09"]
+[GameDuration "00:01:43"]
+[GameEndTime "2026-05-31T19:13:18.744 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:11:34.781 Central Daylight Time"]
+[Opening "Reti accepted"]
+[PlyCount "98"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. Nf3 {book} d5 {book} 2. c4 {book} dxc4 {book} 3. e3 {book} Nf6 {book}
+4. Bxc4 {book} e6 {book} 5. O-O {+0.75/1 1.5s} a6 {-0.47/1 1.6s}
+6. d4 {+0.44/1 1.5s} b5 {-0.13/1 1.5s} 7. Be2 {+0.67/1 1.4s} Bb7 {-0.62/1 1.2s}
+8. a4 {+0.86/1 1.0s} b4 {-0.74/1 0.64s} 9. Nbd2 {+0.90/1 0.52s}
+Nbd7 {-0.49/1 0.63s} 10. Nc4 {+0.69/1 1.4s} c5 {-0.54/1 1.4s}
+11. b3 {+0.65/1 1.4s} Be7 {-0.50/1 1.0s} 12. Bb2 {+0.64/1 1.2s}
+O-O {-0.53/1 0.84s} 13. a5 {+0.48/1 1.3s} Rc8 {-0.66/1 1.7s}
+14. dxc5 {+1.31/1 1.8s} Nxc5 {-1.64/1 1.8s} 15. Nb6 {+2.15/1 1.9s}
+Rc6 {-0.88/1 1.4s} 16. Ne5 {+2.18/1 1.6s} Rd6 {-0.28/1 1.9s}
+17. Bd4 {+0.80/1 1.7s} Nfe4 {+0.34/1 0.69s} 18. Nec4 {+2.53/1 0.96s}
+Rc6 {-2.79/1 1.5s} 19. Bf3 {+2.49/1 1.6s} Bf6 {-3.46/1 1.6s}
+20. Bxf6 {+5.50/1 1.7s} Qxf6 {-6.41/1 1.5s} 21. Nd7 {+6.07/1 1.1s}
+Nxd7 {-5.43/1 1.3s} 22. Bxe4 {+5.39/1 1.2s} Rc7 {-4.97/1 0.38s}
+23. Qd6 {+7.31/1 0.77s} Rfc8 {-5.26/1 1.8s} 24. Bxb7 {+5.86/1 1.8s}
+Rxb7 {-5.96/1 0.92s} 25. Qxa6 {+5.79/1 0.19s} Nc5 {-3.57/1 1.3s}
+26. Qxb7 {+6.05/1 0.83s} Nxb7 {-2.21/1 1.2s} 27. a6 {+6.01/1 0.47s}
+Nc5 {-1.86/1 0.13s} 28. a7 {+5.32/1 0.31s} Ra8 {-0.30/1 0.75s}
+29. Nb6 {+3.86/1 1.5s} Rxa7 {+0.17/1 0.30s} 30. Rxa7 {+3.14/1 0.33s}
+h5 {+0.17/1 0.15s} 31. Rc7 {+3.14/1 0.98s} Nxb3 {+3.13/1 1.7s}
+32. Rd1 {+1.72/1 1.7s} Qe5 {+2.61/1 0.87s} 33. Rc8+ {+4.62/1 1.4s}
+Kh7 {-0.61/1 0.87s} 34. Nc4 {+5.53/1 0.29s} Qf6 {-0.72/1 0.88s}
+35. Nd6 {+6.17/1 1.5s} Kg6 {+0.05/1 1.3s} 36. h3 {+4.04/1 1.7s}
+Qb2 {+4.17/1 1.7s} 37. Nc4 {+3.69/1 1.4s} Qe2 {+0.90/1 1.5s}
+38. Rd7 {+7.67/1 0.83s} Nc1 {-4.74/1 1.3s} 39. Ne5+ {+7.19/1 1.6s}
+Kf6 {-4.92/1 0.92s} 40. Rxf7+ {+6.94/1 0.73s} Kxe5 {-5.30/1 1.4s}
+41. Rxc1 {+6.32/1 1.1s} b3 {-5.12/1 0.17s} 42. Rb7 {+6.83/1 1.1s}
+Qb2 {-5.04/1 0.75s} 43. Rcc7 {+7.58/1 1.6s} Qa1+ {-2.94/1 1.5s}
+44. Kh2 {+4.86/1 1.4s} b2 {-4.97/1 0.67s} 45. Rc5+ {+5.38/1 0.26s}
+Kf6 {-7.01/1 0.69s} 46. Rcb5 {+7.92/1 1.3s} h4 {-7.05/1 0.83s}
+47. Rxb2 {+8.50/1 1.3s} Qf1 {-6.97/1 1.2s} 48. R7b4 {+8.12/1 1.4s}
+g5 {-7.53/1 1.4s} 49. Rg4 {+8.21/1 1.5s}
+Qe1 {-6.60/1 0.91s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "A09"]
+[GameDuration "00:01:16"]
+[GameEndTime "2026-05-31T19:13:09.633 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:11:53.579 Central Daylight Time"]
+[Opening "Reti accepted"]
+[PlyCount "70"]
+[TimeControl "inf"]
+
+1. Nf3 {book} d5 {book} 2. c4 {book} dxc4 {book} 3. e3 {book} Nf6 {book}
+4. Bxc4 {book} e6 {book} 5. O-O {+0.83/1 1.4s} c5 {-0.70/1 1.6s}
+6. d4 {+0.70/1 1.4s} a6 {-0.57/1 1.7s} 7. a4 {+1.44/1 1.5s} Nc6 {-0.79/1 1.6s}
+8. Qe2 {+1.40/1 1.1s} cxd4 {-1.62/1 1.4s} 9. Rd1 {+2.31/1 1.7s}
+Be7 {-1.15/1 1.4s} 10. exd4 {+1.86/1 0.92s} O-O {-1.46/1 1.0s}
+11. Nc3 {+1.77/1 0.69s} Nb4 {-1.35/1 1.3s} 12. Bg5 {+1.76/1 0.58s}
+h6 {-1.10/1 1.5s} 13. Bh4 {+1.53/1 1.9s} Bd7 {-1.39/1 1.4s}
+14. Ne5 {+1.18/1 1.3s} Rc8 {-1.01/1 1.2s} 15. Rac1 {+1.11/1 1.3s}
+Be8 {-1.27/1 1.8s} 16. Bb3 {+1.55/1 1.9s} Nc6 {-1.02/1 1.8s}
+17. Nf3 {+1.66/1 1.7s} Qb6 {-0.50/1 1.7s} 18. Ba2 {+0.75/1 1.9s}
+Nb4 {-1.12/1 1.7s} 19. Bb1 {+0.44/1 0.94s} Bc6 {-0.53/1 1.3s}
+20. Ne5 {+1.64/1 0.97s} Rfd8 {-1.16/1 1.5s} 21. Ng6 {+3.60/1 0.82s}
+Qc7 {-1.63/1 1.8s} 22. Nxe7+ {+2.58/1 1.2s} Qxe7 {-1.29/1 1.5s}
+23. Qe5 {+2.96/1 1.2s} Nbd5 {-1.80/1 1.3s} 24. Ne4 {+2.33/1 1.3s}
+Bxa4 {-1.04/1 1.0s} 25. Re1 {+0.85/1 0.99s} Rxc1 {-1.26/1 0.76s}
+26. Rxc1 {-0.08/1 0.93s} Bc6 {-0.81/1 1.0s} 27. h3 {-0.53/1 0.66s}
+Rd7 {-0.07/1 0.93s} 28. Nc5 {-0.81/1 1.8s} Rd8 {-0.66/1 0.87s}
+29. Ne4 {-1.41/1 0.69s} Rd7 {-0.36/1 0.17s} 30. Rc5 {+0.86/1 0.41s}
+Qd8 {-0.62/1 1.7s} 31. Rc1 {-1.08/1 1.9s} a5 {+0.28/1 0.83s}
+32. Nc5 {-1.38/1 1.8s} Rc7 {+0.60/1 1.3s} 33. Ne4 {-0.57/1 1.3s}
+Rd7 {+0.60/1 1.00s} 34. Nc5 {-1.40/1 0.30s} Rc7 {+0.55/1 0.30s}
+35. Ne4 {-0.55/1 0.34s} Rd7 {+0.46/1 0.48s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "0-1"]
+[ECO "A09"]
+[GameDuration "00:00:52"]
+[GameEndTime "2026-05-31T19:12:55.362 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:12:03.291 Central Daylight Time"]
+[Opening "Reti"]
+[PlyCount "53"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Advance variation"]
+
+1. Nf3 {book} d5 {book} 2. c4 {book} d4 {book} 3. g3 {book} g6 {book}
+4. Bg2 {book} Bg7 {book} 5. b4 {+0.49/1 1.8s} e5 {-0.89/1 1.8s}
+6. d3 {+0.95/1 1.8s} Ne7 {-1.11/1 1.3s} 7. O-O {+0.93/1 1.2s} O-O {-1.19/1 1.0s}
+8. a4 {+1.11/1 1.4s} a5 {-1.38/1 0.99s} 9. b5 {+1.52/1 1.7s} c5 {-1.24/1 1.2s}
+10. Nbd2 {+1.84/1 1.1s} Nd7 {-1.39/1 1.5s} 11. Ne4 {+2.25/1 1.7s}
+h6 {-1.79/1 1.9s} 12. e3 {+2.95/1 2.0s} f5 {-3.60/1 1.9s} 13. Nd6 {+3.21/1 1.7s}
+Qc7 {-2.80/1 0.90s} 14. Nxc8 {+2.84/1 1.5s} Raxc8 {-1.95/1 0.65s}
+15. exd4 {+2.51/1 0.36s} cxd4 {-1.51/1 0.42s} 16. Ba3 {+1.76/1 0.51s}
+Nc5 {-1.45/1 0.84s} 17. Re1 {+0.69/1 1.6s} b6 {-1.23/1 0.94s}
+18. Bxc5 {+1.05/1 1.4s} Qxc5 {-0.37/1 0.73s} 19. Qe2 {+0.68/1 0.62s}
+e4 {+3.04/1 1.4s} 20. dxe4 {-3.45/1 1.7s} d3 {+5.39/1 0.78s}
+21. Qxd3 {-5.10/1 1.3s} Bxa1 {+5.70/1 0.60s} 22. Rxa1 {-5.37/1 0.40s}
+Rfd8 {+6.17/1 0.27s} 23. Qc3 {-6.54/1 0.65s} fxe4 {+7.15/1 1.5s}
+24. Ne5 {-7.01/1 1.5s} Qd4 {+7.50/1 0.65s} 25. Qxd4 {-6.29/1 1.5s}
+Rxd4 {+7.13/1 0.79s} 26. Re1 {-6.05/1 0.33s} Rc5 {+7.23/1 1.6s}
+27. f4 {-6.29/1 0.83s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "A09"]
+[GameDuration "00:00:28"]
+[GameEndTime "2026-05-31T19:12:46.650 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:12:17.784 Central Daylight Time"]
+[Opening "Reti"]
+[PlyCount "33"]
+[TimeControl "inf"]
+[Variation "Advance variation"]
+
+1. Nf3 {book} d5 {book} 2. c4 {book} d4 {book} 3. g3 {book} g6 {book}
+4. Bg2 {book} Bg7 {book} 5. O-O {0.00/1 1.5s} c5 {+0.12/1 1.7s}
+6. b4 {+0.84/1 1.5s} cxb4 {+0.22/1 1.8s} 7. a3 {+0.71/1 1.2s} d3 {+0.12/1 1.3s}
+8. Ra2 {+1.66/1 1.7s} dxe2 {-2.19/1 1.4s} 9. Qxe2 {+2.31/1 1.6s}
+b3 {-2.14/1 1.2s} 10. Rb2 {+3.47/1 1.2s} Nc6 {-2.62/1 0.87s}
+11. Rxb3 {+3.09/1 1.2s} Nf6 {-2.61/1 1.3s} 12. Bb2 {+2.45/1 0.73s}
+O-O {-2.22/1 1.6s} 13. d4 {+2.74/1 1.3s} Na5 {-2.68/1 1.1s}
+14. Rb4 {+2.74/1 1.2s} Nc6 {-2.53/1 1.3s} 15. Rb3 {+2.81/1 0.56s}
+Na5 {-2.68/1 0.28s} 16. Rb4 {+2.75/1 0.27s} Nc6 {-2.55/1 0.54s}
+17. Rb3 {+2.78/1 0.37s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "A46"]
+[GameDuration "00:00:41"]
+[GameEndTime "2026-05-31T19:13:00.077 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:12:18.244 Central Daylight Time"]
+[Opening "Queen's pawn game"]
+[PlyCount "40"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. d4 {book} Nf6 {book} 2. Nf3 {book} e6 {book} 3. g3 {book} d5 {book}
+4. Bg2 {book} b5 {book} 5. O-O {+0.62/1 1.7s} Bb7 {-0.36/1 2.0s}
+6. a4 {+1.15/1 1.8s} b4 {-0.67/1 1.3s} 7. c4 {+1.23/1 0.70s} bxc3 {-1.58/1 1.2s}
+8. Nxc3 {+1.74/1 1.5s} c5 {-1.11/1 1.3s} 9. Bf4 {+2.83/1 1.8s} a6 {-2.19/1 1.6s}
+10. Qb3 {+2.63/1 1.6s} Ra7 {-3.38/1 2.2s} 11. dxc5 {+3.45/1 2.0s}
+Bxc5 {-3.95/1 1.5s} 12. a5 {+5.16/1 1.4s} Nc6 {-4.12/1 1.4s}
+13. Na4 {+5.54/1 1.7s} Be7 {-4.95/1 1.3s} 14. Be3 {+6.22/1 1.2s}
+Nxa5 {-6.36/1 1.5s} 15. Qc3 {+6.45/1 1.4s} Nc6 {-5.72/1 1.6s}
+16. Bxa7 {+5.96/1 1.0s} Nxa7 {-6.81/1 1.1s} 17. Nc5 {+6.49/1 0.34s}
+Nb5 {-7.22/1 0.35s} 18. Nxb7 {+7.88/1 1.9s} Nxc3 {-7.82/1 1.6s}
+19. Nxd8 {+8.23/1 1.0s} Nxe2+ {-7.83/1 0.48s} 20. Kh1 {+8.22/1 0.068s}
+Bxd8 {-7.76/1 0.17s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "A46"]
+[GameDuration "00:00:50"]
+[GameEndTime "2026-05-31T19:13:19.296 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:12:28.445 Central Daylight Time"]
+[Opening "Queen's pawn game"]
+[PlyCount "44"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. d4 {book} Nf6 {book} 2. Nf3 {book} e6 {book} 3. g3 {book} d5 {book}
+4. Bg2 {book} b5 {book} 5. O-O {+0.32/1 1.8s} Bb7 {-0.56/1 2.0s}
+6. a4 {+0.81/1 0.91s} b4 {-0.99/1 1.3s} 7. c4 {+1.12/1 1.0s}
+bxc3 {-1.57/1 0.72s} 8. Nxc3 {+1.57/1 1.5s} c5 {-1.41/1 1.6s}
+9. a5 {+2.27/1 1.2s} Nbd7 {-1.45/1 1.9s} 10. a6 {+2.34/1 2.0s}
+Bc6 {-2.37/1 1.7s} 11. Bf4 {+2.30/1 0.57s} Rc8 {-1.42/1 1.3s}
+12. Rc1 {+1.85/1 1.5s} c4 {-2.04/1 1.9s} 13. Ne5 {+3.01/1 1.7s}
+Nxe5 {-3.61/1 1.6s} 14. dxe5 {+5.46/1 1.7s} Nd7 {-5.07/1 1.3s}
+15. e4 {+6.20/1 1.4s} d4 {-5.20/1 1.1s} 16. Qxd4 {+6.34/1 1.6s}
+Nb6 {-4.38/1 0.72s} 17. Qe3 {+6.37/1 1.3s} Be7 {-4.87/1 1.8s}
+18. Rfd1 {+5.94/1 1.5s} Qc7 {-6.18/1 1.4s} 19. Nd5 {+8.53/1 0.87s}
+exd5 {-7.84/1 1.4s} 20. exd5 {+8.36/1 1.5s} Ba4 {-7.30/1 1.2s}
+21. d6 {+8.18/1 1.2s} Qd7 {-7.02/1 1.5s} 22. Re1 {+7.71/1 1.4s}
+Bd8 {-7.94/1 1.4s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "0-1"]
+[ECO "A20"]
+[GameDuration "00:01:16"]
+[GameEndTime "2026-05-31T19:14:03.312 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:12:46.650 Central Daylight Time"]
+[Opening "English, Nimzowitsch, Flohr variation"]
+[PlyCount "63"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. c4 {book} e5 {book} 2. Nf3 {book} e4 {book} 3. Nd4 {book} Nc6 {book}
+4. Nxc6 {book} dxc6 {book} 5. Nc3 {-0.68/1 1.6s} Nf6 {+1.12/1 2.1s}
+6. g3 {-0.91/1 1.4s} Bf5 {+1.21/1 1.2s} 7. Bg2 {-1.47/1 1.9s} Qd7 {+1.78/1 1.2s}
+8. O-O {-2.22/1 1.3s} O-O-O {+2.01/1 1.3s} 9. Qa4 {-2.28/1 1.7s}
+Kb8 {-0.02/1 1.4s} 10. d3 {-0.21/1 1.7s} exd3 {+0.17/1 1.1s}
+11. Be3 {-0.43/1 1.1s} a6 {+0.66/1 0.60s} 12. exd3 {-1.25/1 1.1s}
+Ng4 {+0.22/1 1.3s} 13. d4 {-0.06/1 1.6s} Nxe3 {+1.52/1 1.3s}
+14. fxe3 {-0.31/1 1.4s} Bh3 {+1.47/1 0.45s} 15. Bxh3 {-0.63/1 0.73s}
+Qxh3 {+1.42/1 1.9s} 16. Qc2 {-0.80/1 1.6s} f6 {+0.92/1 1.6s}
+17. c5 {+0.89/1 1.7s} Re8 {-0.82/1 1.8s} 18. Rae1 {+1.60/1 2.1s}
+h5 {-1.94/1 1.6s} 19. Qf5 {+2.43/1 1.3s} Qxf5 {-2.26/1 0.52s}
+20. Rxf5 {+2.33/1 0.61s} h4 {-2.71/1 0.12s} 21. g4 {+3.17/1 1.5s}
+h3 {-3.46/1 1.4s} 22. Kf2 {+4.05/1 1.6s} Kc8 {-3.77/1 1.3s}
+23. Kg3 {+3.82/1 1.5s} Kd7 {-3.79/1 1.8s} 24. e4 {+4.34/1 1.8s}
+Be7 {-3.81/1 1.5s} 25. Ne2 {+4.73/1 2.0s} g6 {-3.02/1 1.8s}
+26. Rff1 {+0.48/1 1.8s} f5 {+5.54/1 1.9s} 27. Kf4 {-5.79/1 1.5s}
+fxe4 {+6.81/1 1.9s} 28. Ng3 {-6.27/1 1.7s} Rhf8+ {+7.13/1 1.1s}
+29. Ke3 {-6.93/1 1.5s} Bg5+ {+7.37/1 0.93s} 30. Ke2 {-7.40/1 0.78s}
+Bh4 {+8.03/1 0.18s} 31. Rxf8 {-8.07/1 1.4s} Rxf8 {+8.23/1 1.7s}
+32. Rf1 {-8.42/1 1.3s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "0-1"]
+[ECO "A20"]
+[GameDuration "00:00:48"]
+[GameEndTime "2026-05-31T19:13:35.828 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:12:47.779 Central Daylight Time"]
+[Opening "English, Nimzowitsch, Flohr variation"]
+[PlyCount "47"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. c4 {book} e5 {book} 2. Nf3 {book} e4 {book} 3. Nd4 {book} Nc6 {book}
+4. Nxc6 {book} dxc6 {book} 5. Nc3 {-0.70/1 1.8s} Nf6 {+1.00/1 1.9s}
+6. g3 {-1.02/1 0.98s} h5 {+1.74/1 1.4s} 7. Bg2 {-1.06/1 1.8s} h4 {+2.44/1 2.0s}
+8. Nxe4 {-0.45/1 1.5s} Nxe4 {+2.17/1 0.73s} 9. Bxe4 {-0.66/1 0.57s}
+Qd4 {+2.18/1 0.30s} 10. d3 {-0.90/1 1.5s} hxg3 {+1.07/1 1.5s}
+11. hxg3 {+2.61/1 1.9s} Rxh1+ {-0.86/1 1.7s} 12. Bxh1 {+2.43/1 0.57s}
+Bg4 {+0.63/1 0.78s} 13. Qb3 {+1.38/1 0.67s} O-O-O {-0.32/1 1.5s}
+14. Be3 {-0.22/1 1.5s} Qe5 {+2.88/1 1.5s} 15. Qc3 {-1.14/1 0.71s}
+Qh5 {+5.08/1 1.8s} 16. Be4 {-2.42/1 1.5s} f5 {+6.27/1 0.82s}
+17. Bg2 {-4.45/1 1.9s} Bxe2 {+5.96/1 1.1s} 18. d4 {-4.89/1 0.63s}
+Bg4 {+5.66/1 0.65s} 19. Kd2 {-5.08/1 1.9s} Qh2 {+6.87/1 2.0s}
+20. Bf1 {-6.12/1 1.8s} g5 {+8.03/1 1.1s} 21. Be2 {-7.79/1 1.3s}
+Bxe2 {+8.27/1 2.0s} 22. Kxe2 {-8.71/1 1.2s} f4 {+8.63/1 0.37s}
+23. gxf4 {-8.97/1 0.20s} gxf4 {+8.98/1 0.71s}
+24. Bd2 {-8.99/1 0.21s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "0-1"]
+[ECO "B30"]
+[GameDuration "00:01:31"]
+[GameEndTime "2026-05-31T19:14:27.297 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:12:55.378 Central Daylight Time"]
+[Opening "Sicilian"]
+[PlyCount "85"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Nimzowitsch-Rossolimo attack (without ...d6)"]
+
+1. e4 {book} c5 {book} 2. Nf3 {book} Nc6 {book} 3. Bb5 {book} d6 {book}
+4. O-O {book} Bd7 {book} 5. Re1 {+1.97/1 1.6s} a6 {-2.20/1 1.5s}
+6. Bxc6 {+2.37/1 1.5s} Bxc6 {-1.79/1 1.9s} 7. d4 {+2.17/1 1.3s}
+cxd4 {-2.05/1 0.61s} 8. Nxd4 {+2.15/1 0.49s} Nf6 {-2.09/1 0.20s}
+9. Nxc6 {+2.03/1 1.2s} bxc6 {-1.56/1 1.3s} 10. e5 {+1.51/1 0.73s}
+dxe5 {-1.19/1 1.2s} 11. Qf3 {+1.25/1 0.89s} e4 {-0.49/1 0.58s}
+12. Qc3 {+1.21/1 1.7s} Qd5 {-0.65/1 1.8s} 13. Nd2 {+1.51/1 1.3s}
+e6 {+0.08/1 1.3s} 14. Nc4 {+0.75/1 1.7s} Bc5 {+1.20/1 1.1s}
+15. Be3 {-0.33/1 1.3s} O-O {+1.21/1 0.90s} 16. Rad1 {-1.62/1 0.90s}
+Qh5 {+2.36/1 1.7s} 17. Bxc5 {-1.31/1 1.9s} Qxc5 {+1.63/1 1.5s}
+18. b4 {-1.29/1 0.95s} Qg5 {+2.20/1 1.4s} 19. Qe5 {-1.28/1 1.7s}
+Qxe5 {+2.21/1 1.7s} 20. Nxe5 {-2.20/1 1.6s} Rfc8 {+2.47/1 0.88s}
+21. c4 {-2.03/1 1.9s} c5 {+3.44/1 1.4s} 22. a3 {-2.52/1 1.7s}
+Rab8 {+3.23/1 1.2s} 23. Rb1 {-1.73/1 1.3s} cxb4 {+2.22/1 1.2s}
+24. axb4 {-1.40/1 1.1s} Kf8 {+1.79/1 0.76s} 25. Red1 {-0.29/1 1.5s}
+Ke7 {+1.55/1 1.4s} 26. Kf1 {-0.33/1 1.6s} Rc7 {+1.42/1 1.3s}
+27. Ke2 {-0.42/1 1.7s} Ne8 {+1.81/1 1.6s} 28. c5 {-2.43/1 1.8s}
+Nf6 {+4.98/1 1.4s} 29. Rd6 {-3.75/1 1.2s} Rxc5 {+4.92/1 1.4s}
+30. bxc5 {-3.24/1 1.4s} Rxb1 {+3.86/1 1.0s} 31. Nc6+ {-2.94/1 0.67s}
+Kf8 {+4.11/1 0.86s} 32. Rd8+ {-3.09/1 0.97s} Ne8 {+3.64/1 0.34s}
+33. Ra8 {-2.93/1 0.27s} Rc1 {+4.46/1 1.4s} 34. Ne5 {-2.77/1 1.4s}
+Ke7 {+4.12/1 1.1s} 35. Ra7+ {-3.73/1 0.94s} Kf6 {+4.82/1 1.4s}
+36. Nd7+ {-4.52/1 0.78s} Kf5 {+5.78/1 0.59s} 37. Kd2 {-5.20/1 0.85s}
+Rc4 {+6.49/1 1.1s} 38. h3 {-5.82/1 1.1s} Nf6 {+7.33/1 1.7s}
+39. g4+ {-7.47/1 1.5s} Kf4 {+8.66/1 1.2s} 40. Nxf6 {-8.18/1 1.1s}
+gxf6 {+8.31/1 0.61s} 41. Rxf7 {-8.21/1 0.48s} f5 {+8.66/1 0.71s}
+42. gxf5 {-9.19/1 0.77s} exf5 {+9.28/1 0.94s}
+43. Rxh7 {-9.26/1 0.71s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "B30"]
+[GameDuration "00:01:53"]
+[GameEndTime "2026-05-31T19:14:53.570 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:13:00.093 Central Daylight Time"]
+[Opening "Sicilian"]
+[PlyCount "127"]
+[TimeControl "inf"]
+[Variation "Nimzowitsch-Rossolimo attack (without ...d6)"]
+
+1. e4 {book} c5 {book} 2. Nf3 {book} Nc6 {book} 3. Bb5 {book} d6 {book}
+4. O-O {book} Bd7 {book} 5. Re1 {+2.50/1 1.7s} a6 {-1.82/1 1.8s}
+6. Bf1 {+2.41/1 1.5s} Bg4 {-1.81/1 1.3s} 7. h3 {+2.12/1 0.94s}
+Bxf3 {-0.92/1 1.2s} 8. Qxf3 {+1.11/1 1.1s} g6 {-0.76/1 0.41s}
+9. c3 {+0.95/1 0.89s} Bg7 {-0.67/1 1.0s} 10. a4 {+1.02/1 0.38s}
+Nf6 {-0.61/1 1.5s} 11. Na3 {+0.94/1 1.2s} O-O {-0.60/1 1.3s}
+12. Nc2 {+0.91/1 0.97s} d5 {+0.02/1 1.9s} 13. exd5 {+0.81/1 2.0s}
+Nxd5 {-0.16/1 1.8s} 14. Ne3 {+0.91/1 1.4s} Nxe3 {-0.49/1 1.5s}
+15. dxe3 {+0.71/1 1.7s} Qc7 {-0.28/1 1.8s} 16. e4 {+0.80/1 1.5s}
+Rad8 {-0.59/1 1.5s} 17. Bf4 {+1.34/1 1.5s} Qb6 {-0.81/1 1.9s}
+18. Qe2 {+1.43/1 1.5s} Na5 {-1.03/1 1.6s} 19. e5 {+1.91/1 1.8s}
+c4 {-1.03/1 1.7s} 20. Rad1 {+1.67/1 1.9s} e6 {-1.52/1 1.9s}
+21. Rd6 {+2.65/1 1.6s} Rxd6 {-2.15/1 1.8s} 22. exd6 {+2.41/1 1.3s}
+Rd8 {-1.86/1 0.89s} 23. h4 {+2.37/1 0.69s} Bf8 {-1.06/1 1.6s}
+24. h5 {+0.49/1 1.6s} Bxd6 {+0.06/1 1.6s} 25. Bg5 {+0.15/1 0.70s}
+Rd7 {+0.46/1 0.64s} 26. Bf6 {-0.28/1 0.70s} Qc5 {+0.83/1 1.5s}
+27. hxg6 {-1.31/1 1.9s} hxg6 {+0.66/1 1.6s} 28. Qg4 {-1.36/1 0.68s}
+Qh5 {+1.37/1 1.3s} 29. Qxh5 {-1.52/1 1.1s} gxh5 {+1.12/1 0.49s}
+30. Re4 {-1.48/1 0.27s} Kh7 {+1.28/1 1.2s} 31. Rd4 {-1.82/1 1.4s}
+Kg6 {+1.53/1 1.2s} 32. Be5 {-0.42/1 1.8s} Nc6 {+1.79/1 1.6s}
+33. Rxd6 {-0.57/1 0.53s} Nxe5 {+1.83/1 0.31s} 34. Rxd7 {-0.75/1 0.28s}
+Nxd7 {+1.34/1 0.31s} 35. Bxc4 {-0.73/1 0.26s} Kg5 {+2.02/1 0.17s}
+36. a5 {-0.73/1 1.2s} h4 {+1.46/1 1.3s} 37. b4 {-0.41/1 1.2s} Kf4 {+0.84/1 1.2s}
+38. Be2 {-0.39/1 0.94s} Ne5 {+0.27/1 1.3s} 39. Kh2 {-0.08/1 1.2s}
+f5 {+0.86/1 1.3s} 40. Kh3 {-0.47/1 0.99s} Kg5 {+0.46/1 0.70s}
+41. g3 {-0.07/1 0.57s} hxg3 {+0.30/1 0.64s} 42. fxg3 {+0.07/1 0.49s}
+f4 {+0.10/1 0.69s} 43. Kg2 {+0.21/1 0.82s} Kf5 {+0.23/1 0.82s}
+44. gxf4 {+1.54/1 0.61s} Kxf4 {-0.22/1 0.77s} 45. Kf2 {+1.48/1 0.39s}
+Ke4 {-0.55/1 0.34s} 46. Bf1 {+1.24/1 0.46s} Nd3+ {-1.29/1 0.77s}
+47. Ke2 {+0.21/1 0.61s} Nf4+ {-0.26/1 0.87s} 48. Kd2 {-0.09/1 0.37s}
+e5 {+0.51/1 0.44s} 49. b5 {-0.07/1 0.38s} axb5 {+0.30/1 0.63s}
+50. Bxb5 {-0.15/1 0.34s} Kd5 {+0.37/1 0.16s} 51. a6 {+0.14/1 0.43s}
+bxa6 {-0.04/1 0.84s} 52. Bxa6 {+0.15/1 0.65s} Kc5 {-0.06/1 0.14s}
+53. Ke3 {+0.18/1 0.50s} Nd5+ {-0.09/1 0.81s} 54. Ke4 {+0.31/1 0.63s}
+Nxc3+ {-0.24/1 0.85s} 55. Kxe5 {+0.43/1 0.47s} Nd5 {-0.39/1 0.27s}
+56. Bb7 {+0.47/1 0.58s} Nc3 {-0.38/1 0.66s} 57. Ba8 {+0.50/1 0.77s}
+Nb5 {-0.41/1 0.67s} 58. Bb7 {+0.49/1 0.50s} Nd6 {-0.35/1 0.50s}
+59. Ba8 {+0.53/1 0.37s} Nc4+ {-0.39/1 0.53s} 60. Ke6 {+0.47/1 0.51s}
+Nb6 {-0.33/1 0.59s} 61. Bb7 {+0.47/1 0.53s} Nc4 {-0.32/1 0.56s}
+62. Ba8 {+0.47/1 0.41s} Nb6 {-0.33/1 0.22s} 63. Bb7 {+0.47/1 0.20s}
+Nc4 {-0.32/1 0.41s} 64. Ba8 {+0.48/1 0.19s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1/2-1/2"]
+[ECO "C00"]
+[GameDuration "00:00:56"]
+[GameEndTime "2026-05-31T19:14:06.114 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:13:09.644 Central Daylight Time"]
+[Opening "French"]
+[PlyCount "57"]
+[TimeControl "inf"]
+[Variation "King's Indian attack"]
+
+1. e4 {book} e6 {book} 2. d3 {book} d5 {book} 3. Nd2 {book} Nf6 {book}
+4. e5 {book} Nfd7 {book} 5. d4 {+1.07/1 1.8s} c5 {-0.84/1 2.2s}
+6. c3 {+0.97/1 0.65s} Nc6 {-0.98/1 0.29s} 7. Ngf3 {+1.08/1 1.1s}
+Qb6 {+0.32/1 0.82s} 8. Nb3 {-0.28/1 1.7s} a5 {+1.49/1 1.3s} 9. a4 {-1.02/1 1.7s}
+cxd4 {+2.81/1 1.1s} 10. Nbxd4 {-1.14/1 1.2s} Ndxe5 {+3.01/1 1.7s}
+11. Nxe5 {-1.81/1 1.5s} Nxe5 {+2.05/1 1.3s} 12. Bb5+ {-1.68/1 0.97s}
+Bd7 {+2.77/1 0.80s} 13. O-O {-1.18/1 0.94s} Bc5 {+2.67/1 1.3s}
+14. Bf4 {-2.86/1 1.7s} Ng6 {+4.86/1 1.7s} 15. Bxd7+ {-1.28/1 2.0s}
+Kxd7 {+1.83/1 2.1s} 16. Be3 {-0.38/1 0.65s} Rhc8 {+1.80/1 0.38s}
+17. Qh5 {+1.94/1 1.2s} h6 {+0.37/1 1.9s} 18. Rfe1 {+2.53/1 1.3s}
+Qxb2 {+0.33/1 1.4s} 19. Rab1 {+5.32/1 2.0s} Qxc3 {+0.58/1 1.6s}
+20. Nxe6 {+5.52/1 0.91s} fxe6 {-4.16/1 2.1s} 21. Bxc5 {+5.00/1 1.2s}
+Rxc5 {-3.30/1 1.2s} 22. Qxg6 {+4.93/1 1.2s} Qf6 {-3.89/1 1.3s}
+23. Rxb7+ {+5.29/1 0.73s} Rc7 {-4.19/1 0.54s} 24. Qb1 {+5.66/1 0.25s}
+Rc8 {-4.72/1 0.55s} 25. Qb5+ {+5.57/1 0.58s} Kd6 {-4.80/1 0.78s}
+26. Qb6+ {+5.94/1 0.89s} Kd7 {-5.05/1 0.98s} 27. Qb5+ {+5.60/1 0.46s}
+Kd8 {-5.43/1 0.69s} 28. Qb6 {+6.20/1 0.60s} Kd7 {-5.21/1 0.65s}
+29. Qb5+ {+5.67/1 0.48s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "0-1"]
+[ECO "C00"]
+[GameDuration "00:00:46"]
+[GameEndTime "2026-05-31T19:14:05.078 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:13:18.751 Central Daylight Time"]
+[Opening "French"]
+[PlyCount "53"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "King's Indian attack"]
+
+1. e4 {book} e6 {book} 2. d3 {book} d5 {book} 3. Nd2 {book} Nf6 {book}
+4. e5 {book} Nfd7 {book} 5. d4 {+0.99/1 1.9s} c5 {-0.89/1 1.8s}
+6. c3 {+1.02/1 1.0s} Nc6 {-0.99/1 0.22s} 7. Ngf3 {+0.89/1 0.38s}
+cxd4 {-1.15/1 1.2s} 8. cxd4 {+0.26/1 1.9s} Qb6 {+0.49/1 1.3s}
+9. Nb1 {+1.07/1 1.1s} f6 {-0.93/1 1.4s} 10. exf6 {+0.36/1 1.2s}
+Nxf6 {-0.96/1 0.68s} 11. Nc3 {+0.25/1 0.34s} Bd6 {-0.63/1 0.86s}
+12. Bd3 {-0.62/1 1.2s} O-O {-0.64/1 1.2s} 13. O-O {+1.00/1 1.5s}
+Bd7 {-0.65/1 1.5s} 14. Bc2 {+1.56/1 1.2s} Be8 {-0.13/1 1.6s}
+15. Re1 {+0.21/1 2.1s} Bh5 {+0.66/1 2.0s} 16. Rxe6 {-0.71/1 0.93s}
+Bxf3 {+0.52/1 0.70s} 17. gxf3 {-0.67/1 0.86s} Qc7 {-0.64/1 0.98s}
+18. Bg5 {+2.10/1 0.91s} Bxh2+ {+0.04/1 1.5s} 19. Kh1 {+0.28/1 1.9s}
+Bf4 {+3.23/1 2.2s} 20. Bxf6 {-2.91/1 1.8s} Qf7 {+5.65/1 1.4s}
+21. Qd3 {-5.09/1 0.97s} Qh5+ {+6.09/1 1.6s} 22. Kg2 {-5.88/1 0.50s}
+Qh2+ {+6.48/1 0.45s} 23. Kf1 {-7.27/1 0.65s} Qh3+ {+7.38/1 0.17s}
+24. Kg1 {-7.86/1 0.44s} Bh2+ {+9.06/1 0.21s} 25. Kh1 {-9.50/1 0.20s}
+Bg3+ {+9.63/1 0.14s} 26. Kg1 {-9.73/1 0.12s} Qh2+ {+9.86/1 0.003s}
+27. Kf1 {-9.92/1 0.003s, Black wins by adjudication} 0-1
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "A23"]
+[GameDuration "00:01:11"]
+[GameEndTime "2026-05-31T19:14:30.958 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:13:19.312 Central Daylight Time"]
+[Opening "English"]
+[PlyCount "72"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+[Variation "Bremen system, Keres variation"]
+
+1. c4 {book} e5 {book} 2. Nc3 {book} Nf6 {book} 3. g3 {book} c6 {book}
+4. Nf3 {book} e4 {book} 5. Nd4 {+0.28/1 2.2s} d5 {-0.86/1 2.0s}
+6. cxd5 {+0.49/1 1.3s} cxd5 {-1.12/1 1.1s} 7. d3 {+0.86/1 0.90s}
+Nc6 {-1.36/1 0.70s} 8. dxe4 {+1.48/1 1.5s} Nxe4 {-1.51/1 1.6s}
+9. Nxc6 {+3.39/1 1.6s} bxc6 {-3.85/1 1.9s} 10. Nxe4 {+3.25/1 0.86s}
+dxe4 {-4.08/1 0.36s} 11. Qa4 {+3.83/1 0.38s} f5 {-3.89/1 0.59s}
+12. Bg2 {+4.14/1 1.8s} Qb6 {-4.02/1 1.8s} 13. O-O {+3.97/1 1.9s}
+Bc5 {-3.17/1 1.2s} 14. Bf4 {+3.89/1 1.4s} O-O {-3.92/1 1.8s}
+15. Qc4+ {+4.36/1 1.7s} Kh8 {-4.81/1 1.4s} 16. Rac1 {+4.20/1 1.0s}
+Bd4 {-4.59/1 0.28s} 17. Qxc6 {+4.36/1 0.59s} Bb7 {-4.55/1 0.65s}
+18. Qxb6 {+4.11/1 1.9s} axb6 {-4.27/1 0.88s} 19. Rc7 {+3.81/1 0.74s}
+Ba6 {-4.15/1 0.85s} 20. Rd1 {+3.68/1 1.2s} Bxb2 {-3.85/1 1.5s}
+21. Bf1 {+4.25/1 1.2s} Rfc8 {-3.59/1 1.2s} 22. Rxc8+ {+5.14/1 1.6s}
+Rxc8 {-4.94/1 1.6s} 23. Rd6 {+5.18/1 0.54s} Ba3 {-4.91/1 0.36s}
+24. Rxb6 {+4.78/1 1.2s} Bc4 {-4.93/1 0.52s} 25. Bh3 {+5.40/1 0.42s}
+g6 {-4.38/1 1.7s} 26. g4 {+5.12/1 1.6s} Bc5 {-5.02/1 1.1s}
+27. Rb7 {+6.53/1 1.4s} Bxe2 {-6.77/1 1.2s} 28. gxf5 {+6.98/1 1.3s}
+Rd8 {-7.11/1 1.1s} 29. Be5+ {+6.13/1 1.5s} Kg8 {-6.73/1 1.4s}
+30. fxg6 {+6.55/1 1.0s} Rd1+ {-6.25/1 0.82s} 31. Kg2 {+6.47/1 0.87s}
+hxg6 {-5.90/1 0.46s} 32. Be6+ {+6.57/1 0.82s} Kf8 {-6.40/1 0.95s}
+33. Bf6 {+6.89/1 0.22s} Bf3+ {-7.16/1 0.73s} 34. Kg3 {+7.69/1 0.82s}
+Bd6+ {-7.03/1 1.0s} 35. Kh4 {+7.03/1 1.3s} Rg1 {-6.86/1 0.82s}
+36. Rf7+ {+8.20/1 0.58s} Ke8 {-8.76/1 0.57s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1/2-1/2"]
+[ECO "A23"]
+[GameDuration "00:01:04"]
+[GameEndTime "2026-05-31T19:14:40.545 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:13:35.835 Central Daylight Time"]
+[Opening "English"]
+[PlyCount "72"]
+[TimeControl "inf"]
+[Variation "Bremen system, Keres variation"]
+
+1. c4 {book} e5 {book} 2. Nc3 {book} Nf6 {book} 3. g3 {book} c6 {book}
+4. Nf3 {book} e4 {book} 5. Nd4 {+0.72/1 2.0s} d5 {-0.10/1 2.0s}
+6. cxd5 {+1.22/1 1.1s} cxd5 {-0.44/1 1.1s} 7. d3 {+1.51/1 0.88s}
+Nc6 {-0.56/1 1.3s} 8. dxe4 {+2.49/1 1.3s} dxe4 {-1.60/1 1.5s}
+9. Nxc6 {+2.06/1 1.6s} Qxd1+ {-1.25/1 1.2s} 10. Nxd1 {+1.86/1 0.28s}
+bxc6 {-1.17/1 0.44s} 11. Bg2 {+1.70/1 0.35s} a5 {-0.67/1 1.1s}
+12. O-O {+1.42/1 1.6s} a4 {-0.93/1 1.9s} 13. Nc3 {+2.12/1 2.1s}
+Bf5 {-1.75/1 1.8s} 14. Bg5 {+4.00/1 1.6s} a3 {-3.54/1 1.6s}
+15. b3 {+4.44/1 1.2s} Bb4 {-5.07/1 1.5s} 16. Rac1 {+6.15/1 1.4s}
+O-O {-7.15/1 1.4s} 17. Bxf6 {+7.20/1 1.7s} gxf6 {-7.04/1 1.5s}
+18. Nxe4 {+7.32/1 0.12s} Kg7 {-6.92/1 0.45s} 19. Rxc6 {+7.42/1 1.3s}
+Rac8 {-6.01/1 1.6s} 20. Rfc1 {+5.73/1 1.7s} Rxc6 {-5.40/1 1.3s}
+21. Rxc6 {+5.39/1 0.39s} Rd8 {-5.04/1 0.32s} 22. Rc1 {+5.13/1 0.22s}
+Be6 {-4.56/1 1.2s} 23. Bf3 {+3.19/1 1.5s} f5 {-1.43/1 1.6s}
+24. Nc5 {+1.32/1 1.1s} Bxc5 {+2.68/1 0.88s} 25. Rxc5 {-3.82/1 1.6s}
+Rd2 {+3.37/1 0.54s} 26. Ra5 {-4.32/1 0.20s} Rxa2 {+3.90/1 0.78s}
+27. Kg2 {-3.90/1 0.67s} Bxb3 {+3.74/1 0.88s} 28. h4 {-3.23/1 1.0s}
+Be6 {+4.13/1 0.74s} 29. e3 {-2.45/1 0.93s} Ra1 {+2.33/1 1.2s}
+30. Bd5 {-1.48/1 0.71s} Kf6 {+1.96/1 0.68s} 31. Bxe6 {-1.69/1 0.44s}
+fxe6 {+1.60/1 0.45s} 32. Kf3 {-1.64/1 0.38s} h5 {+1.59/1 0.72s}
+33. Kf4 {-0.94/1 0.99s} Rf1 {+1.91/1 0.70s} 34. Kf3 {-1.42/1 0.36s}
+Ra1 {+1.52/1 0.33s} 35. Kf4 {-1.12/1 0.13s} Rf1 {+1.76/1 0.28s}
+36. Kf3 {-1.53/1 0.33s} Ra1 {+1.52/1 0.13s, Draw by 3-fold repetition} 1/2-1/2
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase3_cpuct_1.75"]
+[Black "Phase2_ref"]
+[Result "1-0"]
+[ECO "A04"]
+[GameDuration "00:01:11"]
+[GameEndTime "2026-05-31T19:15:15.008 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:14:03.317 Central Daylight Time"]
+[Opening "Reti Opening"]
+[PlyCount "84"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. Nf3 {book} d6 {book} 2. g3 {book} e5 {book} 3. Bg2 {book} Nf6 {book}
+4. c4 {book} c5 {book} 5. O-O {+1.21/1 1.4s} Be7 {-1.42/1 1.9s}
+6. Nc3 {+1.53/1 1.4s} O-O {-1.48/1 1.0s} 7. e3 {+1.73/1 1.0s}
+Nc6 {-1.90/1 0.94s} 8. d4 {+1.58/1 1.3s} a6 {-1.75/1 1.1s} 9. d5 {+2.32/1 1.9s}
+Na5 {-2.60/1 1.5s} 10. Nd2 {+2.66/1 1.2s} Rb8 {-2.76/1 0.80s}
+11. a4 {+2.55/1 1.4s} Ne8 {-2.60/1 1.3s} 12. e4 {+3.14/1 1.7s} f5 {-2.19/1 1.6s}
+13. exf5 {+2.51/1 1.6s} Bxf5 {-2.31/1 1.3s} 14. b3 {+2.74/1 0.36s}
+Nf6 {-2.45/1 0.99s} 15. h3 {+2.69/1 1.7s} Qd7 {-2.74/1 1.4s}
+16. g4 {+3.01/1 1.4s} Bg6 {-3.21/1 1.5s} 17. Nde4 {+3.06/1 1.0s}
+Nxe4 {-2.90/1 1.1s} 18. Nxe4 {+2.67/1 1.4s} Rf7 {-2.02/1 0.88s}
+19. Bd2 {+2.72/1 1.2s} b6 {-1.92/1 0.84s} 20. Rb1 {+3.08/1 0.96s}
+Rbf8 {-2.44/1 0.76s} 21. Qe2 {+2.33/1 0.99s} Nb7 {-2.35/1 0.91s}
+22. f3 {+2.83/1 1.0s} Bh4 {-1.80/1 1.0s} 23. Rb2 {+2.58/1 1.3s}
+h6 {-1.63/1 1.3s} 24. Rbb1 {+1.19/1 1.0s} Qe7 {-0.81/1 0.96s}
+25. Kh2 {+1.00/1 1.3s} Bxe4 {+1.57/1 1.0s} 26. Qxe4 {-0.67/1 1.1s}
+Bg5 {+0.85/1 0.79s} 27. Be1 {-0.12/1 0.36s} Bf4+ {+0.75/1 0.47s}
+28. Kh1 {-0.42/1 0.85s} Qg5 {+1.29/1 0.74s} 29. h4 {+0.45/1 1.0s}
+Qf6 {-0.17/1 0.80s} 30. Bh3 {+1.34/1 0.77s} g6 {-0.63/1 0.91s}
+31. Rb2 {+2.01/1 0.97s} Na5 {-0.20/1 0.86s} 32. g5 {+3.97/1 1.1s}
+hxg5 {-1.96/1 0.93s} 33. Be6 {+4.43/1 0.42s} gxh4 {-1.76/1 0.27s}
+34. Rg1 {+4.57/1 0.60s} g5 {-3.43/1 0.99s} 35. Bxh4 {+3.52/1 0.51s}
+Kg7 {-1.90/1 0.46s} 36. Bxg5 {+2.65/1 0.63s} Rh8+ {-2.08/1 0.70s}
+37. Bh6+ {+5.90/1 0.69s} Kxh6 {-5.06/1 0.51s} 38. Bxf7 {+6.65/1 0.19s}
+Qh4+ {-6.32/1 0.23s} 39. Kg2 {+6.49/1 0.28s} Kg7 {-6.14/1 0.25s}
+40. Qg6+ {+6.81/1 0.41s} Kf8 {-7.54/1 0.72s} 41. Kf1 {+7.68/1 0.44s}
+Qh3+ {-7.53/1 0.005s} 42. Ke1 {+8.32/1 0.33s}
+Qh4+ {-8.19/1 0.53s, White wins by adjudication} 1-0
+
+[Event "cpuct_phase3_sweep_1.75_vs_phase2"]
+[Site "?"]
+[Date "2026.05.31"]
+[Round "1"]
+[White "Phase2_ref"]
+[Black "Phase3_cpuct_1.75"]
+[Result "1-0"]
+[ECO "A04"]
+[GameDuration "00:00:50"]
+[GameEndTime "2026-05-31T19:14:55.979 Central Daylight Time"]
+[GameStartTime "2026-05-31T19:14:05.087 Central Daylight Time"]
+[Opening "Reti Opening"]
+[PlyCount "58"]
+[Termination "adjudication"]
+[TimeControl "inf"]
+
+1. Nf3 {book} d6 {book} 2. g3 {book} e5 {book} 3. Bg2 {book} Nf6 {book}
+4. c4 {book} c5 {book} 5. O-O {+1.10/1 1.4s} Nc6 {-1.11/1 1.5s}
+6. Nc3 {+1.36/1 1.3s} g6 {-0.94/1 1.3s} 7. e3 {+1.59/1 1.1s} Bg7 {-1.53/1 1.7s}
+8. d4 {+1.92/1 1.2s} O-O {-0.98/1 0.57s} 9. d5 {+2.44/1 1.3s} e4 {-1.52/1 1.6s}
+10. dxc6 {+3.83/1 1.5s} exf3 {-2.82/1 1.6s} 11. Bxf3 {+3.60/1 0.32s}
+bxc6 {-2.47/1 1.2s} 12. Bxc6 {+3.34/1 0.97s} Rb8 {-2.12/1 0.29s}
+13. Bg2 {+3.14/1 0.52s} Be6 {-1.81/1 1.3s} 14. Qe2 {+3.60/1 1.3s}
+Nd7 {-1.21/1 1.3s} 15. Rd1 {+1.68/1 1.5s} Bxc3 {+1.12/1 1.4s}
+16. bxc3 {-0.54/1 0.99s} Ne5 {+0.70/1 0.49s} 17. e4 {-0.01/1 0.96s}
+Bxc4 {-1.43/1 1.1s} 18. Qd2 {+2.77/1 1.1s} Qa5 {-0.89/1 0.99s}
+19. f4 {+1.47/1 1.1s} Nc6 {-0.66/1 1.2s} 20. h4 {+1.53/1 1.1s}
+Rfd8 {-1.97/1 1.3s} 21. h5 {+0.93/1 0.89s} d5 {+1.17/1 1.0s}
+22. e5 {+2.44/1 0.91s} Qa4 {-1.12/1 1.3s} 23. Re1 {+5.06/1 0.79s}
+Ne7 {-4.13/1 0.98s} 24. g4 {+5.49/1 0.77s} d4 {-5.28/1 0.71s}
+25. f5 {+6.60/1 0.77s} dxc3 {-6.13/1 0.70s} 26. Qh6 {+7.14/1 0.41s}
+Rd1 {-6.52/1 0.53s} 27. Bg5 {+8.10/1 0.97s} Rxe1+ {-7.67/1 0.99s}
+28. Rxe1 {+8.69/1 0.81s} Bd5 {-7.62/1 0.63s} 29. Bf6 {+8.97/1 0.41s}
+Qd4+ {-8.79/1 0.60s, White wins by adjudication} 1-0
+
