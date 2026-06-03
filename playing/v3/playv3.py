@@ -474,7 +474,7 @@ def ask_play_again() -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Play chess against ChessTransformer")
     parser.add_argument("checkpoint", type=Path, nargs="?",
-                        default=_PROJECT_ROOT / "models" / "guofish2" / "guofish2_25.6M_54.8p.pt",
+                        default=_PROJECT_ROOT / "models" / "guofish3" / "guofish3_25.6M_final_0.0691.pt",
                         help="Path to model checkpoint")
     parser.add_argument("--mcts", action="store_true",
                         help="Use MCTS search instead of raw policy")
