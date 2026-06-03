@@ -30,7 +30,17 @@ import torch.optim as optim
 from torch.amp.autocast_mode import autocast
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
+
+
+def fmt_hms(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 # ---------------------------------------------------------------------------
@@ -358,13 +368,12 @@ def main():
 
     try:
         for epoch in range(EPOCHS):
-            pbar = tqdm(
-                enumerate(train_loader),
-                total=num_batches,
-                desc=f"Epoch {epoch + 1}/{EPOCHS}",
-                mininterval=2.0,
-            )
-            for batch_idx, (tok, tgt_v) in pbar:
+            epoch_start = time.time()
+            print("=" * 80)
+            print(f"Epoch {epoch + 1}/{EPOCHS} starting "
+                  f"(batches={num_batches:,}, optimizer steps={optimizer_steps_per_epoch:,})")
+            print("=" * 80)
+            for batch_idx, (tok, tgt_v) in enumerate(train_loader):
                 tok   = tok.to(DEVICE,   dtype=torch.long,    non_blocking=True)
                 tgt_v = tgt_v.to(DEVICE, dtype=torch.float32, non_blocking=True)
 
@@ -413,10 +422,39 @@ def main():
                         log_value_loss.append(avg_v)
                         log_kl_loss.append(avg_k)
                         log_total_loss.append(avg_t)
-                        pbar.set_postfix(
-                            step=step, V=f"{avg_v:.4f}", KL=f"{avg_k:.4f}",
-                            lr_v=f"{lr_v:.1e}", lr_b=f"{lr_b:.1e}",
-                            pos_M=f"{positions_processed / 1e6:.1f}",
+
+                        # Log two KL numbers with distinct labels:
+                        #   KL_train = per-batch loss term, model.train() so dropout is ON.
+                        #     Floors at ~0.10 from dropout asymmetry alone, even with
+                        #     identical weights. This is the value used in the gradient
+                        #     and is what we want to keep low *as a loss*.
+                        #   KL_drift = eval-mode KL on the fixed drift batch via
+                        #     measure_policy_kl. Directly comparable to Phase 1's
+                        #     final_kl=0.0056 and to the full_diagnostic checkpoint
+                        #     readouts. This is the honest "is the policy moving" number.
+                        # measure_policy_kl puts model into .eval(); restore .train() after.
+                        drift_kl = measure_policy_kl(model, ref_model, drift_tokens)
+                        model.train()
+
+                        elapsed_total = time.time() - training_start
+                        elapsed_epoch = time.time() - epoch_start
+                        samples_per_sec = (positions_processed / elapsed_total) if elapsed_total > 0 else 0.0
+                        remaining_steps = max(0, total_optimizer_steps - step)
+                        eta_sec = (elapsed_total / step) * remaining_steps if step > 0 else 0.0
+                        pos_M = positions_processed / 1e6
+
+                        print(
+                            f"E{epoch + 1}/{EPOCHS} "
+                            f"step {step:>5}/{total_optimizer_steps} "
+                            f"({100.0 * step / total_optimizer_steps:5.1f}%) | "
+                            f"pos {pos_M:6.2f}M | "
+                            f"V {avg_v:.4f}  KL_train {avg_k:.4f}  "
+                            f"KL_drift {drift_kl:.4f}  tot {avg_t:.4f} | "
+                            f"lr_v {lr_v:.1e} lr_b {lr_b:.1e} | "
+                            f"{samples_per_sec:>5.0f} pos/s | "
+                            f"epoch {fmt_hms(elapsed_epoch)}  "
+                            f"total {fmt_hms(elapsed_total)}  "
+                            f"ETA {fmt_hms(eta_sec)}"
                         )
 
                     accum_value_sum = accum_kl_sum = accum_total_sum = 0.0
