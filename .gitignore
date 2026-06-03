@@ -17,7 +17,12 @@ coverage/
 /models
 *.exe
 /cutechess-1.4.0-win64/
-
+/assets/syzygy
+/data/chessData.csv
+/benchmarking/player/friends
+/benchmarking/player/games
+/training/logs
+/benchmarking/engine/logs
 # Next.js
 .next/
 out/
