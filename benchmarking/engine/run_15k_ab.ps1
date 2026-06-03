@@ -21,7 +21,8 @@ Run from the repo root:
 $ErrorActionPreference = "Stop"
 
 # --- Paths ---
-$Repo      = "C:\Users\Ethan Guo\Github\GuoFish"
+# Auto-derive repo root from this script's location (benchmarking/engine/..).
+$Repo      = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $Cutechess = Join-Path $Repo "cutechess-1.4.0-win64\cutechess-cli.exe"
 $Ordo      = Join-Path $Repo "ordo-win64.exe"
 $Stockfish = "stockfish-windows-x86-64-avx2.exe"   # resolved from engine dir
