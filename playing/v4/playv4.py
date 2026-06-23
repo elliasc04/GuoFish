@@ -17,8 +17,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from core.mctsv2 import ParallelMCTS, count_pieces
-
 import chess
 import chess.polyglot
 import chess.syzygy
@@ -26,10 +24,13 @@ import torch
 import torch.nn as nn
 
 # Make the project root importable when this file is run as a script
-# (python playing/play.py) rather than as a module.
+# (python playing/v4/playv4.py) rather than as a module. Must happen before
+# importing `core`, which lives at the project root.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+from core.mctsv2 import ParallelMCTS, count_pieces
 
 OPENING_BOOK_PATH = _PROJECT_ROOT / "assets" / "gm2001.bin"
 
