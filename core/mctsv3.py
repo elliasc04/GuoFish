@@ -6,6 +6,10 @@ Architecture:
 - Single evaluator thread batches positions and runs them through the NN
 - Virtual loss prevents workers from all exploring the same path
 
+Architecture support: V2 only (68-token boards: 64 squares + side-to-move +
+castling + en passant + CLS). The legacy V1 65-token scheme is not supported;
+models exposing a different seq_length are rejected at construction.
+
 Usage:
     from core.mcts import ParallelMCTS
     mcts = ParallelMCTS(model, device, num_workers=8)
@@ -28,9 +32,13 @@ import chess.syzygy
 import numpy as np
 import torch
 
+# Board tokenization length. Fixed at the V2 scheme (see board_to_tokens below);
+# ParallelMCTS rejects any model that advertises a different seq_length.
+SEQ_LENGTH = 68
+
 # MCTS hyperparameters
 C_PUCT = 2.00  # Exploration constant
-VIRTUAL_LOSS = 2.5  # Penalize in-flight nodes to encourage exploration diversity
+VIRTUAL_LOSS = 2  # Penalize in-flight nodes to encourage exploration diversity
 MAX_TREE_DEPTH = 80  # Maximum simulation depth to prevent endgame slowdowns
 
 # === Mode 2: Syzygy tablebase leaf evaluation ===
@@ -83,6 +91,35 @@ def probe_tablebase_value(tablebase: chess.syzygy.Tablebase,
         return None
     stm_value = wdl_to_value(wdl)
     return stm_value if board.turn == chess.WHITE else -stm_value
+
+
+def build_repetition_history(board: chess.Board) -> dict:
+    """Count the transposition keys of every prior position that could still
+    repeat the current line, so simulations can detect threefold draws.
+
+    Keyed by ``chess.Board._transposition_key()`` (the same key python-chess's
+    own ``is_repetition`` uses: piece placement + side-to-move + castling + a
+    *legal* en-passant file). The count includes the current (root) position.
+
+    We only walk back to the halfmove-clock horizon: a position before the last
+    zeroing move (pawn push / capture) has different material or pawn structure,
+    so it can never share a key with a future position -- counting further is
+    harmless but wasted. This mirrors is_repetition()'s own bound.
+
+    Built ONCE per search from the root board, which retains the full game move
+    stack. Simulations copy the board with ``stack=False`` for speed (no move
+    history), so they cannot call is_repetition() themselves; they instead add
+    their within-line repeats on top of this precomputed history (see
+    MCTSWorker._draw_by_rule). The returned dict is read-only across workers.
+    """
+    counter: dict = {}
+    probe = board.copy()
+    counter[probe._transposition_key()] = 1
+    for _ in range(min(probe.halfmove_clock, len(probe.move_stack))):
+        probe.pop()
+        key = probe._transposition_key()
+        counter[key] = counter.get(key, 0) + 1
+    return counter
 
 
 class TranspositionCache:
@@ -172,7 +209,7 @@ class MCTSNode:
     """A node in the MCTS tree with virtual loss support."""
 
     __slots__ = ['parent', 'move', 'prior', 'children', 'visit_count',
-                 'value_sum', 'virtual_loss', 'is_expanded', 'lock',
+                 'value_sum', 'vloss_count', 'is_expanded', 'lock',
                  'is_terminal', 'terminal_value']
 
     def __init__(self, parent: Optional['MCTSNode'] = None,
@@ -183,7 +220,13 @@ class MCTSNode:
         self.children: dict[chess.Move, 'MCTSNode'] = {}
         self.visit_count = 0
         self.value_sum = 0.0
-        self.virtual_loss = 0  # In-flight penalty
+        # Integer COUNT of in-flight virtual losses through this node (how many
+        # workers are currently descending through it), NOT the penalty magnitude.
+        # The penalty (vloss_count * VIRTUAL_LOSS) is applied at read time in
+        # effective_visits / q_value. Keeping the conserved quantity an integer
+        # makes apply/revert exact inverses at ANY VIRTUAL_LOSS magnitude, so a
+        # quiescent tree sums to exactly 0 with no floating-point residue.
+        self.vloss_count = 0
         self.is_expanded = False
         # Cached terminal state — once a leaf is detected as game-over, store
         # the result so future sims that reach this node skip the (expensive)
@@ -193,34 +236,37 @@ class MCTSNode:
         self.lock = threading.Lock()
 
     @property
-    def effective_visits(self) -> int:
-        """Visit count including virtual losses."""
-        return self.visit_count + self.virtual_loss
+    def effective_visits(self) -> float:
+        """Visit count including in-flight virtual losses (vloss_count * VIRTUAL_LOSS)."""
+        return self.visit_count + self.vloss_count * VIRTUAL_LOSS
 
     @property
     def q_value(self) -> float:
         """Mean action value Q(s,a), adjusted for virtual loss."""
-        total_visits = self.visit_count + self.virtual_loss
+        # Penalty is computed from the integer count at read time; same numeric
+        # value as the old VL-unit accumulator, but the stored state stays exact.
+        penalty = self.vloss_count * VIRTUAL_LOSS
+        total_visits = self.visit_count + penalty
         if total_visits == 0:
             return 0.0
-        # Virtual losses count as losses (value = -1)
-        adjusted_value = self.value_sum - self.virtual_loss
+        # Each in-flight virtual loss counts as a loss (value contribution -VIRTUAL_LOSS).
+        adjusted_value = self.value_sum - penalty
         return adjusted_value / total_visits
 
-    def ucb_score(self, parent_visits: int) -> float:
+    def ucb_score(self, parent_visits: float) -> float:
         """PUCT score for node selection."""
         exploration = C_PUCT * self.prior * math.sqrt(parent_visits) / (1 + self.effective_visits)
         return self.q_value + exploration
 
     def apply_virtual_loss(self):
-        """Apply virtual loss when worker starts traversing through this node."""
+        """Register one in-flight virtual loss (a worker is descending through this node)."""
         with self.lock:
-            self.virtual_loss += VIRTUAL_LOSS
+            self.vloss_count += 1
 
     def revert_virtual_loss(self):
-        """Remove virtual loss after evaluation completes."""
+        """Remove one in-flight virtual loss after evaluation completes."""
         with self.lock:
-            self.virtual_loss -= VIRTUAL_LOSS
+            self.vloss_count -= 1
 
     def expand(self, policy: torch.Tensor, legal_moves: list[chess.Move]):
         """Expand node with children based on policy network output."""
@@ -279,14 +325,13 @@ class BatchedEvaluator:
 
     def __init__(self, model: torch.nn.Module, device: torch.device,
                  max_batch_size: int = 128, min_batch_size: int = 8,
-                 batch_timeout_ms: float = 50.0, seq_length: int = 68,
+                 batch_timeout_ms: float = 50.0,
                  inline: bool = False):
         self.model = model
         self.device = device
         self.max_batch_size = max_batch_size
         self.min_batch_size = min_batch_size  # Wait for at least this many
         self.batch_timeout = batch_timeout_ms / 1000.0  # Convert to seconds
-        self.seq_length = seq_length  # Tokenization scheme (65 or 68)
         # When inline=True, workers call eval_inline() directly instead of going through
         # the queue. Used on CPU where batching is counterproductive and thread handoffs
         # dominate the per-sim cost.
@@ -301,6 +346,71 @@ class BatchedEvaluator:
         # Stats
         self.total_evals = 0
         self.total_batches = 0
+        # Per-batch size log for game-level diagnostics (avg / histogram /
+        # saturation). Distinct from total_evals/total_batches, which callers
+        # reset every move; this persists until reset_batch_history() so an
+        # end-of-game summary can see the whole game. Guarded by _stats_lock
+        # (appended from the evaluator thread, read from the main thread).
+        self.batch_size_history: list[int] = []
+
+    def reset_batch_history(self) -> None:
+        """Drop the recorded per-batch sizes. Call at the start of a game so the
+        end-of-game summary only covers that game."""
+        with self._stats_lock:
+            self.batch_size_history.clear()
+
+    def format_batch_summary(self) -> str:
+        """Build a multi-line, human-readable summary of the batch sizes recorded
+        since the last reset_batch_history(): average size, an ASCII histogram
+        (printed, never persisted), and the proportion of batches that saturated
+        max_batch_size or bottomed out at min_batch_size (both configured above).
+
+        Returns a single placeholder line when no batches were recorded (e.g.
+        raw-policy play, CPU inline mode with batch size 1, or a game that ended
+        before any search ran)."""
+        with self._stats_lock:
+            sizes = list(self.batch_size_history)
+
+        if not sizes:
+            return "Batch statistics: no batches recorded this game."
+
+        arr = np.array(sizes)
+        n = len(arr)
+        total_evals = int(arr.sum())
+        avg = arr.mean()
+        at_max = int((arr >= self.max_batch_size).sum())
+        at_min = int((arr <= self.min_batch_size).sum())
+
+        lines = [
+            "=" * 60,
+            "Batch size summary (this game)",
+            "=" * 60,
+            f"  batches: {n}   evals: {total_evals}",
+            f"  avg batch size: {avg:.1f}   (observed min={int(arr.min())}, "
+            f"max={int(arr.max())})",
+            f"  configured range: {self.min_batch_size}-{self.max_batch_size}",
+            f"  at max batch ({self.max_batch_size}): {at_max} ({at_max / n:.1%})",
+            f"  at min batch ({self.min_batch_size}): {at_min} ({at_min / n:.1%})",
+            "",
+            "  Histogram:",
+        ]
+
+        lo, hi = int(arr.min()), int(arr.max())
+        if lo == hi:
+            lines.append(f"    all {n} batches were size {lo}")
+        else:
+            nbins = min(20, hi - lo + 1)
+            counts, edges = np.histogram(arr, bins=nbins, range=(lo, hi + 1))
+            peak = int(counts.max()) or 1
+            bar_w = 40
+            for i, c in enumerate(counts):
+                bar = "#" * int(round(bar_w * c / peak))
+                lines.append(
+                    f"    [{edges[i]:5.0f}-{edges[i + 1]:5.0f}) "
+                    f"{int(c):6d} |{bar}"
+                )
+        lines.append("=" * 60)
+        return "\n".join(lines)
 
     def eval_inline(self, tokens: torch.Tensor) -> tuple[torch.Tensor, float]:
         """Synchronous single-position evaluation. Used in inline mode (CPU).
@@ -313,6 +423,7 @@ class BatchedEvaluator:
         with self._stats_lock:
             self.total_evals += 1
             self.total_batches += 1
+            self.batch_size_history.append(1)
         # .clone() so the cached row doesn't pin the full forward-pass output buffer.
         return policy_logits[0].clone(), values[0].item()
 
@@ -405,8 +516,10 @@ class BatchedEvaluator:
             req.event.set()  # Signal worker that result is ready
 
         # Stats
-        self.total_batches += 1
-        self.total_evals += len(batch)
+        with self._stats_lock:
+            self.total_batches += 1
+            self.total_evals += len(batch)
+            self.batch_size_history.append(len(batch))
 
 
 class MCTSWorker:
@@ -415,7 +528,8 @@ class MCTSWorker:
     def __init__(self, worker_id: int, root: MCTSNode, root_board: chess.Board,
                  evaluator: BatchedEvaluator, cache: TranspositionCache,
                  stats: dict, target_sims: int, completion_event: threading.Event,
-                 tablebase: Optional[chess.syzygy.Tablebase] = None):
+                 tablebase: Optional[chess.syzygy.Tablebase] = None,
+                 repetition_history: Optional[dict] = None):
         self.worker_id = worker_id
         self.root = root
         self.root_board = root_board
@@ -424,6 +538,12 @@ class MCTSWorker:
         self.stats = stats
         self.target_sims = target_sims
         self.completion_event = completion_event
+        # Transposition-key -> occurrence count for the game history leading to
+        # root_board (built by build_repetition_history). Lets simulations, which
+        # run on stack-stripped board copies, detect threefold repetition by
+        # adding their within-line repeats on top of it. Read-only; shared across
+        # workers. None => no history (repetition still detected within a line).
+        self.repetition_history = repetition_history if repetition_history is not None else {}
         # Syzygy tablebase for Mode 2 leaf evaluation. None => disabled.
         # Thread-safe to share read-only across workers because each worker
         # probes its own board copy (chess.syzygy guarantees this).
@@ -465,144 +585,219 @@ class MCTSWorker:
             print(traceback.format_exc(), file=sys.stderr, flush=True)
             self.completion_event.set()
 
+    def _draw_by_rule(self, board: chess.Board, path_counts: dict) -> bool:
+        """True if `board` is a draw by the fifty-move rule or threefold
+        repetition, given the game history plus repeats within this simulation.
+
+        `path_counts` maps transposition key -> times the key has appeared on the
+        CURRENT simulation's path from the root; it is mutated here (the key for
+        `board` is counted in) and is local to one _run_simulation call, so two
+        sims exploring different lines never pollute each other's counts, and a
+        tree transposition (two different lines reaching one position) is not
+        mistaken for a single line repeating.
+
+        The repetition value is intentionally never written to the Zobrist NN
+        cache: whether a position is a draw is path-dependent (it depends on the
+        prior game line), whereas the NN cache is keyed purely by position. We
+        store the draw only on the tree node (path-specific) at the call site.
+        """
+        # Fifty-move rule: 100 half-moves without a pawn move or capture. The
+        # halfmove clock is board state, preserved through stack=False copies.
+        if board.halfmove_clock >= 100:
+            return True
+        # Threefold repetition: history occurrences + occurrences on this line.
+        key = board._transposition_key()
+        seen = path_counts.get(key, 0) + 1
+        path_counts[key] = seen
+        return self.repetition_history.get(key, 0) + seen >= 3
+
     def _run_simulation(self):
-        """Run one MCTS simulation."""
+        """Run one MCTS simulation.
+
+        Virtual-loss bookkeeping is centralized: every node this simulation
+        descends through is registered in `applied` the instant its
+        apply_virtual_loss() runs, and a single `repay()` reverts exactly that
+        set. repay() is called explicitly right before each backprop (preserving
+        the original revert-before-backprop ordering, so backprop always runs
+        with zero in-flight loss on the path) and again in the `finally` as a
+        safety net, so EVERY exit -- normal leaf, in-search terminal (repetition
+        / fifty-move / checkmate / stalemate), max-depth cutoff, transposition
+        cache hit, tablebase leaf override, AND exceptions -- repays precisely
+        what it applied. Because each node's in-flight count is an integer,
+        apply and revert are exact inverses regardless of the VIRTUAL_LOSS
+        magnitude, so a quiescent tree conserves to exactly 0.
+        """
         node = self.root
         # stack=False skips cloning move history (much faster, we don't need undo)
         board = self.root_board.copy(stack=False)
-        path = [node]  # Track path for virtual loss
         depth = 0
+        # Per-simulation tally of transposition keys along this path (excludes the
+        # pre-root game history, which lives in self.repetition_history). Rebuilt
+        # fresh every simulation so lines never share repeat counts.
+        path_counts: dict = {}
 
-        # === Selection: traverse to leaf ===
-        while node.is_expanded and node.children:
+        # Ledger of nodes this simulation has applied a virtual loss to and still
+        # owes a revert. repay() drains it exactly once per node; the finally
+        # below guarantees it runs even on an early return or an exception.
+        applied: list[MCTSNode] = []
+
+        def repay() -> None:
+            while applied:
+                applied.pop().revert_virtual_loss()
+
+        try:
+            # Register the root, then each node as we arrive at it during descent.
             node.apply_virtual_loss()
-            node = node.select_child()
-            assert node is not None  # loop condition guarantees children exist
-            path.append(node)
-            board.push(node.move)
-            depth += 1
+            applied.append(node)
 
-            # Max depth cutoff to prevent endgame slowdowns
-            if depth >= MAX_TREE_DEPTH:
-                # Treat as terminal with value 0 (draw-ish)
-                for n in path:
-                    n.revert_virtual_loss()
-                node.backpropagate(0.0)
+            # === Selection: traverse to leaf ===
+            while node.is_expanded and node.children:
+                node = node.select_child()
+                assert node is not None  # loop condition guarantees children exist
+                board.push(node.move)
+                depth += 1
+                node.apply_virtual_loss()
+                applied.append(node)
+
+                # === Draw-by-rule detection (threefold repetition / fifty-move) ===
+                # Checked on every step of the descent, not just the final leaf: with
+                # tree reuse an already-expanded interior node can have *become* a
+                # draw now that the game history is longer. Detecting it here stops
+                # the line and backs a draw value (0.0) up to the move that enters
+                # the repetition, so a winning engine sees entering it as worse than
+                # its positive alternatives (and a losing engine sees it as better) --
+                # no explicit "am I winning" logic needed; the value comparison does
+                # it in both directions. The value is stored on the tree node, which
+                # is path-specific, NOT in the position-keyed NN cache.
+                if self._draw_by_rule(board, path_counts):
+                    repay()
+                    with node.lock:
+                        node.is_terminal = True
+                        node.terminal_value = 0.0
+                        node.is_expanded = True
+                    node.backpropagate(0.0)
+                    self.stats['simulations'] += 1
+                    return
+
+                # Max depth cutoff to prevent endgame slowdowns
+                if depth >= MAX_TREE_DEPTH:
+                    # Treat as terminal with value 0 (draw-ish).
+                    repay()
+                    node.backpropagate(0.0)
+                    self.stats['simulations'] += 1
+                    return
+
+            # === Cached terminal (fast path) ===
+            # If this leaf was previously identified as terminal, just backprop the
+            # cached mover-perspective value
+            if node.is_terminal:
+                repay()
+                node.backpropagate(node.terminal_value)
+                # Mate-in-one short-circuit: a root-child (depth==1) that is
+                # terminal with value +1 from the mover's perspective is a
+                # winning move for us. Signal search() to take it immediately.
+                if depth == 1 and node.terminal_value == 1.0 and node.move is not None:
+                    self.stats['mating_move'] = node.move
+                    self.completion_event.set()
                 self.stats['simulations'] += 1
                 return
 
-        node.apply_virtual_loss()
+            # === Check terminal state (slow path, first visit only) ===
+            if board.is_game_over():
+                result = board.result()
+                # Value must be from MOVER's perspective (who moved TO this node, i.e., opponent of board.turn)
+                # This allows selection to use max(Q) directly without negation.
+                if result == "1-0":
+                    # White wins. If it's Black's turn (Black mated), mover was White, value = +1 for mover.
+                    value = 1.0 if board.turn == chess.BLACK else -1.0
+                elif result == "0-1":
+                    # Black wins. If it's White's turn (White mated), mover was Black, value = +1 for mover.
+                    value = 1.0 if board.turn == chess.WHITE else -1.0
+                else:
+                    value = 0.0
 
-        # === Cached terminal (fast path) ===
-        # If this leaf was previously identified as terminal, just backprop the
-        # cached mover-perspective value
-        if node.is_terminal:
-            for n in path:
-                n.revert_virtual_loss()
-            node.backpropagate(node.terminal_value)
-            # Mate-in-one short-circuit: a root-child (depth==1) that is
-            # terminal with value +1 from the mover's perspective is a
-            # winning move for us. Signal search() to take it immediately.
-            if depth == 1 and node.terminal_value == 1.0 and node.move is not None:
-                self.stats['mating_move'] = node.move
-                self.completion_event.set()
-            self.stats['simulations'] += 1
-            return
+                # Cache result so subsequent visits hit the fast path above.
+                # Setting is_expanded=True is harmless: selection bails on the
+                # empty children dict before reaching this node again.
+                with node.lock:
+                    node.is_terminal = True
+                    node.terminal_value = value
+                    node.is_expanded = True
 
-        # === Check terminal state (slow path, first visit only) ===
-        if board.is_game_over():
-            result = board.result()
-            # Value must be from MOVER's perspective (who moved TO this node, i.e., opponent of board.turn)
-            # This allows selection to use max(Q) directly without negation.
-            if result == "1-0":
-                # White wins. If it's Black's turn (Black mated), mover was White, value = +1 for mover.
-                value = 1.0 if board.turn == chess.BLACK else -1.0
-            elif result == "0-1":
-                # Black wins. If it's White's turn (White mated), mover was Black, value = +1 for mover.
-                value = 1.0 if board.turn == chess.WHITE else -1.0
+                repay()
+                node.backpropagate(value)
+                if depth == 1 and value == 1.0 and node.move is not None:
+                    self.stats['mating_move'] = node.move
+                    self.completion_event.set()
+                self.stats['simulations'] += 1
+                return
+
+            # === Expansion & Evaluation ===
+            # Check transposition cache first (Zobrist hash includes side-to-move, castling, ep)
+            zobrist_hash = chess.polyglot.zobrist_hash(board)
+            cached = self.cache.get(zobrist_hash)
+
+            if cached is not None:
+                # Cache hit - use cached policy and value
+                policy, nn_value = cached
             else:
-                value = 0.0
+                tokens = board_to_tokens(board)
 
-            # Cache result so subsequent visits hit the fast path above.
-            # Setting is_expanded=True is harmless: selection bails on the
-            # empty children dict before reaching this node again.
-            with node.lock:
-                node.is_terminal = True
-                node.terminal_value = value
-                node.is_expanded = True
+                if self.evaluator.inline:
+                    # CPU path: run forward pass on this worker's thread (no queueing).
+                    # PyTorch releases the GIL during the forward, so workers run in parallel.
+                    policy, nn_value = self.evaluator.eval_inline(tokens)
+                else:
+                    # GPU path: submit to batched evaluator
+                    request = EvalRequest(node=node, tokens=tokens)
+                    self.evaluator.submit(request)
+                    request.event.wait()  # Block until evaluated
+                    policy = request.policy
+                    nn_value = request.value if request.value is not None else 0.0
 
-            # Revert virtual loss and backprop
-            for n in path:
-                n.revert_virtual_loss()
-            node.backpropagate(value)
-            if depth == 1 and value == 1.0 and node.move is not None:
-                self.stats['mating_move'] = node.move
-                self.completion_event.set()
+                # === Mode 2: tablebase value override ===
+                # If this leaf is within tablebase range, replace the neural value
+                # with the exact WDL result. Policy logits are left untouched (the
+                # network still decides move ordering). The piece-count check is a
+                # cheap popcount that filters out the overwhelming majority of
+                # middlegame leaves before any probe cost. On a tablebase miss
+                # (position not covered) we keep the neural value. We override
+                # BEFORE caching so the WDL value is what gets stored — subsequent
+                # transpositions to this position reuse it without re-probing, and
+                # it flows through the same absolute->mover perspective conversion
+                # below as the neural value. See probe_tablebase_value().
+                if self.tablebase is not None and count_pieces(board) <= TABLEBASE_MAX_PIECES:
+                    tb_value = probe_tablebase_value(self.tablebase, board)
+                    if tb_value is not None:
+                        nn_value = tb_value
+
+                # Store in cache (policy logits, not softmax'd)
+                if policy is not None:
+                    self.cache.put(zobrist_hash, policy, nn_value)
+
+            # Expand node with policy LOGITS (Softmax happens inside expand now)
+            legal_moves = list(board.legal_moves)
+            node.expand(policy, legal_moves)
+
+            repay()
+
+            # === Absolute to Mover's Perspective Conversion ===
+            # The NN outputs Absolute value (White winning = +1.0, Black winning = -1.0).
+            # We need Mover's perspective (who moved TO this node = opponent of board.turn).
+            # - If board.turn == BLACK, mover was WHITE, use NN value as-is.
+            # - If board.turn == WHITE, mover was BLACK, negate NN value.
+            mover_value = nn_value if board.turn == chess.BLACK else -nn_value
+
+            # Backpropagate from mover's perspective
+            node.backpropagate(mover_value)
+
             self.stats['simulations'] += 1
-            return
-
-        # === Expansion & Evaluation ===
-        # Check transposition cache first (Zobrist hash includes side-to-move, castling, ep)
-        zobrist_hash = chess.polyglot.zobrist_hash(board)
-        cached = self.cache.get(zobrist_hash)
-
-        if cached is not None:
-            # Cache hit - use cached policy and value
-            policy, nn_value = cached
-        else:
-            tokens = board_to_tokens(board, self.evaluator.seq_length)
-
-            if self.evaluator.inline:
-                # CPU path: run forward pass on this worker's thread (no queueing).
-                # PyTorch releases the GIL during the forward, so workers run in parallel.
-                policy, nn_value = self.evaluator.eval_inline(tokens)
-            else:
-                # GPU path: submit to batched evaluator
-                request = EvalRequest(node=node, tokens=tokens)
-                self.evaluator.submit(request)
-                request.event.wait()  # Block until evaluated
-                policy = request.policy
-                nn_value = request.value if request.value is not None else 0.0
-
-            # === Mode 2: tablebase value override ===
-            # If this leaf is within tablebase range, replace the neural value
-            # with the exact WDL result. Policy logits are left untouched (the
-            # network still decides move ordering). The piece-count check is a
-            # cheap popcount that filters out the overwhelming majority of
-            # middlegame leaves before any probe cost. On a tablebase miss
-            # (position not covered) we keep the neural value. We override
-            # BEFORE caching so the WDL value is what gets stored — subsequent
-            # transpositions to this position reuse it without re-probing, and
-            # it flows through the same absolute->mover perspective conversion
-            # below as the neural value. See probe_tablebase_value().
-            if self.tablebase is not None and count_pieces(board) <= TABLEBASE_MAX_PIECES:
-                tb_value = probe_tablebase_value(self.tablebase, board)
-                if tb_value is not None:
-                    nn_value = tb_value
-
-            # Store in cache (policy logits, not softmax'd)
-            if policy is not None:
-                self.cache.put(zobrist_hash, policy, nn_value)
-
-        # Expand node with policy LOGITS (Softmax happens inside expand now)
-        legal_moves = list(board.legal_moves)
-        node.expand(policy, legal_moves)
-
-        # Revert virtual loss along path
-        for n in path:
-            n.revert_virtual_loss()
-
-        # === Absolute to Mover's Perspective Conversion ===
-        # The NN outputs Absolute value (White winning = +1.0, Black winning = -1.0).
-        # We need Mover's perspective (who moved TO this node = opponent of board.turn).
-        # - If board.turn == BLACK, mover was WHITE, use NN value as-is.
-        # - If board.turn == WHITE, mover was BLACK, negate NN value.
-        mover_value = nn_value if board.turn == chess.BLACK else -nn_value
-
-        # Backpropagate from mover's perspective
-        node.backpropagate(mover_value)
-
-        self.stats['simulations'] += 1
+        finally:
+            # Safety net: on a normal exit `applied` is already drained by repay()
+            # above (no-op here); on an early return path that skipped it, or any
+            # exception mid-simulation, this guarantees every applied virtual loss
+            # is reverted so none is stranded in the tree.
+            repay()
 
 
 class ParallelMCTS:
@@ -610,6 +805,7 @@ class ParallelMCTS:
 
     def __init__(self, model: torch.nn.Module, device: torch.device,
                  num_workers: Optional[int] = None, max_batch_size: Optional[int] = None,
+                 min_batch_size: Optional[int] = None,
                  cache_size: int = 100_000,
                  tablebase: Optional[chess.syzygy.Tablebase] = None):
         self.model = model
@@ -619,9 +815,18 @@ class ParallelMCTS:
         # every worker at search time. None => Mode 2 disabled.
         self.tablebase = tablebase
 
-        # Auto-detect tokenization scheme from model's seq_length attribute
-        # (set by ChessTransformerV1/V2 in play.py)
-        self.seq_length: int = getattr(model, 'seq_length', 68)
+        # V2 architecture only. Models built by playv5's ChessTransformerV2
+        # advertise seq_length=68; anything else (notably the legacy V1
+        # 65-token scheme) would be tokenized wrong and silently produce
+        # garbage evaluations, so reject it outright. A model that doesn't
+        # advertise seq_length at all is assumed to be V2.
+        model_seq_length = getattr(model, 'seq_length', SEQ_LENGTH)
+        if model_seq_length != SEQ_LENGTH:
+            raise ValueError(
+                f"Unsupported architecture: model.seq_length={model_seq_length}, "
+                f"but this MCTS only supports the V2 {SEQ_LENGTH}-token scheme."
+            )
+        self.seq_length: int = SEQ_LENGTH
 
         # Auto-tune workers based on hardware.
         # GPU: many workers feed the batched evaluator despite the GIL (forward pass
@@ -650,12 +855,16 @@ class ParallelMCTS:
 
         # Min batch size - on CPU, don't wait for batches to fill.
         # On GPU, larger min batches improve utilization.
+        # An explicit min_batch_size (e.g. playv5's --turbo) overrides the
+        # hardware default; None falls back to auto-tuning below.
         if device.type == 'cuda':
-            min_batch_size = max(4, num_workers)
+            auto_min_batch_size = max(32, num_workers)
             batch_timeout_ms = 100.0
         else:
-            min_batch_size = 1  # Process immediately on CPU
+            auto_min_batch_size = 1  # Process immediately on CPU
             batch_timeout_ms = 5.0  # Short timeout - don't block workers
+        if min_batch_size is None:
+            min_batch_size = auto_min_batch_size
 
         self.evaluator = BatchedEvaluator(
             model=model,
@@ -663,7 +872,6 @@ class ParallelMCTS:
             max_batch_size=max_batch_size,
             min_batch_size=min_batch_size,
             batch_timeout_ms=batch_timeout_ms,
-            seq_length=self.seq_length,
             inline=(device.type == 'cpu'),
         )
 
@@ -771,10 +979,20 @@ class ParallelMCTS:
         self._root_hash = chess.polyglot.zobrist_hash(self.root_board)
 
     def _reset_virtual_loss(self, node: MCTSNode):
-        """Recursively reset virtual_loss to 0 in the subtree (defensive)."""
-        node.virtual_loss = 0
+        """Recursively reset the in-flight virtual-loss count to 0 in the subtree (defensive)."""
+        node.vloss_count = 0
         for child in node.children.values():
             self._reset_virtual_loss(child)
+
+    def _sum_virtual_loss(self, node: MCTSNode) -> int:
+        """Recursively sum the in-flight virtual-loss counts across the subtree.
+
+        Integer counts (not VL-scaled magnitudes), so a quiescent tree returns
+        exactly 0 at any VIRTUAL_LOSS value -- no floating-point residue."""
+        total = node.vloss_count
+        for child in node.children.values():
+            total += self._sum_virtual_loss(child)
+        return total
 
     def _add_dirichlet_noise(self, root: MCTSNode, alpha: float = 0.3, epsilon: float = 0.25):
         """
@@ -841,10 +1059,16 @@ class ParallelMCTS:
         target_new_sims = max(0, num_simulations - existing_visits)
 
         if target_new_sims == 0:
-            # Already have enough simulations
+            # Already have enough simulations (e.g. a ponder hit promoted a
+            # subtree that already meets num_simulations). Use the SAME sign
+            # convention as the normal-search exit below: each node's q_value is
+            # from the MOVER's perspective, so root.q_value (opponent moved to
+            # reach root) is negated and best_child.q_value (engine moved to
+            # reach child) is used as-is. Previously these were inverted here,
+            # which flipped the reported UCI score whenever this path was taken.
             best_move, best_child = max(root.children.items(), key=lambda x: x[1].visit_count)
-            self.last_root_q = root.q_value
-            self.last_best_child_q = -best_child.q_value
+            self.last_root_q = -root.q_value
+            self.last_best_child_q = best_child.q_value
             return best_move
 
         stats = defaultdict(int)
@@ -853,6 +1077,11 @@ class ParallelMCTS:
         # Start evaluator (keeps running across searches). No-op in inline mode.
         if not self.evaluator.inline:
             self.evaluator.start()
+
+        # Precompute the game-history repetition counts once for this search.
+        # `board` carries the full move stack (the UCI layer replays every game
+        # move), so this sees repetitions that occurred before the current move.
+        repetition_history = build_repetition_history(board)
 
         # Start workers
         workers = []
@@ -867,6 +1096,7 @@ class ParallelMCTS:
                 target_sims=target_new_sims,
                 completion_event=completion_event,
                 tablebase=self.tablebase,
+                repetition_history=repetition_history,
             )
             worker.start()
             workers.append(worker)
@@ -904,7 +1134,7 @@ class ParallelMCTS:
 
     def _expand_root(self, root: MCTSNode, board: chess.Board):
         """Expand root node synchronously."""
-        tokens = board_to_tokens(board, self.seq_length).unsqueeze(0).to(self.device)
+        tokens = board_to_tokens(board).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             with torch.amp.autocast_mode.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
@@ -967,6 +1197,8 @@ class ParallelMCTS:
             if not self.evaluator.inline:
                 self.evaluator.start()
 
+            repetition_history = build_repetition_history(board)
+
             workers = []
             for i in range(self.num_workers):
                 worker = MCTSWorker(
@@ -979,6 +1211,7 @@ class ParallelMCTS:
                     target_sims=target_new_sims,
                     completion_event=completion_event,
                     tablebase=self.tablebase,
+                    repetition_history=repetition_history,
                 )
                 worker.start()
                 workers.append(worker)
@@ -1138,6 +1371,9 @@ class ParallelMCTS:
             workers = []
             worker_id = 0
             for _, node, bboard, n_workers in branches:
+                # Each branch simulates from its own board (root + predicted
+                # reply), so it needs that board's history for repetition checks.
+                branch_rep_history = build_repetition_history(bboard)
                 for _ in range(n_workers):
                     worker = MCTSWorker(
                         worker_id=worker_id,
@@ -1148,9 +1384,10 @@ class ParallelMCTS:
                         stats=stats,
                         # Cap pondering total sims to prevent unbounded tree
                         # growth
-                        target_sims=15000 if self.device.type == 'cuda' else 5000,
+                        target_sims=60000 if self.device.type == 'cuda' else 5000,
                         completion_event=stop_event,
                         tablebase=self.tablebase,
+                        repetition_history=branch_rep_history,
                     )
                     worker.start()
                     workers.append(worker)
@@ -1180,7 +1417,6 @@ class ParallelMCTS:
 
 
 # === Board Tokenization ===
-# V1 (65 tokens): 64 squares + side-to-move
 # V2 (68 tokens): 64 squares + side + castling + ep + CLS
 
 TOKEN_WHITE_TO_MOVE = 13
@@ -1191,23 +1427,13 @@ TOKEN_EP_BASE = 32
 TOKEN_CLS = 40
 
 
-def board_to_tokens_v1(board: chess.Board) -> torch.Tensor:
-    """V1: 65 tokens (64 squares + side-to-move).
+def board_to_tokens(board: chess.Board) -> torch.Tensor:
+    """V2: 68 tokens (64 squares + side + castling + ep + CLS).
 
     Iterates only occupied squares via piece_map() — empty squares stay zero from
     the preallocated tensor, avoiding 64 piece_at() calls per leaf.
     """
-    tokens = torch.zeros(65, dtype=torch.long)
-    for square, piece in board.piece_map().items():
-        offset = 0 if piece.color else 6
-        tokens[square] = piece.piece_type + offset
-    tokens[64] = 13 if board.turn else 14
-    return tokens
-
-
-def board_to_tokens_v2(board: chess.Board) -> torch.Tensor:
-    """V2: 68 tokens (64 squares + side + castling + ep + CLS)."""
-    tokens = torch.zeros(68, dtype=torch.long)
+    tokens = torch.zeros(SEQ_LENGTH, dtype=torch.long)
 
     # Positions 0-63: piece placement (only occupied squares; empties stay 0)
     for square, piece in board.piece_map().items():
@@ -1236,14 +1462,6 @@ def board_to_tokens_v2(board: chess.Board) -> torch.Tensor:
     tokens[67] = TOKEN_CLS
 
     return tokens
-
-
-def board_to_tokens(board: chess.Board, seq_length: int = 68) -> torch.Tensor:
-    """Convert board to tokens using appropriate scheme based on seq_length."""
-    if seq_length == 65:
-        return board_to_tokens_v1(board)
-    else:
-        return board_to_tokens_v2(board)
 
 
 # === Demo / Testing ===

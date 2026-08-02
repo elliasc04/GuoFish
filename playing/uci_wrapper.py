@@ -30,8 +30,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import core.mctsv2 as mcts_module
-from core.mctsv2 import ParallelMCTS
+import core.mctsv3 as mcts_module
+from core.mctsv3 import ParallelMCTS
 from playing.v2.playv2 import load_model, ChessTransformerV2
 
 
@@ -640,7 +640,7 @@ def main():
     parser.add_argument("--workers", type=int, default=32,
                         help="MCTS worker threads per engine instance. Lower this when "
                              "running many concurrent games (default: 32)")
-    parser.add_argument("--sim-cap", type=int, default=15000,
+    parser.add_argument("--sim-cap", type=int, default=50000,
                         help="Upper bound on 'go nodes N' (default: 15000). NOTE: a "
                              "'go nodes N' larger than this is silently clamped to it, "
                              "so keep this >= the nodes= you pass from Cutechess.")
