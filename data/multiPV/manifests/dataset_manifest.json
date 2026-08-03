@@ -1,0 +1,247 @@
+{
+  "created_utc": "2026-08-02T23:13:53Z",
+  "git_sha": "7c3a91b0c3bce4392cde2ac4a3bc5d1ed3b1c7ed",
+  "source": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\data\\multiPV\\lichess_db_eval.jsonl.zst",
+  "source_hash": "2046f874e01663e9aaa7e10a67fc9062103e0d0d0d3396ceac65575ac4d8c3fa",
+  "index": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\data\\multiPV\\index\\pass_a_index.bin",
+  "pov_convention": "WHITE_RELATIVE (hardcoded; Phase 1)",
+  "value_path": "no conversion; cp clipped +-2000 then tanh(cp/scale); mate -> +-0.995; clamp +-0.995",
+  "value_cp_encoding": "cp clipped +-2000; mate -> sign*(30000 - min(|mate|,1000)); |value_cp| >= 29000 == mate",
+  "policy_path": "score * stm, then softmax(rel/T)",
+  "mate_mapping": "sign*(11020 - 20*min(|mate|,50)); cp clamped +-10000; bands disjoint by construction",
+  "value_scale": 290.6806,
+  "value_min_depth": 26,
+  "policy_min_depth": 20,
+  "temperature": 30.0,
+  "epsilon": 0.05,
+  "cp_clamp": 10000,
+  "val_split": "sha1(fen) % 1000 < 5",
+  "seed": 20260802,
+  "target": 30000000,
+  "target_shares": {
+    "<=5": 0.01,
+    "6-14": 0.35,
+    "15-27": 0.4,
+    ">=28": 0.24
+  },
+  "bucket_available": {
+    "<=5": 10771845,
+    "6-14": 48503578,
+    "15-27": 68370224,
+    ">=28": 23128100
+  },
+  "bucket_sampling_rates": {
+    "<=5": 0.027850382176869422,
+    "6-14": 0.21647887502237464,
+    "15-27": 0.17551500196927833,
+    ">=28": 0.3113096190348537
+  },
+  "selected_lines": 29994655,
+  "record_dtype": [
+    [
+      "tokens",
+      "('i1', (68,))"
+    ],
+    [
+      "value",
+      "float16"
+    ],
+    [
+      "value_cp",
+      "int16"
+    ],
+    [
+      "has_policy",
+      "uint8"
+    ],
+    [
+      "n_pv",
+      "uint8"
+    ],
+    [
+      "pv_idx",
+      "('<i2', (8,))"
+    ],
+    [
+      "pv_prob",
+      "('<f2', (8,))"
+    ],
+    [
+      "pv_score",
+      "('<f2', (8,))"
+    ],
+    [
+      "n_legal",
+      "uint8"
+    ],
+    [
+      "legal_idx",
+      "('<i2', (128,))"
+    ]
+  ],
+  "record_size_bytes": 379,
+  "n_train_shards": 64,
+  "n_val_shards": 4,
+  "shard_counts": [
+    462750,
+    462141,
+    460219,
+    462838,
+    462741,
+    461993,
+    461296,
+    461926,
+    461569,
+    461968,
+    459855,
+    461534,
+    461888,
+    462761,
+    462545,
+    460777,
+    463417,
+    460737,
+    460193,
+    461896,
+    461823,
+    461810,
+    461421,
+    460929,
+    461663,
+    459862,
+    461816,
+    461594,
+    463496,
+    463148,
+    461091,
+    461779,
+    461962,
+    460250,
+    462189,
+    461825,
+    461901,
+    461320,
+    462063,
+    461785,
+    462810,
+    460205,
+    461886,
+    462251,
+    462578,
+    462767,
+    461744,
+    460796,
+    463318,
+    462462,
+    461784,
+    462228,
+    462330,
+    461048,
+    461301,
+    463385,
+    460925,
+    462992,
+    463016,
+    460242,
+    462474,
+    462119,
+    460700,
+    460962,
+    37091,
+    36953,
+    36966,
+    36953
+  ],
+  "records_total": 29703057,
+  "records_train": 29555094,
+  "records_val": 147963,
+  "invariant_violation_rate": 0.000278416271165646,
+  "post_selection_piece_histogram": {
+    "<=5": {
+      "count": 299553,
+      "share": 0.01008492156211396,
+      "with_policy": 144943,
+      "policy_coverage": 0.4838642911271127
+    },
+    "6-14": {
+      "count": 10486882,
+      "share": 0.35305733009232015,
+      "with_policy": 4477048,
+      "policy_coverage": 0.4269188878066903
+    },
+    "15-27": {
+      "count": 11868184,
+      "share": 0.3995610283480249,
+      "with_policy": 4360954,
+      "policy_coverage": 0.36744913964933473
+    },
+    ">=28": {
+      "count": 7048438,
+      "share": 0.23729671999754098,
+      "with_policy": 2999144,
+      "policy_coverage": 0.4255047714117653
+    }
+  },
+  "value_strata": {
+    "value_exact_zero": {
+      "count": 6239818,
+      "share": 0.2100732594628223
+    },
+    "value_mate": {
+      "count": 5985831,
+      "share": 0.20152238875614722
+    },
+    "value_middle": {
+      "count": 17477408,
+      "share": 0.5884043517810305
+    }
+  },
+  "rejection_histogram": {
+    "reject_chess960_skipped": 273529,
+    "reject_invalid_fen": 9718,
+    "reject_invariant_violation": 8351
+  },
+  "counters": {
+    "accepted_train": 29555094,
+    "accepted_val": 147963,
+    "bucket_15-27": 11868184,
+    "bucket_15-27_policy": 4360954,
+    "bucket_6-14": 10486882,
+    "bucket_6-14_policy": 4477048,
+    "bucket_<=5": 299553,
+    "bucket_<=5_policy": 144943,
+    "bucket_>=28": 7048438,
+    "bucket_>=28_policy": 2999144,
+    "duplicate_pvs_removed": 458270,
+    "legal_truncated": 62,
+    "policy_truncated": 528,
+    "positions_with_duplicate_pvs": 233568,
+    "unique_pv_count_10": 494,
+    "unique_pv_count_12": 2,
+    "unique_pv_count_13": 2,
+    "unique_pv_count_14": 1,
+    "unique_pv_count_16": 6,
+    "unique_pv_count_2": 3364316,
+    "unique_pv_count_3": 5059323,
+    "unique_pv_count_4": 746750,
+    "unique_pv_count_5": 2819041,
+    "unique_pv_count_6": 228,
+    "unique_pv_count_7": 113,
+    "unique_pv_count_8": 141,
+    "unique_pv_count_9": 23,
+    "value_exact_zero": 6239818,
+    "value_mate": 5985831,
+    "value_middle": 17477408,
+    "value_only": 17720968
+  },
+  "notes": [
+    "duplicate_pvs_removed: repeated PVs dropped BEFORE the softmax; keying on full Move so underpromotions survive and merge at 4096 via +=.",
+    "unique_pv_count_N: distribution of unique moves per selected block (N capped at 16).",
+    "value_cp holds the RAW White-POV score: cp clipped +-2000, or sign*(30000 - min(|mate|,1000)) for a forced mate, so mate DISTANCE survives. |value_cp| >= 29000 identifies a mate. value_scale is therefore a collate-time transform via dataset.revalue() - changing it does NOT require re-running Pass B. `value` is the target at the scale recorded here, with every mate pinned to +-0.995 regardless of distance.",
+    "value_scale 290.6806 is the Lc0 WDL calibration constant (v ~ expected score), shared with benchmarking/player/acpl_elo_estimator.py. It is NOT fitted to this corpus and deliberately so: MCTS Q backup and the tuned C_PUCT / VALUE_LOSS are denominated in these units. ~11.5% of cp values saturate above |v|=0.99; accepted.",
+    "post_selection_piece_histogram.policy_coverage: policy coverage is roughly flat across buckets (Pass A predicted 43/37/42% for 6-14 / 15-27 / >=28), i.e. NOT opening-skewed, so no preferential sampling of policy-bearing positions was applied.",
+    "value_strata: report value metrics against these three groups, not in aggregate. A head collapsing toward 0 scores well on the exact-zero mass by doing nothing; also track prediction std.",
+    "LABEL NOISE: the dump carries no engine version field and was produced by many browser Stockfish builds, so cp is heterogeneous in scale across positions. Irreducible here; not corrected for.",
+    "Colour-mirror augmentation is applied at collate time (dataset.MultiPVCollate, 50% default), NOT baked into the shards."
+  ]
+}

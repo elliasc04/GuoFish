@@ -1,0 +1,45 @@
+{
+  "index": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\data\\multiPV\\index\\pass_a_index.bin",
+  "indexed_positions": 394669566,
+  "illegal_excluded": 63558,
+  "pass_b_target": 30000000,
+  "value_min_depth": 26,
+  "policy_min_depth": 20,
+  "bucket_edges": {
+    "<=5": [
+      0,
+      5
+    ],
+    "6-14": [
+      6,
+      14
+    ],
+    "15-27": [
+      15,
+      27
+    ],
+    ">=28": [
+      28,
+      32
+    ]
+  },
+  "target_shares": {
+    "<=5": 0.01,
+    "6-14": 0.35,
+    "15-27": 0.4,
+    ">=28": 0.24
+  },
+  "bucket_available": {
+    "<=5": 10771845,
+    "6-14": 48503578,
+    "15-27": 68370224,
+    ">=28": 23128100
+  },
+  "bucket_sampling_rates": {
+    "<=5": 0.027850382176869422,
+    "6-14": 0.21647887502237464,
+    "15-27": 0.17551500196927833,
+    ">=28": 0.3113096190348537
+  },
+  "expected_selected": 30000000
+}

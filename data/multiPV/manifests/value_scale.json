@@ -1,0 +1,73 @@
+{
+  "emitted_scale": 849.7011077063714,
+  "fit_mode": "with_mates",
+  "legacy_scale": 290.6806,
+  "legacy_provenance": "Lc0 WDL calibration constant (expected score); NOT fitted on GuoFish data",
+  "sample_total": 2000000,
+  "sample_cp": 1599157,
+  "sample_mate": 400843,
+  "mate_fraction": 0.2004215,
+  "mate_sign_split_positive": 0.5992221393413382,
+  "mate_variance_share_of_target": 0.7936891821500001,
+  "overall_std_floor": 0.44368482190002206,
+  "cp_exactly_zero": 418796,
+  "candidates": {
+    "legacy (Lc0 WDL calibration)": {
+      "scale": 290.6806,
+      "overall_std": 0.5896820016629893,
+      "cp_std": 0.4381836525661288,
+      "sat_cp": 0.1147911055637439,
+      "sat_all": 0.292206,
+      "pawn": 0.33106173025930036,
+      "p95": 0.9361969777346033
+    },
+    "fit incl. mates -> overall std 0.5": {
+      "scale": 849.7011077063714,
+      "overall_std": 0.5000000000000001,
+      "cp_std": 0.26118210540379216,
+      "sat_cp": 0.019071923519704444,
+      "sat_all": 0.215671,
+      "pawn": 0.11714808540420582,
+      "p95": 0.5253745685824022
+    },
+    "fit cp-only -> cp std 0.3": {
+      "scale": 667.1971630500509,
+      "overall_std": 0.516877247124519,
+      "cp_std": 0.30000000000000004,
+      "sat_cp": 0.021415658375006332,
+      "sat_all": 0.217545,
+      "pawn": 0.1487684085298765,
+      "p95": 0.6312000439040687
+    },
+    "fit cp-only -> cp std 0.35": {
+      "scale": 496.48181025728684,
+      "overall_std": 0.5411166673660432,
+      "cp_std": 0.35000000000000003,
+      "sat_cp": 0.03337195785029237,
+      "sat_all": 0.227105,
+      "pawn": 0.19873697484903097,
+      "p95": 0.7611862909718062
+    },
+    "fit cp-only -> cp std 0.4": {
+      "scale": 369.4054851353469,
+      "overall_std": 0.5678298981252257,
+      "cp_std": 0.4000000000000001,
+      "sat_cp": 0.07006003788245932,
+      "sat_all": 0.25644,
+      "pawn": 0.26428093928726615,
+      "p95": 0.8723187471140597
+    },
+    "fit cp-only -> cp std 0.5": {
+      "scale": 188.46456326941353,
+      "overall_std": 0.6273506902592405,
+      "cp_std": 0.5000000000000001,
+      "sat_cp": 0.17686255946101603,
+      "sat_all": 0.341837,
+      "pawn": 0.48584244871522636,
+      "p95": 0.9896999357660436
+    }
+  },
+  "value_min_depth": 26,
+  "cp_sample_dump": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\data\\multiPV\\index\\value_cp_sample.npy",
+  "note": "mates are pinned at +-0.995 and carry fixed variance; fitting overall std shrinks cp rather than spreading it. See report."
+}

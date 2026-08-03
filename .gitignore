@@ -14,6 +14,22 @@ coverage/
 # Project Specific
 /data/processed/
 /data/_mmap_cache/
+
+# --- GuoFish multiPV data pipeline ---
+# Raw Lichess eval dump (~21GB) and any decompressed/derived form. Never committed.
+/data/multiPV/*.zst
+/data/multiPV/*.jsonl
+/data/multiPV/*.jsonl.*
+# Pass A line index and Pass B binary shards.
+/data/multiPV/index/
+/data/multiPV/shards/
+*.npy
+*.memmap
+# Manifests ARE committed - they are the record of how a dataset was built.
+# They live here (not under the ignored shard dirs) so no un-ignore gymnastics
+# are needed: git cannot re-include a file whose parent directory is excluded.
+!/data/multiPV/manifests/
+!/data/multiPV/manifests/*.json
 /models
 *.exe
 /cutechess-1.4.0-win64/
