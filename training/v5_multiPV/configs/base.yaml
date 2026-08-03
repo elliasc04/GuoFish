@@ -1,0 +1,137 @@
+# GuoFish v5 - multi-PV student, run "base".
+#
+#   python training/v5_multiPV/train_v5.py --config training/v5_multiPV/configs/base.yaml
+#
+# Explicit CLI flags override anything here. Keys are the argparse dests
+# (underscores, no leading --); an unknown key is a hard error rather than a
+# silent no-op, so a typo cannot quietly leave a default in place.
+#
+# NOT set here and deliberately so: value_scale, policy coverage and the value
+# strata. All three are read from data/multiPV/manifests/dataset_manifest.json
+# at startup and travel into every checkpoint. A checkpoint that cannot state
+# its own value scale is unusable to the MCTS engine.
+
+# --- data -------------------------------------------------------------------
+shards:            data/processed/multipv
+manifest:          data/multiPV/manifests/dataset_manifest.json
+# 10M records drawn as a prefix of a seeded global PERMUTATION of the corpus,
+# not of source order. Source order is not exchangeable: every shard sweeps
+# openings -> endgames, so within-shard position moves mean piece count 23.6 ->
+# 16.2 and has_policy 0.75 -> 0.19. A prefix is only representative when it
+# lands on whole shards (10M does, to 2.5%; 50k does NOT - 0.380 of its mass is
+# >=28-piece positions vs a corpus 0.236). Permuting makes that hold by
+# construction, and makes 5M/10M/20M nested for a scaling study.
+subset:            10000000
+subset_seed:       20260802        # seeds WHICH records; separate from `seed`
+mirror_prob:       0.5             # train-time colour mirror, per sample
+
+# VALIDATION MIRRORING IS OFF, AND MUST STAY OFF FOR EVERY SUBSEQUENT RUN.
+# Stochastic val augmentation makes val loss incomparable across runs. The
+# mirrored half of the world is covered instead by the mirror-consistency
+# diagnostic at each epoch boundary, which is exact rather than sampled.
+val_mirror_prob:   0.0
+
+temperature:       null            # null = use the stored policy target (T=30)
+revalue:           false           # use the stored float16 value target as-is
+workers:           8
+val_workers:       4
+prefetch_factor:   2               # x8 workers x 32 KB/record of dense targets
+drop_last:         true
+
+# --- model (~10.9M params) --------------------------------------------------
+d_model:           384
+num_layers:        6
+nhead:             6
+head_dim:          64
+dim_feedforward:   1536
+vocab_size:        43
+seq_len:           68
+dropout:           0.1
+activation:        gelu            # torch's TransformerEncoderLayer default is
+                                   # RELU and train.py never overrode it, so
+                                   # every earlier GuoFish has a ReLU FFN
+final_norm:        true            # train.py's encoder has NO final LayerNorm;
+                                   # Pre-LN without it hands both heads an
+                                   # unnormalised residual stream
+smolgen:           false           # separate flagged A/B, not this run
+
+# --- optimisation -----------------------------------------------------------
+epochs:            9
+
+# micro_batch from bench_batch.py on this RTX 5070. Measured: throughput is
+# FLAT at ~4,400-4,600 samples/s for every micro-batch from 128 to 1024, then
+# collapses - 1536 reserves 93.7% of VRAM and loses 47%, 2048 reserves 126% of
+# a 11.94 GiB card WITHOUT raising OOM and loses 86%. That is the WDDM spill.
+# Effective batch comes from accumulation, so micro_batch does not change the
+# optimizer-step count. 512 measured fastest WITH torch.compile; 256/accum 4 is
+# within measurement noise and equally acceptable.
+micro_batch:       512
+accum_steps:       2               # effective batch 1024 (unchanged)
+
+# 3.5e-4, NOT the 5e-4 Phase 1 used for the 25.6M model. The LR range test for
+# this net at effective batch 1024 puts the smoothed-loss minimum at 3.57e-4
+# with degradation above ~5e-4, so 5e-4 sat at the very top of the usable band.
+# The batch-scaling heuristic agrees, which is why this is a decision and not a
+# guess. See README "LR range test".
+max_lr:            0.00035
+pct_start:         0.1
+div_factor:        25.0
+final_div_factor:  10000.0
+weight_decay:      0.01
+beta1:             0.9
+beta2:             0.999
+adam_eps:          1.0e-8
+grad_clip:         1.0
+policy_weight:     1.0             # do NOT tune the ratio in this run
+value_weight:      1.0
+policy_norm:       const           # divide every micro-batch by
+                                   # effective_batch * coverage
+
+# Coverage is MEASURED on the records actually selected. With the permuted
+# subset it should land on the corpus figure at any size, which makes it a free
+# self-check: a mismatch means the permutation is not being applied.
+coverage:          null            # null = MEASURE it (always; there is no
+                                   # scenario where the corpus-wide figure beats
+                                   # measuring the records actually selected)
+coverage_samples:  200000
+max_steps:         0
+seed:              20260802
+
+# --- precision --------------------------------------------------------------
+amp:               bf16            # matches inference precision
+tf32:              true
+matmul_precision:  high
+# torch.compile WORKS on this box and is numerically faithful (eager-vs-
+# compiled gradients agree to 2.5e-6 in fp32; the 0.9% seen under bf16 is bf16
+# precision, not compile). Controlled A/B, 3 repeats, medians:
+#   micro   eager  compiled  speedup
+#     128   4,057     4,207    1.04x
+#     256   4,350     4,561    1.05x
+#     512   4,263     4,780    1.12x
+# Best-to-best (eager 256 -> compiled 512) is +9.9%. 512 is 33% of VRAM, far
+# below the 1536 spill point. Disable with --no-compile.
+# REQUIRES triton pinned to the torch version: torch 2.8 -> triton-windows
+# 3.4.x. If torch is upgraded, move triton with it.
+compile:           true
+
+# --- logging / checkpointing ------------------------------------------------
+out_dir:           models/guofish5
+log_every:         50
+val_every:         2000            # fixed val subsample, kept under ~5s
+val_subset:        20000           # same records every time - comparable curve
+val_batch:         1024
+ckpt_every:        5000
+keep_step_ckpts:   3
+mirror_subset:     10000           # epoch-boundary mirror-consistency slice
+drift_window:      200
+drift_tol:         0.05
+
+# --- LR range test (terminal mode: --lr-range-test) -------------------------
+lr_range_steps:    500
+lr_range_min:      1.0e-5
+lr_range_max:      5.0e-3
+lr_range_smooth:   0.9
+lr_range_div:      4.0
+lr_range_diverge:  4.0
+lr_range_slope_window: 10
+lr_range_min_span: 0.05            # below this the sweep did not separate LRs
