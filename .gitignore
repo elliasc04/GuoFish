@@ -14,6 +14,10 @@ coverage/
 # Project Specific
 /data/processed/
 /data/_mmap_cache/
+/recon
+/docs
+/cmake-build-debug
+/golden
 
 # --- GuoFish multiPV data pipeline ---
 # Raw Lichess eval dump (~21GB) and any decompressed/derived form. Never committed.
@@ -116,6 +120,16 @@ replay_pid*
 *.ipr
 *.iws
 out/
+
+# --- C++ core (guofish_core) build artifacts ---
+# The compiled extension and its debug databases are per-machine, per-Python.
+# Build them with README_BUILD.md; never commit them.
+*.pyd
+*.pdb
+*.ilk
+*.exp
+# ASan runtime staged next to the module by the GUOFISH_ASAN build.
+clang_rt.asan*.dll
 
 # Python
 __pycache__/
