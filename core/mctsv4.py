@@ -78,9 +78,14 @@ _instr_batches: list = []
 
 
 # Item 12/13 blast radius: what the cache key does NOT distinguish. Maps
-# zobrist key -> (ep token 66, halfmove_clock, came_from_tablebase) as recorded
+# cache key -> (ep token 66, halfmove_clock, came_from_tablebase) as recorded
 # at cache.put time, so a later cache *hit* can be compared against the position
 # actually being asked about.
+#
+# Item 12 is now FIXED (make_cache_key folds ep_square into the key), so
+# `cache_hit_ep_mismatch` should read exactly 0 -- the probe is kept as a
+# regression check. `cache_hit_hmc_mismatch` (item 13) is still live: the key
+# deliberately does not include the halfmove clock.
 _instr_keymeta: dict = {}
 _instr_keymeta_lock = threading.Lock()
 
@@ -424,8 +429,33 @@ def build_repetition_history(board: chess.Board) -> dict:
     return counter
 
 
+CacheKey = tuple[int, Optional[int]]
+
+
+def make_cache_key(board: chess.Board) -> CacheKey:
+    """Transposition-cache key for `board`: Zobrist hash + raw en-passant square.
+
+    The Zobrist hash alone is COARSER than the network's own input, so it cannot
+    be the whole key. `chess.polyglot.zobrist_hash` follows the Polyglot rule and
+    folds in the en-passant file only when an enemy pawn actually stands ready to
+    capture; `board_to_tokens` writes token 66 from `board.ep_square is not None`
+    -- unconditionally. That is the same rule the training shards were written
+    with (data/pgn_parallel.py's ep branch), so the tokenization is the correct,
+    trained contract and must not change. The consequence is that two positions
+    the network tokenizes *differently* can share a Zobrist key, and whichever is
+    evaluated second is served the first one's policy and value.
+
+    Appending the raw ep square closes the gap without touching tokenization: any
+    two boards differing at token 66 now differ in the key, because that token is
+    a function of ep_square. The key is marginally finer than token 66 (which
+    keeps only the file), but ep rank is implied by side-to-move, which the
+    Zobrist hash already covers -- so the extra precision costs no real entries.
+    """
+    return (chess.polyglot.zobrist_hash(board), board.ep_square)
+
+
 class TranspositionCache:
-    """Thread-safe ring buffer cache for NN evaluations, keyed by Zobrist hash.
+    """Thread-safe ring buffer cache for NN evaluations, keyed by make_cache_key.
 
     Uses a circular buffer instead of OrderedDict to avoid O(n) LRU operations.
     Stores (policy_logits, value) pairs to avoid re-evaluating positions
@@ -435,9 +465,10 @@ class TranspositionCache:
     def __init__(self, max_size: int = 500_000):
         self.max_size = max_size
         # Hash table for O(1) lookup
-        self._cache: dict[int, tuple[torch.Tensor, float]] = {}
-        # Ring buffer of keys for O(1) eviction (no ordering maintained)
-        self._ring: list[Optional[int]] = [None] * max_size
+        self._cache: dict[CacheKey, tuple[torch.Tensor, float]] = {}
+        # Ring buffer of keys for O(1) eviction (no ordering maintained).
+        # None is the empty-slot sentinel; a real key is always a tuple.
+        self._ring: list[Optional[CacheKey]] = [None] * max_size
         self._ring_idx = 0  # Next position to write
         self._lock = threading.Lock()
 
@@ -445,22 +476,22 @@ class TranspositionCache:
         self.hits = 0
         self.misses = 0
 
-    def get(self, zobrist_hash: int) -> Optional[tuple[torch.Tensor, float]]:
-        """Get cached (policy_logits, value) for hash. Returns None on miss."""
+    def get(self, key: CacheKey) -> Optional[tuple[torch.Tensor, float]]:
+        """Get cached (policy_logits, value) for key. Returns None on miss."""
         with self._lock:
-            result = self._cache.get(zobrist_hash)
+            result = self._cache.get(key)
             if result is not None:
                 self.hits += 1
                 return result
             self.misses += 1
             return None
 
-    def put(self, zobrist_hash: int, policy: torch.Tensor, value: float):
-        """Store (policy_logits, value) for hash. Evicts oldest entry if at capacity."""
+    def put(self, key: CacheKey, policy: torch.Tensor, value: float):
+        """Store (policy_logits, value) for key. Evicts oldest entry if at capacity."""
         with self._lock:
-            if zobrist_hash in self._cache:
+            if key in self._cache:
                 # Update existing entry (no ring position change needed)
-                self._cache[zobrist_hash] = (policy, value)
+                self._cache[key] = (policy, value)
                 return
 
             # Evict entry at current ring position if occupied
@@ -469,8 +500,8 @@ class TranspositionCache:
                 self._cache.pop(old_key, None)
 
             # Insert new entry
-            self._cache[zobrist_hash] = (policy, value)
-            self._ring[self._ring_idx] = zobrist_hash
+            self._cache[key] = (policy, value)
+            self._ring[self._ring_idx] = key
 
             # Advance ring pointer
             self._ring_idx = (self._ring_idx + 1) % self.max_size
@@ -510,15 +541,20 @@ class EvalRequest:
 class MCTSNode:
     """A node in the MCTS tree with virtual loss support."""
 
-    __slots__ = ['parent', 'move', 'prior', 'children', 'visit_count',
-                 'value_sum', 'vloss_count', 'is_expanded', 'lock',
-                 'is_terminal', 'terminal_value']
+    __slots__ = ['parent', 'move', 'prior', 'base_prior', 'children',
+                 'visit_count', 'value_sum', 'vloss_count', 'is_expanded',
+                 'lock', 'is_terminal', 'terminal_value']
 
     def __init__(self, parent: Optional['MCTSNode'] = None,
                  move: Optional[chess.Move] = None, prior: float = 0.0):
         self.parent = parent
         self.move = move  # Move that led to this node
-        self.prior = prior  # P(s,a) from neural network
+        self.prior = prior  # P(s,a) actually used by PUCT (may include noise)
+        # The network's own P(s,a), written once at expansion and never mutated
+        # afterwards. Dirichlet noise is a function OF this value rather than an
+        # edit to `prior`, so re-applying it on a reused tree recomputes instead
+        # of compounding -- see ParallelMCTS._add_dirichlet_noise.
+        self.base_prior = prior
         self.children: dict[chess.Move, 'MCTSNode'] = {}
         self.visit_count = 0
         self.value_sum = 0.0
@@ -1137,10 +1173,29 @@ class MCTSWorker:
                 # is path-specific, NOT in the position-keyed NN cache.
                 if self._draw_by_rule(board, path_counts):
                     repay()
+                    # is_expanded is deliberately LEFT ALONE (False) here.
+                    #
+                    # A draw by fifty-move / threefold is only a draw if someone
+                    # CLAIMS it: python-chess's is_game_over() ends the game on
+                    # the seventy-five-move and fivefold rules alone, and hosts
+                    # differ -- cutechess claims both automatically, Lichess does
+                    # not. So a node we mark here can still be handed to us as
+                    # the position we must move from. Marking it expanded with an
+                    # empty children dict made that unrecoverable: apply_move
+                    # promotes it to root, search() sees is_expanded and skips
+                    # _expand_root, then finds no children and returns None --
+                    # 'bestmove 0000', a forfeit, with legal moves on the board.
+                    #
+                    # Leaving it unexpanded costs the search nothing: the
+                    # selection loop above stops here either way (its condition
+                    # needs `is_expanded AND children`), and the cached-terminal
+                    # fast path below returns terminal_value before any expansion
+                    # is attempted. The only code that can now expand this node is
+                    # _expand_root, which runs exactly when it has become a search
+                    # root -- i.e. when we are actually being forced to play on.
                     with node.lock:
                         node.is_terminal = True
                         node.terminal_value = 0.0
-                        node.is_expanded = True
                     node.backpropagate(0.0)
                     self.stats['simulations'] += 1
                     return
@@ -1183,8 +1238,15 @@ class MCTSWorker:
                     value = 0.0
 
                 # Cache result so subsequent visits hit the fast path above.
-                # Setting is_expanded=True is harmless: selection bails on the
-                # empty children dict before reaching this node again.
+                # Setting is_expanded=True is harmless WITHIN the search:
+                # selection bails on the empty children dict before reaching this
+                # node again. Unlike the draw-by-rule path above, this branch is
+                # gated on board.is_game_over(), so the position is over by a rule
+                # that needs no claim -- checkmate, stalemate, insufficient
+                # material, seventy-five-move, fivefold. A host can still decline
+                # to end on the last three, so search()/get_policy() re-expand a
+                # promoted root that arrives with no children rather than trusting
+                # this flag; that recovery is what makes leaving it here safe.
                 with node.lock:
                     node.is_terminal = True
                     node.terminal_value = value
@@ -1199,15 +1261,17 @@ class MCTSWorker:
                 return
 
             # === Expansion & Evaluation ===
-            # Check transposition cache first (Zobrist hash includes side-to-move, castling, ep)
-            zobrist_hash = chess.polyglot.zobrist_hash(board)
-            cached = self.cache.get(zobrist_hash)
+            # Check transposition cache first. The key is (Zobrist, ep_square),
+            # NOT the Zobrist hash alone -- see make_cache_key for why the hash
+            # by itself is coarser than the network's own tokenization.
+            cache_key = make_cache_key(board)
+            cached = self.cache.get(cache_key)
 
             if _INSTR and cached is not None:
                 # Items 12/13: the key matched, but did the POSITION match on
                 # the axes the key ignores (ep token, halfmove clock)?
                 with _instr_keymeta_lock:
-                    _meta = _instr_keymeta.get(zobrist_hash)
+                    _meta = _instr_keymeta.get(cache_key)
                 if _meta is not None:
                     _b = _instr_bucket()
                     _b['cache_hit_checked'] += 1
@@ -1263,9 +1327,9 @@ class MCTSWorker:
                 if policy is not None:
                     if _INSTR:
                         with _instr_keymeta_lock:
-                            _instr_keymeta[zobrist_hash] = (
+                            _instr_keymeta[cache_key] = (
                                 _instr_ep_token(board), board.halfmove_clock, _was_tb)
-                    self.cache.put(zobrist_hash, policy, nn_value)
+                    self.cache.put(cache_key, policy, nn_value)
 
             # Expand node with policy LOGITS (Softmax, and any sharpening,
             # happen inside expand). The cache stores raw logits, so a cache hit
@@ -1504,6 +1568,16 @@ class ParallelMCTS:
         """
         Add Dirichlet noise to root's children priors for exploration.
         Standard AlphaZero formula: P'(a) = (1 - epsilon) * P(a) + epsilon * Dir(alpha)
+
+        P(a) is read from `base_prior` -- the untouched network prior -- and the
+        result is written to `prior`. Reading and writing the same field would be
+        wrong here, because this tree PERSISTS across moves: a node can be the
+        root of one search, get promoted through apply_move, and be noised again.
+        In-place mixing makes those applications compose, so after k of them the
+        network's contribution has decayed to (1 - epsilon)^k = 0.75^k -- 24% of
+        its intended weight by the fifth. Deriving from base_prior each time
+        makes the operation idempotent: one application's worth of noise, always,
+        no matter how many searches the node has already served.
         """
         if not root.children:
             return
@@ -1513,7 +1587,7 @@ class ParallelMCTS:
 
         for move, n in zip(moves, noise):
             child = root.children[move]
-            child.prior = (1 - epsilon) * child.prior + epsilon * n
+            child.prior = (1 - epsilon) * child.base_prior + epsilon * n
 
     def search(self, board: chess.Board, num_simulations: int = 800,
                time_limit: float = 0.0, add_dirichlet_noise: bool = False) -> Optional[chess.Move]:
@@ -1548,7 +1622,16 @@ class ParallelMCTS:
             # If this node was an unexplored leaf in the prior tree, it has no
             # children yet. Expand now so max(root.children) doesn't return None
             # (which would produce an illegal "0000" bestmove).
-            if not root.is_expanded:
+            #
+            # `or not root.children` covers the other way a promoted node can
+            # arrive childless: the board.is_game_over() path in _run_simulation
+            # marks a terminal leaf is_expanded with an empty children dict. That
+            # is correct for checkmate/stalemate (no legal moves to generate, and
+            # _expand_root re-derives the same empty result), but the same flag
+            # combination also lands on positions a host may refuse to end --
+            # insufficient material, seventy-five-move, fivefold. Re-expanding
+            # costs one forward pass on a position we play from at most once.
+            if not root.is_expanded or not root.children:
                 self._expand_root(root, board)
         else:
             # Create fresh root
@@ -1559,8 +1642,19 @@ class ParallelMCTS:
             self._root_hash = board_hash
 
         if not root.children:
-            # No legal moves
-            return None
+            # Last-resort net. With the two paths above this should now be
+            # unreachable unless the position genuinely has no legal moves, but
+            # returning None here means 'bestmove 0000' at the UCI layer, which
+            # loses the game on the spot. Only concede when the board agrees.
+            legal = list(board.legal_moves)
+            if not legal:
+                return None
+            print(f"[mcts] WARNING: root has no children but {len(legal)} legal "
+                  f"moves exist ({board.fen()}); playing {legal[0].uci()}",
+                  file=sys.stderr, flush=True)
+            self.last_root_q = 0.0
+            self.last_best_child_q = 0.0
+            return legal[0]
 
         # Add Dirichlet noise for exploration (per-search, not per-tree)
         if add_dirichlet_noise:
@@ -1673,6 +1767,16 @@ class ParallelMCTS:
         # PUCT comparison, and Dirichlet noise (added afterwards, when enabled)
         # is defined as a mix with the final priors.
         root.expand(policy_logits[0], legal_moves, self.params.policy_temperature)
+        # If this node had been marked drawn-by-rule (fifty-move / threefold) it
+        # was left unexpanded precisely so we could reach here. Now that it IS a
+        # search root with real children, the mark is stale: the host declined to
+        # claim the draw and we are playing on. Clearing it keeps the tree's
+        # invariant honest (no node is both terminal and branching). Guarded on
+        # children actually existing, so a genuine checkmate/stalemate leaf --
+        # legal_moves empty, expand() returns without children -- keeps its mark
+        # and its cached value.
+        if root.children:
+            root.is_terminal = False
         root.visit_count = 1
         # Seed value in MOVER's perspective (same convention as backpropagate).
         # The v5 value head is White-POV by construction (model_v5: "tanh,
@@ -1708,8 +1812,10 @@ class ParallelMCTS:
             root = self.root
             self._reset_virtual_loss(root)
             # If this node was an unexplored leaf in the prior tree, expand now
-            # so root.children is populated before the search proceeds.
-            if not root.is_expanded:
+            # so root.children is populated before the search proceeds. The
+            # `or not root.children` half is the same forced-to-play recovery
+            # search() does -- see the comment there.
+            if not root.is_expanded or not root.children:
                 self._expand_root(root, board)
         else:
             root = MCTSNode()
@@ -1719,7 +1825,16 @@ class ParallelMCTS:
             self._root_hash = board_hash
 
         if not root.children:
-            return {}
+            # Mirror of search()'s last-resort net: an empty policy makes callers
+            # (pick_engine_move's argmax) produce no move at all. Only return
+            # empty when the board really has nothing to play.
+            legal = list(board.legal_moves)
+            if not legal:
+                return {}
+            print(f"[mcts] WARNING: root has no children but {len(legal)} legal "
+                  f"moves exist ({board.fen()}); returning uniform policy",
+                  file=sys.stderr, flush=True)
+            return {m: 1.0 / len(legal) for m in legal}
 
         if add_dirichlet_noise:
             self._add_dirichlet_noise(root)
