@@ -96,6 +96,8 @@ FetchContent_MakeAvailable(chess_library)
 # ---------------------------------------------------------------------------
 pybind11_add_module(guofish_core
         cpp/bindings.cpp
+        cpp/movegen.hpp
+        cpp/tokens.hpp
 )
 
 target_include_directories(guofish_core PRIVATE cpp/)

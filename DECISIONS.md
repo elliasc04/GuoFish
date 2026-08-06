@@ -643,3 +643,300 @@ library that produced it, and it gives the same verdict on 3.12 (Linux) and 3.13
 
 No existing test file was modified. `tests/test_c1_movegen.py` is new; `git
 status` over `tests/` shows one untracked file and nothing else.
+
+---
+
+# C2 — Tokenizer parity (2026-08-05)
+
+`tokens(fen) -> numpy.int32[68]` and the `TokenBatch` batch buffer are exposed
+from `cpp/bindings.cpp`; the encoding itself lives in `cpp/tokens.hpp` so C4/C5
+can include it without the benchmark machinery, exactly as C1 did for movegen.
+Acceptance is `tests/test_c2_tokens.py` against `golden/tokens.npz` — 100,000
+positions, 0 mismatches, through both entry points.
+
+## Not building this on `chess::Board`
+
+**The decision that determined everything else in this chunk.** The obvious
+implementation is `board.setFen(fen)` followed by reading the pieces, side,
+castling rights and ep square off the `Board`. It is wrong, and it fails
+silently.
+
+chess-library validates the en-passant square on the way in. From
+`setFenCommon()` in `chess.hpp`:
+
+```cpp
+if (ep_sq_ != Square::NO_SQ) {
+    valid = movegen::isEpSquareValid<...>(*this, ep_sq_);
+    if (!valid) ep_sq_ = Square::NO_SQ;
+}
+```
+
+That is defensible for a search library — an ep square no pawn can act on does
+not change the position — but it is not the FEN's fourth field, and it is not
+what `board.ep_square` reports in python-chess, which stores the field verbatim
+and offers the legality question separately as `has_legal_en_passant()`.
+`board_to_tokens` reads the attribute.
+
+The gap is neither hypothetical nor rare. Of the **3,610** positions in the
+corpus carrying an ep target, **3,203 have no legal ep capture available**. A
+`Board`-based tokenizer would emit 31 where the reference emits 32..39 on 3.2%
+of the corpus — and on precisely the positions that follow a double pawn push,
+which is to say constantly, in every game.
+
+**Alternatives considered:**
+
+* *Use `Board` and patch the ep square back in from the FEN text.* Rejected: it
+  still pays `setFen`'s zobrist hashing, castling-path construction and a
+  movegen call on a hot path that needs none of them, and it leaves a `Board`
+  in the code whose `enpassantSq()` disagrees with the token that was emitted —
+  a trap laid for whoever touches this next.
+* *Parse the FEN directly.* Chosen. It is the only version where the ep rule is
+  a single line that says what it means, and it is also the fast one: 272 ns per
+  position on Windows, 361x the reference (BENCH.md).
+
+The cost is that `cpp/tokens.hpp` now contains a second FEN parser, independent
+of the one inside chess-library. That duplication is real and is the price of
+the parity guarantee; the header says so at the top.
+
+## Castling rights: transcribing python-chess rather than reading the letters
+
+`board_to_tokens` does not read the FEN's castling field. It calls
+`has_kingside_castling_rights()` / `has_queenside_castling_rights()`, and those
+answer a *narrower* question: python-chess cleans the claimed rights against
+where the king and rooks actually stand. A FEN claiming `KQkq` with the White
+king on d1 yields no White rights at all.
+
+**Every FEN in `golden/tokens.npz` is self-consistent** — the field's letters and
+the cleaned rights agree on all 100,000 positions, and the token-65 histogram
+matches the castling-field histogram exactly. So the naive implementation
+(`'K' in field ? 8 : 0`, etc.) also passes the acceptance test, and it is
+shorter.
+
+It was rejected anyway. The corpus is not the contract: the first inconsistent
+FEN reaching a search built on the naive rule would be mis-encoded with nothing
+to catch it, and FENs arriving over UCI from a GUI are not guaranteed to be
+self-consistent. `parse_castling_field` / `clean_castling_rights` /
+`has_castling_right` in `cpp/tokens.hpp` are a line-by-line transcription of
+`_set_castling_fen`, `clean_castling_rights` and `has_*_castling_rights` for the
+standard-chess (`chess960=False`) branch, which is the mode
+`tools/gen_token_golden.py` runs in.
+
+`test_castling_rights_are_cleaned_against_the_position` is what fails if this is
+ever simplified back: two FENs claiming `KQkq`, one with the king off e1 and one
+with the a1 rook missing, whose reference tokens are 18 and 26 rather than 30.
+
+Three details are transcribed rather than rewritten, and all three are
+deliberate:
+
+* **`lsb()`/`msb()` return -1 on an empty bitboard.** python-chess's castling
+  parser depends on it: `msb(0) == -1` is what pushes the "no rook on the back
+  rank" case into the `else` branch instead of indexing a bitboard.
+* **`rook > king_mask` compares whole 64-bit masks**, not square indices. With
+  the one king per side that real positions have these are the same test, but
+  python-chess permits two kings and `tokens()` therefore has to answer for
+  them; keeping the comparison in its original shape means both languages land
+  on the same side of it.
+* **The X-FEN `~` promoted-piece suffix is parsed.** No FEN in the corpus uses
+  it, but python-chess excludes promoted kings from every castling test
+  (`kings & ~promoted`), and — more immediately — treating `~` as an ordinary
+  character would place every subsequent piece on that rank one square off.
+
+Shredder-FEN file letters (`a`..`h`) in the castling field are also handled, for
+the same reason: `FEN_CASTLING_REGEX` admits them, so silently dropping a letter
+the reference honoured would be a parity hole.
+
+## Where this parser is knowingly laxer than the reference
+
+`tokens()` does not parse the halfmove clock or the fullmove number. python-chess
+validates both as integers and raises on garbage; this accepts it.
+
+That is the only divergence, and it is safe in the only direction that matters:
+**no FEN the reference accepts is refused here, and no accepted FEN produces a
+different token.** Neither counter reaches the encoding —
+`test_move_counters_do_not_reach_the_encoding` pins that — so chasing `int()`'s
+full accepted syntax (leading `+`, underscores, surrounding whitespace) would be
+code with no observable behaviour.
+
+Everything the encoding *does* depend on is refused exactly where the reference
+refuses it: rank and file counts, adjacent digits, `~` placement, piece letters,
+side-to-move, the castling regex, the ep square name, and a seventh field.
+Trailing fields are defaulted rather than required, because python-chess defaults
+them and `tokens()` and `legal_moves()` are fed from the same call sites — two
+different ideas of what parses would be a bug visible in only one of them.
+
+## Kingless positions are encoded, not refused
+
+C1's `legal_moves` refuses them: chess-library's `setFen` calls `kingSq()` while
+building castling paths and asserts on an empty king bitboard, so the guard is
+load-bearing there (see "C1 / rejecting a FEN early enough").
+
+`tokens()` does not touch chess-library and python-chess encodes a kingless board
+without complaint, so refusing here would be a divergence rather than a safety
+check. The two functions therefore accept different sets of FENs *on purpose*,
+and both are documented at their binding.
+
+## The batch interface
+
+The brief asks for "a batch/buffer interface that writes tokenized sequences
+directly into a C++-owned 2D array without intermediate memory copies".
+
+**Chosen shape:** a `TokenBatch` class owning one 64-byte-aligned
+`AlignedBuffer` of `[capacity, 68]` int32, with `view()` returning a zero-copy
+NumPy alias and `fill(fens, row_offset=0)` encoding into rows in place.
+
+**Alternatives considered:**
+
+* *`tokens_batch(fens) -> ndarray` returning a fresh array each call.* Rejected:
+  it reallocates per batch and gives the caller no way to hand the *same* array
+  to the network every iteration, which is what the evaluator in scope 2.1 does.
+* *Reuse C0's module-level `make_buffer` / `g_buffer` singleton.* Rejected: a
+  single global buffer cannot serve more than one dispatcher, and C9 will have
+  more than one thread.
+
+`row_offset` exists so several `fill()` calls can pack one network batch. The
+parity sweep in `test_c2_tokens.py` deliberately alternates the offset between 0
+and mid-buffer, because a sweep that always started at row 0 would never
+exercise the argument and would not notice a stale row being read back.
+
+### Releasing the GIL over Python-owned string memory
+
+`fill()` encodes with the GIL released. That is only safe because of a specific
+sequence, and it is worth stating since it is the sort of thing that looks like a
+bug later:
+
+1. `PySequence_List` materialises the iterable into a list this call owns — so a
+   generator is consumed exactly once, here, and never re-entered from inside
+   the GIL-free region.
+2. `PyUnicode_AsUTF8AndSize` caches the encoded form *inside each str object*,
+   so the returned pointer lives as long as the object does, and the list holds
+   every object alive on this frame.
+3. Python strings are immutable, so nothing can move or rewrite those buffers
+   under a reader.
+4. The encode loop makes no Python API call at all. It reads bytes and writes
+   int32s.
+
+`py::gil_scoped_release`'s destructor reacquires on scope exit *including during
+unwinding*, so a `std::invalid_argument` thrown from a bad FEN mid-batch is
+translated to `ValueError` with the GIL correctly held.
+
+**Documented behaviour on a bad FEN mid-batch:** rows written before it keep
+their new contents; the rest keep their old ones. Rolling back was considered and
+rejected — the caller's batch is wrong either way, and quietly restoring stale
+rows for the network to read is worse than a partially updated buffer plus an
+exception. `test_a_rejected_fen_inside_a_batch_raises` pins it so a change is a
+deliberate one.
+
+## Two benchmark numbers, not one
+
+`tokenize_bench` copies the FENs into C++ strings before starting the timer, so
+the timed region touches no Python object; `TokenBatch.fill` is measured
+separately end to end. Both are in BENCH.md.
+
+Publishing only the faster one would overstate what a Python-driven dispatcher
+sees today (by 7% on Windows). Publishing only the slower one would understate
+what C5 will see, where the leaves are `chess::Board` objects and no FEN string
+is constructed at all. The gate is judged on the encoder figure — 3,678,645
+pos/s, **360.7x** the brief's 10,200 pos/s baseline against a 100x requirement.
+
+`tools/bench_c2.py --python` also re-measures the reference on this machine. It
+comes out at 8,841 pos/s, *slower* than the 10,200 the brief quotes, which would
+inflate the speedup to 416x. BENCH.md reports both and carries the conservative
+number forward.
+
+## Mutation check
+
+Same reconciliation as C1: the brief asks for a golden value to be corrupted and
+the file restored; Global Rules 1 and 2 say `golden/` is never written to, and
+the rules win. `tests/test_c2_tokens.py` reads an optional
+`GUOFISH_GOLDEN_TOKENS` environment variable, so the drill ran against a
+**corrupted copy in the scratch directory** and `golden/tokens.npz` was never
+opened for writing. Its SHA-256 was `ea9bf8df…413ce562` before the drill and
+`ea9bf8df…413ce562` after.
+
+Four mutations in one file, one per field the report has to tell apart. All four
+produced the required diagnostic — the FEN, both 68-element arrays in full, and
+every differing index with both values — through **both** the single-position and
+the batched path, and the other 99,996 positions stayed green:
+
+| mutation | what the report said |
+|---|---|
+| row 5, index 4: rook on e1 → 0 | `[4] square e1  expected 0  got 4` |
+| row 6, index 65: castling 29 → 22 | `[65] castling rights  expected 22  got 29`, plus `CASTLING MASK: expected 0111, got 1110 (bits are WK WQ BK BQ, high to low)` |
+| row 184, index 66: ep 37 → 31 | `[66] en-passant file  expected 31  got 37` |
+| row 99999, index 67: CLS 40 → 0 | `[67] CLS  expected 0  got 40` |
+
+Two notes on the report:
+
+* Indices are named, not numbered: `[4] square e1`, `[66] en-passant file`. A
+  bare index list is not much use when the failure is on square 41.
+* Both arrays print via `.tolist()`, not NumPy's repr, which elides the middle of
+  a 68-element array with `...` — and the elided region is squares 24..47, most
+  of the board. `test_diagnostic_reports_every_differing_index` asserts the
+  report contains no `...`.
+
+The `EN PASSANT DISCARDED` hint did not fire on the row-184 mutation, and that is
+correct: it fires on the real-bug direction (C++ emitting 31 where the reference
+has a file), not on a corrupted reference. Five `test_diagnostic_*` tests
+exercise the formatter directly so the requirement is covered by the suite and
+not only by a one-off drill.
+
+## Where the test could have fooled itself
+
+Three ways this suite could have been green while the encoder was wrong, and what
+closes each:
+
+* **A corpus with no hard cases.** `test_corpus_covers_en_passant_without_a_capturer`
+  asserts at least 1,000 ep positions with no pawn placed to capture (there are
+  3,203), and `test_corpus_covers_every_token_value` asserts all 16 castling
+  masks, all 9 ep values and all 13 square values appear. Without the first, a
+  `Board`-based tokenizer passes outright.
+* **Judging the ep token against the golden file only.**
+  `test_en_passant_is_emitted_without_a_capturer` re-derives the expected file
+  from the FEN string itself, so it still fails if the reference and the C++ side
+  were somehow wrong together.
+* **Testing only the path the search will not use.** `tokens()` and
+  `TokenBatch.fill()` are compared against the golden file *separately*. They
+  reach the same encoder through different plumbing — fresh NumPy array vs. a row
+  of a C++ buffer, GIL held vs. GIL released — and a plumbing bug shows up in
+  exactly one.
+
+Nothing in `tests/test_c2_tokens.py` imports `chess`. The reference's answers
+reach it only through the golden file and through targeted literals that were
+cross-checked against `core.mctsv4.board_to_tokens` on python-chess 1.11.2, so
+the suite cannot drift into re-deriving its expectation from the library that
+produced the file.
+
+## Sanitizers
+
+Suite green on four builds: MSVC Release, MSVC Debug + ASan, Clang Release,
+Clang Debug + ASan + UBSan. 143 tests each (62 of them C2's), no ASan or UBSan
+runtime errors.
+
+`TokenBatch`'s allocation was leak-checked with the quantitative method
+README_BUILD.md prescribes rather than by reading the summary: 1 vs 500
+`TokenBatch(1000)` allocations (272 KB each) give a **byte-identical** total of
+941,456 bytes in 858 allocations. Had the buffer leaked, the second run would
+have been ~136 MB heavier. No leaked allocation's stack mentions `guofish_core`.
+
+## Not done
+
+* **No tokenization from a `chess::Board`.** C5 will want `tokenize_into(const
+  chess::Board&, int32_t*)` so search leaves never round-trip through a FEN
+  string. It is deliberately not in C2: there is no golden data for it, so it
+  would ship unverified. The square/castling/ep logic is already factored to be
+  reusable when that chunk arrives — and note the ep rule will need the *board's
+  own* ep square, which is where the trap at the top of this entry reappears.
+* **No multi-threaded fill.** `TokenBatch.fill` is single-threaded. At 272 ns per
+  position a 256-row batch takes 70 µs, which is below the C0b GIL acquire wait
+  that surrounds it (78 µs p99); parallelising it would optimise a term that is
+  already noise. Revisit only if profiling in C5 says otherwise.
+* **No `int16` or packed encoding.** The network's input is `int32[68]` and the
+  buffer matches it, so no conversion happens on the way in. A narrower buffer
+  would save memory the dispatcher does not lack and add a widening step it
+  currently does not pay.
+
+## Global Rule 1
+
+No existing test file was modified. `tests/test_c2_tokens.py` is new; `git
+status` over `tests/` shows one untracked file and nothing else. `golden/` was
+not written to — see "Mutation check" for the before/after hash.

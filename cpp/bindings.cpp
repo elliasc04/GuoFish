@@ -17,6 +17,11 @@
 //
 // C1 adds the first real engine surface: legal_moves(fen). The generation and
 // UCI normalisation live in cpp/movegen.hpp; this file only binds them.
+//
+// C2 adds the tokenizer: tokens(fen) for one position and TokenBatch for the
+// batched path the evaluator will actually use, which writes straight into the
+// same kind of C++-owned aligned buffer C0 proved out. The encoding itself
+// lives in cpp/tokens.hpp; this file only binds it and owns the memory.
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -26,6 +31,7 @@
 #include <chess.hpp>
 
 #include "movegen.hpp"
+#include "tokens.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -76,10 +82,11 @@ namespace {
 // 64 bytes: one x86 cache line, and the alignment AVX-512 loads want.
 constexpr std::size_t kAlignment = 64;
 
-// The tokenizer width this port targets (scope C2: tokens(fen) -> int32[68]).
-// The benchmarks write rows of this width so the simulated work matches the
-// shape of the real dispatcher batch rather than being an arbitrary memset.
-constexpr std::size_t kTokenWidth = 68;
+// The tokenizer width, taken from the encoding itself rather than restated:
+// C0's benchmarks write rows of this width so the simulated work matches the
+// shape of the real dispatcher batch, and C2's buffers are this wide because
+// that is what the network's input is.
+constexpr std::size_t kTokenWidth = static_cast<std::size_t>(guofish::kSeqLength);
 
 using clock_type = std::chrono::steady_clock;
 
@@ -523,10 +530,189 @@ py::dict contention_bench(std::size_t rows, std::size_t iters, const py::object 
     return res;
 }
 
+// ---------------------------------------------------------------------------
+// C2 — tokenization
+// ---------------------------------------------------------------------------
+
+// One position, as a fresh 68-element int32 array.
+//
+// This allocates a NumPy array per call and is the *validation* signature, not
+// the search path — parity against golden/tokens.npz is judged one position at
+// a time. TokenBatch below is the shape the evaluator uses.
+py::array_t<std::int32_t> tokens(std::string_view fen) {
+    py::array_t<std::int32_t> out(static_cast<py::ssize_t>(guofish::kSeqLength));
+    guofish::tokenize_into(fen, out.mutable_data());
+    return out;
+}
+
+// Materialise an arbitrary iterable of FENs into a list this call owns.
+//
+// Two things follow, and the batch path needs both: a generator is consumed
+// exactly once, here, rather than re-entered from inside a GIL-released region;
+// and every string object stays alive at a fixed address for the duration of
+// the call, which is what makes the cached UTF-8 pointers below safe to read
+// without the GIL.
+py::list materialize(const py::object &fens) {
+    PyObject *raw = PySequence_List(fens.ptr());
+    if (raw == nullptr) {
+        throw py::error_already_set();
+    }
+    return py::reinterpret_steal<py::list>(raw);
+}
+
+// Borrow each element's UTF-8 buffer. Must be called with the GIL held, and the
+// returned views are valid only while `items` is alive.
+//
+// PyUnicode_AsUTF8AndSize caches the encoded form inside the str object, so the
+// pointer it hands back lives as long as the object does. Python strings are
+// immutable, so nothing can move or rewrite that buffer underneath a reader —
+// which is why the tokenize loop may then run with the GIL released. It makes
+// no Python API calls at all; it only reads bytes.
+std::vector<std::string_view> borrow_utf8(const py::list &items) {
+    const auto n = static_cast<std::size_t>(py::len(items));
+
+    std::vector<std::string_view> views;
+    views.reserve(n);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        PyObject *item = PyList_GetItem(items.ptr(), static_cast<py::ssize_t>(i));
+        if (item == nullptr) {
+            throw py::error_already_set();
+        }
+        if (!PyUnicode_Check(item)) {
+            throw py::type_error("guofish_core: expected a str FEN at index " + std::to_string(i));
+        }
+        py::ssize_t length = 0;
+        const char *data = PyUnicode_AsUTF8AndSize(item, &length);
+        if (data == nullptr) {
+            throw py::error_already_set();
+        }
+        views.emplace_back(data, static_cast<std::size_t>(length));
+    }
+
+    return views;
+}
+
+// A C++-owned [capacity, 68] int32 matrix that FENs are tokenized straight into.
+//
+// This is the batch interface the brief asks for. The important property is
+// what does *not* happen: no per-position array, no list of arrays, no
+// np.stack, and no copy between the parser and the network's input buffer. The
+// parser's only output destination is a row of this allocation, and `view()`
+// hands Python a NumPy array aliasing that same memory.
+//
+// The buffer is 64-byte aligned for the same reason C0's is — see AlignedBuffer.
+class TokenBatch {
+public:
+    explicit TokenBatch(std::size_t capacity) : buffer_(std::make_shared<AlignedBuffer>(capacity, kTokenWidth)) {
+        if (capacity == 0) {
+            throw py::value_error("guofish_core.TokenBatch: capacity must be > 0");
+        }
+    }
+
+    std::size_t capacity() const noexcept { return buffer_->rows(); }
+
+    py::array_t<std::int32_t> view() const { return make_view(buffer_); }
+
+    // Tokenize `fens` into rows [row_offset, row_offset + len(fens)). Returns
+    // the number of rows written.
+    //
+    // On a FEN the parser refuses this throws ValueError, and the rows written
+    // before it keep their new contents while the rest keep their old ones.
+    // Recovering a half-filled batch is not attempted: the caller's batch is
+    // wrong, and quietly leaving stale rows in place for the network to read
+    // would be worse than a partially updated buffer plus an exception.
+    std::size_t fill(const py::object &fens, std::size_t row_offset) {
+        py::list items = materialize(fens);
+        const std::vector<std::string_view> views = borrow_utf8(items);
+
+        if (row_offset > buffer_->rows() || views.size() > buffer_->rows() - row_offset) {
+            throw py::value_error("guofish_core.TokenBatch.fill: " + std::to_string(views.size()) +
+                                  " FENs at row_offset " + std::to_string(row_offset) +
+                                  " do not fit a batch of capacity " + std::to_string(buffer_->rows()));
+        }
+
+        {
+            // Safe because the loop touches no Python object: see borrow_utf8.
+            // `items` is held on this frame and keeps every buffer alive; the
+            // release guard reacquires the GIL on the way out, including while
+            // unwinding from a bad FEN.
+            py::gil_scoped_release released;
+            for (std::size_t i = 0; i < views.size(); ++i) {
+                guofish::tokenize_into(views[i], buffer_->row(row_offset + i));
+            }
+        }
+
+        return views.size();
+    }
+
+private:
+    std::shared_ptr<AlignedBuffer> buffer_;
+};
+
+// Single-threaded tokenization throughput, for BENCH.md.
+//
+// The FENs are copied into C++-owned strings up front and the timed region
+// touches no Python object at all, so what this reports is the cost of the
+// encoder rather than the cost of the language boundary. `TokenBatch.fill` pays
+// that boundary once per batch; tools/bench_c2.py measures it separately and
+// BENCH.md carries both numbers, because quoting only the faster one would
+// overstate what the dispatcher will actually see.
+py::dict tokenize_bench(const py::object &fens, std::size_t repeats) {
+    if (repeats == 0) {
+        throw py::value_error("guofish_core.tokenize_bench: repeats must be > 0");
+    }
+
+    py::list items = materialize(fens);
+    const std::vector<std::string_view> borrowed = borrow_utf8(items);
+    if (borrowed.empty()) {
+        throw py::value_error("guofish_core.tokenize_bench: need at least one FEN");
+    }
+
+    const std::vector<std::string> owned(borrowed.begin(), borrowed.end());
+
+    // One row per position: writing every result to the same row would let the
+    // whole buffer stay in L1 and measure something the real batch never sees.
+    AlignedBuffer scratch(owned.size(), kTokenWidth);
+
+    double elapsed_us = 0.0;
+    std::int64_t checksum = 0;
+
+    {
+        py::gil_scoped_release released;
+        const auto start = clock_type::now();
+        for (std::size_t r = 0; r < repeats; ++r) {
+            for (std::size_t i = 0; i < owned.size(); ++i) {
+                guofish::tokenize_into(owned[i], scratch.row(i));
+            }
+        }
+        elapsed_us = micros_between(start, clock_type::now());
+
+        // Consume the writes so the encoder cannot be optimised away wholesale.
+        for (std::size_t i = 0; i < scratch.size(); ++i) {
+            checksum += scratch.data()[i];
+        }
+    }
+
+    const auto positions = static_cast<double>(owned.size()) * static_cast<double>(repeats);
+
+    py::dict d;
+    d["positions"] = owned.size();
+    d["repeats"] = repeats;
+    d["total_positions"] = static_cast<std::size_t>(positions);
+    d["elapsed_s"] = elapsed_us / 1e6;
+    d["ns_per_position"] = (elapsed_us * 1000.0) / positions;
+    d["positions_per_second"] = positions / (elapsed_us / 1e6);
+    d["checksum"] = checksum;
+    return d;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(guofish_core, m) {
-    m.doc() = "GuoFish C++ core — C0 toolchain spike, C0b GIL contention probe, C1 movegen";
+    m.doc() = "GuoFish C++ core — C0 toolchain spike, C0b GIL contention probe, C1 movegen, C2 tokenizer";
+
+    m.attr("SEQ_LENGTH") = guofish::kSeqLength;
 
     // C1. std::invalid_argument is translated to ValueError by pybind11's stock
     // exception translator, so a bad FEN surfaces in Python as ValueError
@@ -536,6 +722,33 @@ PYBIND11_MODULE(guofish_core, m) {
           "(from, to, promotion) order. Castling is normalised away from "
           "chess-library's king-takes-rook encoding (e1h1 -> e1g1). Raises "
           "ValueError on a FEN that cannot be parsed or has no king.");
+
+    // C2. The 68-token encoding the v5 network was trained on.
+    m.def("tokens", &tokens, py::arg("fen"),
+          "The 68-token encoding of `fen` as an int32 NumPy array: 64 squares, side to "
+          "move, castling rights, en-passant target file, CLS. Byte-for-byte identical to "
+          "core.mctsv4.board_to_tokens. Index 66 reports the en-passant file whenever the "
+          "FEN carries one, whether or not the capture is playable. Raises ValueError on a "
+          "FEN python-chess would itself refuse.");
+
+    py::class_<TokenBatch>(m, "TokenBatch",
+                           "A C++-owned, 64-byte-aligned [capacity, 68] int32 buffer that FENs are "
+                           "tokenized directly into. view() aliases it with no copy.")
+        .def(py::init<std::size_t>(), py::arg("capacity"))
+        .def_property_readonly("capacity", &TokenBatch::capacity, "Rows in the buffer.")
+        .def("view", &TokenBatch::view,
+             "A zero-copy [capacity, 68] int32 NumPy view of the buffer. Slice it to the "
+             "rows fill() reported; a NumPy slice is itself a view.")
+        .def("fill", &TokenBatch::fill, py::arg("fens"), py::arg("row_offset") = 0,
+             "Tokenize an iterable of FENs into rows [row_offset, row_offset + n) and return n. "
+             "Releases the GIL while encoding. Raises ValueError if the FENs do not fit, or on "
+             "a FEN that cannot be parsed — in which case rows already written keep their new "
+             "contents.");
+
+    m.def("tokenize_bench", &tokenize_bench, py::arg("fens"), py::arg("repeats") = 1,
+          "Single-threaded tokenization throughput over `fens`, repeated `repeats` times. The "
+          "FENs are copied into C++ strings first and the timed region touches no Python "
+          "object, so this measures the encoder and not the language boundary.");
 
     m.def("ping", &ping, "Import health check; returns \"pong\".");
 

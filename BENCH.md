@@ -5,8 +5,8 @@ Accumulated performance numbers, one section per chunk.
 Machine for all numbers below: **Intel Core i5-12600K** (10 cores / 16 threads),
 Windows 11 Pro 26200. Linux figures are from WSL2 Ubuntu 24.04 on the same host.
 
-Reproduce with `python tools/bench_c0.py` and `python tools/bench_c0b.py`
-(see `README_BUILD.md`).
+Reproduce with `python tools/bench_c0.py`, `python tools/bench_c0b.py` and
+`python tools/bench_c2.py` (see `README_BUILD.md`).
 
 ---
 
@@ -305,3 +305,95 @@ resolution floor and the true value is somewhere at or below 100 ns; the 3.3 µs
 is comfortably resolved. Every number the gate depends on is ≥ 78 µs, i.e. ≥ 780
 ticks, so the gate verdict is not resolution-limited. Linux resolves everything
 with room to spare.
+
+---
+
+## C2 — Tokenization throughput
+
+What is measured: FEN string in, 68 `int32` tokens out — the encoding in
+`cpp/tokens.hpp`, which is the C++ replica of `core.mctsv4.board_to_tokens`.
+
+Corpus: all 100,000 FENs from `golden/tokens.npz`, best of 5 passes. Reproduce
+with `python tools/bench_c2.py [--python]`.
+
+Three rows, and they answer different questions:
+
+| row | what it includes | who pays it |
+|---|---|---|
+| `encoder` | the encoder only — FENs are copied into C++ strings before the timer starts and the timed region touches no Python object | the C5 search, where the positions are never Python objects to begin with |
+| `fill()` | `TokenBatch.fill(fens)` end to end: materialising the iterable, borrowing each `str`'s UTF-8 buffer, then encoding | a caller still driving the search from Python |
+| `python` | the reference, `board_to_tokens(chess.Board(fen))` | today's engine |
+
+### Windows / MSVC 19.51, Release, Python 3.13.7
+
+| path | positions/s | ns/position |
+|---|---:|---:|
+| encoder (`tokenize_bench`) | **3,678,645** | 271.8 |
+| batch (`TokenBatch.fill`) | 3,431,179 | 291.4 |
+| python (`board_to_tokens`) | 8,841 | 113,109.0 |
+
+### Linux / Clang 18.1.3, Release, Python 3.12.3 (WSL2)
+
+| path | positions/s | ns/position |
+|---|---:|---:|
+| encoder (`tokenize_bench`) | **4,227,148** | 236.6 |
+| batch (`TokenBatch.fill`) | 4,127,002 | 242.3 |
+
+The Python reference was not re-measured under WSL2; the ratio below uses the
+Windows figure, which is the production platform.
+
+### Gate verdict
+
+The C2 brief sets the target at **≥ 100x** the Python reference's ~10,200 pos/s,
+i.e. ≥ 1,020,000 pos/s.
+
+| baseline | encoder speedup | `fill()` speedup |
+|---|---:|---:|
+| 10,200 pos/s (quoted in the brief) | **360.7x** | 336.4x |
+| 8,841 pos/s (measured here, Windows) | **416.1x** | 388.1x |
+
+**PASS**, by 3.6x over the requirement against the brief's own baseline.
+
+Both baselines are given because they disagree, and the direction matters: this
+machine measures the reference *slower* than the brief quotes, which inflates
+the speedup. The 360.7x figure — the conservative one — is the number to carry
+forward.
+
+### Why the two C++ rows differ, and why the gap will close
+
+`fill()` runs 7% slower than the encoder on Windows and 2% slower on Linux. The
+difference is not tokenization; it is `PySequence_List` plus one
+`PyUnicode_AsUTF8AndSize` per element, paid once per batch at the language
+boundary. Two things follow:
+
+* It is a **fixed cost per FEN crossing the boundary**, not per token, so it does
+  not grow with the encoding.
+* By C5 it disappears entirely. The search's leaves are `chess::Board` objects in
+  C++; nothing round-trips through a Python `str`. The `encoder` row is the
+  figure that predicts the shipped engine, and `fill()` is what the transitional
+  Python-driven path sees.
+
+### What this buys the dispatcher
+
+At 3.7M pos/s a batch of 256 positions is tokenized in **70 µs**. Read that next
+to C0b: the *contended* GIL acquire wait alone is 78 µs p99 on Windows at the
+recommended switch interval. Tokenization is therefore not a term in the
+dispatcher's budget — it is already below the noise floor of the boundary
+crossing that surrounds it, and no further optimisation of it is worth spending.
+
+The relevant consequence for C5 is the reverse of the usual one: **the encoder is
+fast enough that it does not need to be cached.** The Python engine memoises
+token arrays per node; the C++ search can re-encode from the board every time it
+needs a batch row, which removes a cache, its invalidation, and the en-passant
+key collision class recorded against the Python side.
+
+### Measurement notes
+
+* Benchmarked on the **Release** build. `tools/bench_c2.py` prints `asan=` in its
+  header and warns loudly on a sanitizer build (README_BUILD.md, Benchmarks).
+* The harness asserts the CLS column is 40 across the filled buffer afterwards, so
+  a `fill()` that silently encoded nothing cannot post a good number.
+* `tokenize_bench` sums the whole scratch buffer inside the timed scope's tail and
+  returns the checksum, so the encoder cannot be optimised away as dead stores.
+* Each position is written to its own row rather than reusing one, so the working
+  set is 100,000 x 272 B rather than a single cache line.

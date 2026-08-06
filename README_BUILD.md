@@ -202,6 +202,8 @@ implementations (Global Rule 2). Results are transcribed into `BENCH.md`.
 | `python tools/bench_c0b.py --scale 4` | C0b tables: configurations A/B/C × batch {32, 256} |
 | `python tools/bench_c0b.py --sweep` | acquire wait vs `sys.setswitchinterval` — locates the regime change |
 | `python tools/bench_c0b.py --repeat 10` | gate stability: 10 × 2,000 samples of config C at batch 256 |
+| `python tools/bench_c2.py` | C2 table: tokenization throughput, encoder vs `TokenBatch.fill` |
+| `python tools/bench_c2.py --python` | as above, plus the `board_to_tokens` reference on this machine (imports torch) |
 
 On Linux, prefix with the build directory as usual:
 
@@ -212,8 +214,9 @@ PYTHONPATH="$HOME/build/gf-release" "$HOME/.venvs/guofish/bin/python" tools/benc
 **Benchmark on the Release build, not the ASan build.** Instrumentation roughly
 doubles the callback cost and materially widens the latency tail — enough to
 change how often the C0b gate's `max` criterion is met (see BENCH.md, "Gate
-stability"). `tools/bench_c0b.py` prints `asan=True/False` in its header so a
-mistake is visible in the output rather than silently transcribed.
+stability"). `tools/bench_c0b.py` and `tools/bench_c2.py` print `asan=True/False`
+in their headers so a mistake is visible in the output rather than silently
+transcribed; `bench_c2.py` additionally prints a warning banner.
 
 `tools/bench_c0b.py` imports its experiment from `tests/test_c0b_contention.py`
 rather than reimplementing it, so the published numbers and the asserted numbers
