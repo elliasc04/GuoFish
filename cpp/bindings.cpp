@@ -30,6 +30,7 @@
 // Vendored per Global Rule 7.
 #include <chess.hpp>
 
+#include "keys.hpp"
 #include "movegen.hpp"
 #include "tokens.hpp"
 
@@ -707,6 +708,121 @@ py::dict tokenize_bench(const py::object &fens, std::size_t repeats) {
     return d;
 }
 
+// ---------------------------------------------------------------------------
+// C3 — the two keys
+//
+// Both cross the boundary as plain Python ints. The strong typing this chunk is
+// about is a C++ property and cannot survive the trip: Python has no way to
+// reject `cache[rep_key(fen)]`. What protects the Python side instead is the
+// domain tag in each payload — the two keys for one position are never equal —
+// and the fact that no Python code in the engine will hold either once C7 owns
+// the cache. `key_type_separation()` below reports the compile-time facts so the
+// acceptance test can check them rather than take them on trust.
+// ---------------------------------------------------------------------------
+
+std::uint64_t nn_key(std::string_view fen) { return guofish::nn_key(fen).value; }
+
+std::uint64_t rep_key(std::string_view fen) { return guofish::rep_key(fen).value; }
+
+// Both keys for one FEN, so a caller that needs the pair pays for one parse.
+// This is also the shape C6/C7 will use internally.
+py::tuple keys(std::string_view fen) {
+    const guofish::ParsedFen parsed = guofish::parse_fen(fen);
+    return py::make_tuple(guofish::nn_key(parsed).value, guofish::rep_key(parsed).value);
+}
+
+// The batch path, mirroring TokenBatch.fill(): the FENs are materialised and
+// their UTF-8 buffers borrowed under the GIL, then the whole sweep runs with the
+// GIL released. 100k positions through the one-at-a-time entry point would spend
+// most of their time in pybind11's argument marshalling rather than in the keys.
+//
+// `which` selects the key rather than there being two near-identical functions,
+// because the expensive half — parse_fen — is shared, and a caller wanting both
+// should not parse twice.
+enum class WhichKeys { Nn, Rep, Both };
+
+py::array_t<std::uint64_t> key_batch(const py::object &fens, WhichKeys which) {
+    py::list items = materialize(fens);
+    const std::vector<std::string_view> views = borrow_utf8(items);
+
+    const auto rows = static_cast<py::ssize_t>(views.size());
+    const py::ssize_t cols = (which == WhichKeys::Both) ? 2 : 1;
+
+    py::array_t<std::uint64_t> out({rows, cols});
+    std::uint64_t *data = out.mutable_data();
+
+    {
+        // Touches no Python object: see borrow_utf8. `items` keeps every string
+        // alive on this frame for the duration.
+        py::gil_scoped_release released;
+        for (std::size_t i = 0; i < views.size(); ++i) {
+            const guofish::ParsedFen parsed = guofish::parse_fen(views[i]);
+            std::uint64_t *row = data + static_cast<std::size_t>(cols) * i;
+            switch (which) {
+                case WhichKeys::Nn:
+                    row[0] = guofish::nn_key(parsed).value;
+                    break;
+                case WhichKeys::Rep:
+                    row[0] = guofish::rep_key(parsed).value;
+                    break;
+                case WhichKeys::Both:
+                    row[0] = guofish::nn_key(parsed).value;
+                    row[1] = guofish::rep_key(parsed).value;
+                    break;
+            }
+        }
+    }
+
+    if (which == WhichKeys::Both) {
+        return out;
+    }
+    // A [n, 1] column is an awkward thing to compare against a golden list;
+    // reshape to [n]. This is a view, not a copy.
+    return out.reshape({rows});
+}
+
+py::array_t<std::uint64_t> nn_keys(const py::object &fens) { return key_batch(fens, WhichKeys::Nn); }
+
+py::array_t<std::uint64_t> rep_keys(const py::object &fens) { return key_batch(fens, WhichKeys::Rep); }
+
+py::array_t<std::uint64_t> key_pairs(const py::object &fens) { return key_batch(fens, WhichKeys::Both); }
+
+// What the compiler was able to prove about NNKey and RepKey while building this
+// module. Every value is a constant folded at compile time from <type_traits>,
+// not a runtime experiment — the C++ side already refuses to build if any of
+// them is wrong (see the static_asserts in cpp/keys.hpp). Exposing them lets
+// tests/test_c3_keys.py state acceptance criterion 3 as an assertion in the same
+// place as the rest of the suite, instead of as a claim about a build nobody
+// re-runs.
+py::dict key_type_separation() {
+    using guofish::NNKey;
+    using guofish::RepKey;
+    namespace gd = guofish::detail;
+
+    py::dict d;
+    d["nn_accepted_as_rep"] = std::is_invocable_v<decltype(gd::takes_rep_key), NNKey>;
+    d["rep_accepted_as_nn"] = std::is_invocable_v<decltype(gd::takes_nn_key), RepKey>;
+    d["nn_accepted_as_nn"] = std::is_invocable_v<decltype(gd::takes_nn_key), NNKey>;
+    d["rep_accepted_as_rep"] = std::is_invocable_v<decltype(gd::takes_rep_key), RepKey>;
+    d["nn_converts_to_rep"] = std::is_convertible_v<NNKey, RepKey>;
+    d["rep_converts_to_nn"] = std::is_convertible_v<RepKey, NNKey>;
+    d["nn_constructible_from_rep"] = std::is_constructible_v<NNKey, RepKey>;
+    d["rep_constructible_from_nn"] = std::is_constructible_v<RepKey, NNKey>;
+    d["nn_assignable_from_rep"] = std::is_assignable_v<NNKey &, RepKey>;
+    d["rep_assignable_from_nn"] = std::is_assignable_v<RepKey &, NNKey>;
+    d["uint64_converts_to_nn"] = std::is_convertible_v<std::uint64_t, NNKey>;
+    d["uint64_converts_to_rep"] = std::is_convertible_v<std::uint64_t, RepKey>;
+    d["nn_converts_to_uint64"] = std::is_convertible_v<NNKey, std::uint64_t>;
+    d["rep_converts_to_uint64"] = std::is_convertible_v<RepKey, std::uint64_t>;
+    d["nn_comparable_to_rep"] = gd::EqComparable<NNKey, RepKey>::value;
+    d["rep_comparable_to_nn"] = gd::EqComparable<RepKey, NNKey>::value;
+    d["nn_comparable_to_nn"] = gd::EqComparable<NNKey, NNKey>::value;
+    d["rep_comparable_to_rep"] = gd::EqComparable<RepKey, RepKey>::value;
+    d["nn_size"] = sizeof(NNKey);
+    d["rep_size"] = sizeof(RepKey);
+    return d;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(guofish_core, m) {
@@ -744,6 +860,49 @@ PYBIND11_MODULE(guofish_core, m) {
              "Releases the GIL while encoding. Raises ValueError if the FENs do not fit, or on "
              "a FEN that cannot be parsed — in which case rows already written keep their new "
              "contents.");
+
+    // C3. The magic bitboard tables `has_legal_en_passant` reads are filled by a
+    // dynamic initializer inside chess.hpp. It runs at load time, before any of
+    // this is reachable from Python, so this call is redundant today — it is
+    // here so that the dependency is stated by the module that has it, rather
+    // than inherited from an unrelated inline variable in another header. It is
+    // idempotent and costs 64 iterations once.
+    chess::attacks::initAttacks();
+
+    m.def("nn_key", &nn_key, py::arg("fen"),
+          "The NN cache key for `fen` as a uint64: FNV-1a over the 68-token encoding. Two "
+          "positions share a key exactly when they tokenize identically, which is the same "
+          "partition core.mctsv4.make_cache_key induces. Ignores the halfmove clock — the "
+          "network does not see it. Distinguishes any en-passant square the FEN carries, "
+          "whether or not the capture is playable.");
+
+    m.def("rep_key", &rep_key, py::arg("fen"),
+          "The repetition/draw key for `fen` as a uint64: FNV-1a over the fields of "
+          "python-chess's Board._transposition_key(). Counts an en-passant square only when "
+          "an en-passant capture is actually LEGAL — a different rule from nn_key's and from "
+          "Polyglot's, and the three disagree on real positions.");
+
+    m.def("keys", &keys, py::arg("fen"),
+          "(nn_key, rep_key) for `fen`, sharing one parse. Never equal: the two payloads "
+          "carry different domain tags, so a swapped key cannot compare equal by luck.");
+
+    m.def("nn_keys", &nn_keys, py::arg("fens"),
+          "nn_key over an iterable of FENs as a uint64 NumPy array. Releases the GIL for the "
+          "sweep.");
+
+    m.def("rep_keys", &rep_keys, py::arg("fens"),
+          "rep_key over an iterable of FENs as a uint64 NumPy array. Releases the GIL for the "
+          "sweep.");
+
+    m.def("key_pairs", &key_pairs, py::arg("fens"),
+          "Both keys over an iterable of FENs as an [n, 2] uint64 NumPy array (column 0 "
+          "nn_key, column 1 rep_key), parsing each FEN once.");
+
+    m.def("key_type_separation", &key_type_separation,
+          "Compile-time facts about the C++ NNKey/RepKey types, as <type_traits> answered "
+          "them while this module was built. Every 'accepted', 'converts', 'assignable' and "
+          "'comparable' entry crossing the two types must be False; the build itself fails "
+          "if one is not.");
 
     m.def("tokenize_bench", &tokenize_bench, py::arg("fens"), py::arg("repeats") = 1,
           "Single-threaded tokenization throughput over `fens`, repeated `repeats` times. The "

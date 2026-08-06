@@ -149,7 +149,13 @@ inline int lsb_index(Bitboard bb) {
 // ---------------------------------------------------------------------------
 
 // What one pass over the FEN's placement field produced: the 64 square tokens,
-// plus the bitboards the castling rules need.
+// plus a bitboard per piece type.
+//
+// C2 needs only `rooks` and `kings` (the castling rules); C3's `rep_key` needs
+// all six, because `Board._transposition_key()` is built from python-chess's
+// full set of piece bitboards. They are collected in the same pass rather than
+// re-derived from `square_token` later, so there is exactly one place where a
+// FEN character becomes a bit.
 //
 // `promoted` tracks the X-FEN "~" suffix. It exists for one reason: python-chess
 // excludes promoted kings from every castling test (`self.kings & ~self.promoted`),
@@ -161,11 +167,16 @@ struct Placement {
     std::int32_t square_token[64] = {};
     Bitboard occupied_white = 0;
     Bitboard occupied_black = 0;
+    Bitboard pawns = 0;
+    Bitboard knights = 0;
+    Bitboard bishops = 0;
     Bitboard rooks = 0;
+    Bitboard queens = 0;
     Bitboard kings = 0;
     Bitboard promoted = 0;
 
     Bitboard occupied_of(bool white) const { return white ? occupied_white : occupied_black; }
+    Bitboard occupied() const { return occupied_white | occupied_black; }
 };
 
 // python-chess's PIECE_SYMBOLS index: p=1, n=2, b=3, r=4, q=5, k=6. Returns 0
@@ -310,10 +321,29 @@ inline Placement parse_placement(std::string_view placement, std::string_view fe
         } else {
             out.occupied_black |= bit;
         }
-        if (piece_type == 4) {
-            out.rooks |= bit;
-        } else if (piece_type == 6) {
-            out.kings |= bit;
+        switch (piece_type) {
+            case 1:
+                out.pawns |= bit;
+                break;
+            case 2:
+                out.knights |= bit;
+                break;
+            case 3:
+                out.bishops |= bit;
+                break;
+            case 4:
+                out.rooks |= bit;
+                break;
+            case 5:
+                out.queens |= bit;
+                break;
+            default:
+                // piece_type_of() returns 1..6 or 0, and 0 was rejected above,
+                // so this is the king. Spelled as `default` rather than
+                // `case 6` so the switch is exhaustive without a fallthrough.
+                assert(piece_type == 6);
+                out.kings |= bit;
+                break;
         }
 
         ++square;
@@ -488,9 +518,11 @@ inline bool has_castling_right(Bitboard cleaned, const Placement &placement, boo
 // ep positions out of distribution.
 // ---------------------------------------------------------------------------
 
-inline std::int32_t en_passant_token(std::string_view ep, std::string_view fen) {
+// The ep field as a square index 0..63, or -1 for "-"/absent — python-chess's
+// `board.ep_square`, which is `None` or a square and nothing else.
+inline int en_passant_square(std::string_view ep, std::string_view fen) {
     if (ep.empty() || ep == "-") {
-        return kTokenEpNone;
+        return -1;
     }
 
     // python-chess resolves the field with `SQUARE_NAMES.index(ep_part)`, so
@@ -499,13 +531,116 @@ inline std::int32_t en_passant_token(std::string_view ep, std::string_view fen) 
         reject("invalid en passant field", fen);
     }
 
-    // Only the file reaches the network: chess::square_file(ep_square).
-    return kTokenEpBase + (ep[0] - 'a');
+    return (ep[1] - '1') * 8 + (ep[0] - 'a');
+}
+
+// ---------------------------------------------------------------------------
+// The parse
+// ---------------------------------------------------------------------------
+
+// Everything a FEN says that anything downstream reads, in python-chess's own
+// terms. C2 turns this into 68 tokens; C3's `rep_key` reads the piece bitboards,
+// the side to move, the cleaned castling rights and the raw ep square off the
+// same struct.
+//
+// Sharing the parse is the point. `nn_key` and `rep_key` are two different
+// summaries of one position, and the entire failure mode C3 exists to prevent
+// is the two disagreeing about what that position *is*. Two parsers could drift
+// apart on a castling edge case and produce two internally consistent keys for
+// different boards; one parser cannot.
+struct ParsedFen {
+    Placement placement;
+    bool white_to_move = true;
+    // python-chess's `clean_castling_rights()`: a bitboard of the ROOK squares
+    // whose rights survive, not a four-bit mask.
+    Bitboard castling = 0;
+    // The RAW ep square, verbatim from the FEN's fourth field. Whether a capture
+    // is available is a separate question with three different answers; see
+    // cpp/keys.hpp.
+    int ep_square = -1;
+};
+
+// Parse `fen`, or throw std::invalid_argument (ValueError in Python) on a FEN
+// python-chess would itself refuse.
+inline ParsedFen parse_fen(std::string_view fen) {
+    ParsedFen out;
+
+    std::string_view rest = fen;
+    const std::string_view placement_field = next_field(rest);
+    if (placement_field.empty()) {
+        reject("empty FEN", fen);
+    }
+
+    out.placement = parse_placement(placement_field, fen);
+
+    // python-chess defaults a missing side-to-move field to White.
+    const std::string_view turn_field = next_field(rest);
+    if (!turn_field.empty()) {
+        if (turn_field == "w") {
+            out.white_to_move = true;
+        } else if (turn_field == "b") {
+            out.white_to_move = false;
+        } else {
+            reject("expected 'w' or 'b' for the side-to-move field", fen);
+        }
+    }
+
+    const std::string_view castling_field = next_field(rest);
+    out.castling = clean_castling_rights(parse_castling_field(castling_field, out.placement, fen), out.placement);
+
+    out.ep_square = en_passant_square(next_field(rest), fen);
+
+    // The halfmove clock and fullmove number are consumed but not read: neither
+    // reaches the token encoding, neither is part of either key, and the v5
+    // network is blind to both. python-chess refuses a seventh field ("expected
+    // 6 parts"), so a FEN with trailing junk is refused here too rather than
+    // silently accepted.
+    next_field(rest);
+    next_field(rest);
+    if (!next_field(rest).empty()) {
+        reject("expected at most 6 space-separated fields in FEN", fen);
+    }
+
+    // python-chess does validate the clock and move number as integers, so a FEN
+    // with a non-numeric clock is accepted here and refused there. That is the
+    // one place this parser is knowingly laxer than the reference, and it is
+    // safe in the only direction that matters: no FEN the reference accepts is
+    // refused here, and no accepted FEN parses differently. See DECISIONS.md.
+    return out;
 }
 
 // ---------------------------------------------------------------------------
 // The entry point
 // ---------------------------------------------------------------------------
+
+// Write the 68 tokens for `parsed` into `out`, which must have room for
+// `kSeqLength` int32s.
+inline void tokenize_into(const ParsedFen &parsed, std::int32_t *out) {
+    assert(out != nullptr);
+
+    const Placement &placement = parsed.placement;
+
+    // Indices 0..63. Empty squares are 0, which parse_placement already left in
+    // place, so this is a straight copy of the 64 square tokens.
+    for (int square = 0; square < 64; ++square) {
+        out[square] = placement.square_token[square];
+    }
+
+    out[kIdxSideToMove] = parsed.white_to_move ? kTokenWhiteToMove : kTokenBlackToMove;
+
+    const int mask = (has_castling_right(parsed.castling, placement, true, true) ? kCastleWhiteKing : 0) |
+                     (has_castling_right(parsed.castling, placement, true, false) ? kCastleWhiteQueen : 0) |
+                     (has_castling_right(parsed.castling, placement, false, true) ? kCastleBlackKing : 0) |
+                     (has_castling_right(parsed.castling, placement, false, false) ? kCastleBlackQueen : 0);
+    out[kIdxCastling] = kTokenCastlingBase + mask;
+
+    // Index 66 is written from the RAW ep square — `board.ep_square is not
+    // None`, unconditionally. Only the file reaches the network.
+    out[kIdxEnPassant] =
+        parsed.ep_square < 0 ? kTokenEpNone : kTokenEpBase + static_cast<std::int32_t>(parsed.ep_square & 7);
+
+    out[kIdxCls] = kTokenCls;
+}
 
 // Write the 68 tokens for `fen` into `out`, which must have room for
 // `kSeqLength` int32s. Throws std::invalid_argument (ValueError in Python) on a
@@ -515,65 +650,7 @@ inline std::int32_t en_passant_token(std::string_view ep, std::string_view fen) 
 // the batch path needs so a whole [N, 68] buffer can be filled with no
 // per-position allocation and no intermediate copy.
 inline void tokenize_into(std::string_view fen, std::int32_t *out) {
-    assert(out != nullptr);
-
-    std::string_view rest = fen;
-    const std::string_view placement_field = next_field(rest);
-    if (placement_field.empty()) {
-        reject("empty FEN", fen);
-    }
-
-    const Placement placement = parse_placement(placement_field, fen);
-
-    // Indices 0..63. Empty squares are 0, which parse_placement already left in
-    // place, so this is a straight copy of the 64 square tokens.
-    for (int square = 0; square < 64; ++square) {
-        out[square] = placement.square_token[square];
-    }
-
-    // Index 64. python-chess defaults a missing side-to-move field to White.
-    const std::string_view turn_field = next_field(rest);
-    bool white_to_move = true;
-    if (!turn_field.empty()) {
-        if (turn_field == "w") {
-            white_to_move = true;
-        } else if (turn_field == "b") {
-            white_to_move = false;
-        } else {
-            reject("expected 'w' or 'b' for the side-to-move field", fen);
-        }
-    }
-    out[kIdxSideToMove] = white_to_move ? kTokenWhiteToMove : kTokenBlackToMove;
-
-    // Index 65.
-    const std::string_view castling_field = next_field(rest);
-    const Bitboard cleaned = clean_castling_rights(parse_castling_field(castling_field, placement, fen), placement);
-    const int mask = (has_castling_right(cleaned, placement, true, true) ? kCastleWhiteKing : 0) |
-                     (has_castling_right(cleaned, placement, true, false) ? kCastleWhiteQueen : 0) |
-                     (has_castling_right(cleaned, placement, false, true) ? kCastleBlackKing : 0) |
-                     (has_castling_right(cleaned, placement, false, false) ? kCastleBlackQueen : 0);
-    out[kIdxCastling] = kTokenCastlingBase + mask;
-
-    // Index 66.
-    out[kIdxEnPassant] = en_passant_token(next_field(rest), fen);
-
-    // The halfmove clock and fullmove number are consumed but not read; see
-    // below. python-chess refuses a seventh field ("expected 6 parts"), so a
-    // FEN with trailing junk is refused here too rather than silently encoded.
-    next_field(rest);
-    next_field(rest);
-    if (!next_field(rest).empty()) {
-        reject("expected at most 6 space-separated fields in FEN", fen);
-    }
-
-    // Index 67. The halfmove clock and fullmove number are deliberately not
-    // parsed: neither reaches the encoding, and the v5 network is blind to both.
-    // python-chess does validate them as integers, so a FEN with a non-numeric
-    // clock is accepted here and refused there. That is the one place this
-    // parser is knowingly laxer than the reference, and it is safe in the only
-    // direction that matters: no FEN the reference accepts is refused here, and
-    // no accepted FEN produces a different token. See DECISIONS.md.
-    out[kIdxCls] = kTokenCls;
+    tokenize_into(parse_fen(fen), out);
 }
 
 }  // namespace guofish

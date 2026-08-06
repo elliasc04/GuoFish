@@ -940,3 +940,480 @@ have been ~136 MB heavier. No leaked allocation's stack mentions `guofish_core`.
 No existing test file was modified. `tests/test_c2_tokens.py` is new; `git
 status` over `tests/` shows one untracked file and nothing else. `golden/` was
 not written to — see "Mutation check" for the before/after hash.
+
+---
+
+# C3 — Two keys, never mixed (2026-08-06) — golden data only
+
+This entry covers `tools/gen_key_golden.py` and the two files it writes,
+`golden/keys.jsonl` (100,000 positions, the shared C1 corpus) and
+`golden/keys_adversarial.jsonl` (22 constructed pairs). The C++ side of C3 is
+not written yet; the decisions here are the ones the C++ must conform to.
+
+## The one that needed a ruling: what `nn_key` actually is
+
+The chunk brief and the scope disagree, and the disagreement is not cosmetic.
+
+* **Chunk brief (C3):** "`nn_key(fen) -> uint64` — must reproduce the
+  **post-fix** Python key including the en-passant correction." The post-fix
+  Python key is `make_cache_key()`, which returns the *tuple*
+  `(chess.polyglot.zobrist_hash(board), board.ep_square)`.
+* **Scope §2.4:** `nn_key` is the "**hash of the 68-token sequence itself**",
+  and says so emphatically — "the key cannot be coarser than the network's
+  input if it *is* the network's input" — while explicitly noting this is "a
+  third convention distinct from both python-chess's polyglot hash and its
+  transposition key".
+
+**Chosen: scope §2.4, the token hash.** Reasons, in order of weight:
+
+1. The brief's own requirement is `-> uint64`, and `make_cache_key` is a tuple
+   with more entropy than 64 bits (a 64-bit hash plus a 65-valued ep field).
+   Any uint64 rendering of it is a *lossy* packing, invented here and recorded
+   nowhere else, that C++ would have to reproduce bit-for-bit from the golden
+   numbers alone. The token hash is uint64-native with nothing to invent.
+2. The brief's stated intent — "including the en-passant correction" — is
+   satisfied strictly *better* by the token hash. `make_cache_key` patches the
+   defect by appending the ep square to a hash that is coarser than the
+   network's input; hashing the tokens makes the defect unrepresentable, which
+   is the phrasing scope §2.4 uses and the outcome the brief is asking for.
+3. Both C3 acceptance criteria then hold by construction rather than by
+   argument. Clock-twins share an `nn_key` because the halfmove clock is not a
+   token; ep-twins never share one because token 66 is written from
+   `board.ep_square is not None` unconditionally.
+
+**Resolved 2026-08-06: there was no conflict.** The scope is right about the
+mechanism, the brief is right about the constraint; they only read as
+incompatible because the brief stated the constraint as *value* equality when
+what the cache depends on is *partition* equality. The two keys induce the same
+equivalence classes, so they are interchangeable for cache-hit behaviour and
+Gate 1 cannot tell them apart. The brief has been amended to say so, and
+`check_partition_matches_python()` now asserts it at generation time.
+
+The equivalence, since the argument decides the chunk:
+
+* **tokens equal ⟹ Python key equal.** Exact, no assumptions. Equal tokens fix
+  placement, side to move, the four castling flags and the ep *file*; the ep
+  *rank* is implied by side to move, so the raw ep square matches too — and
+  every input to the Zobrist is then equal.
+* **Python key equal ⟹ tokens equal.** Holds unless two distinct positions
+  collide in the 64-bit Zobrist.
+
+The asymmetry is worth knowing: only the Python key can be coarser, never ours.
+That is the same failure mode the ep correction was introduced to fix,
+surviving as a hash collision rather than as a rule. If this assertion ever
+trips, suspect Python's key, not the port's.
+
+Measured over the 100k corpus: 96,068 classes on each side, partitions
+identical.
+
+## The three en-passant rules
+
+The reason this chunk is dangerous, in one table. All three coexist, and each
+is correct for its own consumer:
+
+| rule | who uses it | ep square counts when |
+|---|---|---|
+| raw FEN field | token 66, therefore `nn_key` | a double push just happened, always |
+| legal capture | `_transposition_key()`, therefore `rep_key` | a *legal* ep capture exists |
+| pseudo-legal adjacency | `chess.polyglot.zobrist_hash` | a pawn stands beside it — "legality [...] is irrelevant", its own comment |
+
+The corpus holds 3,610 positions with an ep target, 3,203 of which have no
+legal capture, and **3** where all three rules give three different answers —
+the horizontal-pin positions carried as literals in the generator
+(`EP_PIN_1..3`). They are in the adversarial set for that reason.
+
+Consequences for the C++ side, both read off `chess.hpp` at the pinned revision:
+
+* `nn_key` must **not** be built on `chess::Board`. `setFenCommon()` runs
+  `isEpSquareValid()` and silently clears an ep square with no legal capture —
+  see the C2 entry, which is why `cpp/tokens.hpp` parses the FEN directly. Hash
+  C2's token buffer and this is already right.
+* `rep_key` **may** use `Board::enpassantSq()`, because `isEpSquareValid()` is a
+  full legality test — `checkMask`, both pin masks, and `generateEPMove`, which
+  handles the horizontal double-pawn pin explicitly (`chess.hpp` ~4085, with
+  the `7k/4p3/8/2KP3r/8/8/8/8 b - - 0 1` case in its comment). That it
+  coincides with `has_legal_en_passant()` is a fact about this pinned revision,
+  not a guarantee; the three `ep_pinned_*` pairs exist to catch it changing.
+
+## FNV-1a-64 over an explicit byte serialisation
+
+Chosen for both keys: offset basis `0xcbf29ce484222325`, prime
+`0x100000001b3`, over a payload that begins with a domain tag.
+
+*Alternatives:* reuse `chess.polyglot.zobrist_hash` for one or both (it is
+already there, and chess-library ships a Zobrist too); `std::hash` (not stable
+across implementations, so unusable for golden data); xxhash/wyhash (a new
+third-party dependency, Global Rule 7).
+
+*Why:* a Zobrist realisation of either rule has to **re-derive** the ep handling
+inside a 781-entry random table, which is precisely the silent divergence this
+chunk exists to prevent — and for `nn_key` it would have to be a Zobrist over
+tokens, a table nobody has. Hashing a byte string puts the rule in one readable
+place. FNV-1a is ~6 lines of dependency-free C++ and needs no shared table. It
+is not a strong hash, but it is not being asked to be one: no adversary, and 0
+collisions over 100,000 positions.
+
+`nn_key`'s payload is the byte image of the `int32[68]` buffer C2 already
+produces, so C++ hashes the buffer it is holding with no repacking.
+
+**The domain tags (`guofish/nn_key/v1\0`, `guofish/rep_key/v1\0`) are
+load-bearing.** They guarantee `nn_key(p) != rep_key(p)` for every position, so
+a swapped key can never coincidentally compare equal. That is the runtime
+complement to the strong typedefs the brief requires at compile time: the
+typedefs stop the mistake being written, the tags stop it being survivable if it
+ever is. Cost is 18 bytes per hash, once.
+
+## Two files, and a pair per line
+
+`golden/keys.jsonl` is `{fen, nn_key, rep_key}` per position. The adversarial
+set is a separate file with a *pair* per line, carrying `expect_nn` and
+`expect_rep` as `"same"`/`"differ"` alongside both members.
+
+*Alternative:* one flat file of positions with a `desc` string, as the previous
+draft declared. *Why not:* the pairs are the unit of meaning — the brief calls
+them "position *pairs* [that] will not occur adjacently in any corpus" — and a
+flat file forces `tests/test_c3_keys.py` to re-pair records by parsing `desc`
+and to hardcode which relation each pair is meant to prove. Both belong in the
+data. A test reading this file cannot mis-pair records and cannot disagree with
+the generator about what a pair means.
+
+## The generator refuses to emit data it cannot satisfy
+
+`--self-check` (default on) blocks the write unless, for every emitted record:
+the FEN is canonical; **both keys are recomputable from the stored FEN alone**;
+`nn_key != rep_key`; every declared pair relation actually holds; no FEN
+anywhere in either file maps to two different key values; and no two distinct
+payloads share a key.
+
+This is not defensive habit, it is the specific defect the previous draft had
+(below). A golden generator is the one program with no downstream check on it,
+so its self-consistency has to be its own responsibility.
+
+The last check distinguishes two things that look identical in the output:
+3,932 corpus positions share an `nn_key` with another, and every one of them is
+the *same board with a different clock* (the corpus is deduplicated on the full
+FEN, clocks included). Those must share a key. A genuine FNV collision would
+look the same in the file, so the check keeps a blake2b digest of each payload
+and aborts if two different payloads ever land on one key.
+
+## What the previous draft got wrong
+
+`tools/gen_key_golden.py` already existed and was rewritten, as in C0. Recorded
+because the draft's output was not merely imprecise — it was unsatisfiable, and
+it would have failed in a way that reads as a C++ bug.
+
+1. **It wrote `board.fen()`.** python-chess defaults to `en_passant="legal"`,
+   which omits the ep square unless a capture is available, while the keys were
+   computed from the raw `board.ep_square`. 3 of its 8 records did not survive a
+   FEN round trip, and two *pairs* collapsed onto identical FEN strings carrying
+   different `nn_key` values. No implementation can satisfy that file. It also
+   erased the ep-twin distinction that is the entire point of the pair.
+2. **`get_rep_key` returned a raw polyglot Zobrist**, with a docstring claiming
+   "Polyglot Zobrist natively follows the 'only if capturer present' rule".
+   Polyglot's rule is pseudo-legal adjacency; `_transposition_key()`'s is legal
+   capture. Wrong on all three horizontal-pin positions in the corpus.
+3. **No corpus.** 8 records against an acceptance criterion of 100k FENs, with a
+   comment saying the corpus was skipped "for brevity".
+4. **4 pairs, not ~20**, and the pair labelled "transposition" was not one:
+   `1.d4 Nf6 2.c4` and `1.c4 Nf6 2.d4` reach the same placement with *different*
+   ep files (c3 vs d3). It is a good adversarial case and is kept — as
+   `near_miss_ep_file`, with the relation it actually has.
+
+## Mutation check
+
+Per "How to tell whether a chunk actually passed", against the guards rather
+than an implementation, since there is no C++ yet:
+
+* `fen_of` reverted to python-chess's default (defect 1 above): caught on the
+  first pair — `ep_no_capturer.a: keys do not survive a FEN round trip`.
+* `nn_key` blinded to token 66 — the original ep cache-key defect, reintroduced:
+  the partition check catches it, but **only at full corpus size**. It passes
+  on the first 20,000 rows and fails somewhere before 50,000. The corpus holds
+  just 32 groups of positions that share placement, side and castling while
+  differing in the raw ep square, and a smoke run under `--limit` can easily
+  contain none of them. Two consequences: `--limit` runs do not certify this
+  property, and the constructed ep-twins are not redundant with the corpus —
+  they are the only coverage that does not depend on a 32-in-100,000 accident.
+* FNV truncated to 16 bits: the collision guard fires after 478 positions; to 24
+  bits, after 4,327. At 32 bits it does not fire in 60,000 positions, which is
+  correct — ~0.4 collisions are expected there. The guard tracks the birthday
+  bound rather than firing on anything unusual-looking.
+
+Independently validated by a checker that re-derives FNV, both payloads and all
+three ep rules from the scope text without importing the generator: 100,000 rows
+reproduced, corpus identical to `golden/movegen.jsonl` FEN-for-FEN and in order,
+and `nn_key` cross-checked against the committed `golden/tokens.npz` —
+100,000/100,000 agree, which ties the C2 and C3 artifacts to each other.
+
+## Not done
+
+* No `tests/test_c3_keys.py`. Writing the acceptance test is part of the C++
+  chunk; this was golden data only.
+* `rep_key` is a hash of `_transposition_key()`'s fields, not the tuple itself,
+  so it inherits a collision probability the Python engine does not have. At
+  100k entries that is ~2.7e-10, and the corpus shows none. If repetition
+  detection is ever seen misfiring, this is the first place to look.
+
+## Global Rule 1
+
+Nothing under `tests/` was touched. `golden/movegen.jsonl` and
+`golden/tokens.npz` were read and not modified; `golden/keys.jsonl` and
+`golden/keys_adversarial.jsonl` are new files, which is what this chunk's
+golden-data step is for. The generator refuses to overwrite either output unless
+`--force` is passed, so a later accidental re-run cannot regenerate committed
+golden data.
+
+---
+
+# C3 â€” Two keys, never mixed (2026-08-06) â€” the C++ side
+
+The entry above covers the golden data. This one covers `cpp/keys.hpp`, the
+bindings, `tests/test_c3_keys.py`, and the one change to `cpp/tokens.hpp`.
+
+## Acceptance criterion 1: the audit of `tools/gen_key_golden.py`
+
+Re-run independently rather than read. A checker was written that imports
+neither the generator nor anything from `cpp/`, re-deriving FNV-1a, both
+payloads and all three en-passant rules from the scope text and python-chess
+1.11.2 alone, so agreement is evidence rather than a tautology. It confirmed:
+
+| claim | result |
+|---|---|
+| `keys.jsonl` is the shared C1 corpus, same FENs in the same order | 100,000/100,000, identical to `golden/movegen.jsonl` |
+| every `nn_key` recomputes from `core.mctsv4.board_to_tokens` | 100,000/100,000 |
+| every `rep_key` recomputes from `_transposition_key()`'s fields | 100,000/100,000 |
+| `nn_key` partitions the corpus exactly as `make_cache_key` does | identical, 96,068 classes each â€” the figure the chunks doc quotes |
+| `nn_key != rep_key` everywhere (domain tags) | 100,000/100,000 |
+| every FEN is canonical (`en_passant="fen"`) and round-trips to its keys | clean, corpus and pairs |
+| no FEN maps to two different key pairs anywhere in the data | clean |
+| adversarial pairs | 22: 7 ep_twin, 5 clock_twin, 5 transposition, 5 near_miss |
+| every pair's declared relation actually holds | clean |
+
+En-passant census, which is the number that matters for this chunk: 3,610
+corpus positions carry an ep square under the **raw** rule, 407 under the
+**legal-capture** rule, 410 under **Polyglot's pseudo-legal adjacency**. The
+last two disagree on exactly 3 positions, and they are the three carried as
+`ep_pinned_1..3` in the adversarial file. Nothing in the generator needed
+changing and nothing was changed.
+
+The brief's `nn_key` wording ("derived from Polyglot Zobrist hashing plus raw
+en-passant square state") and the generator's mechanism (FNV-1a over the 68
+tokens) still read as a conflict in isolation. `docs/guofish_port_chunks.md`
+Â§C3 settles it explicitly â€” "**Mechanism:** scope Â§2.4 â€” a hash of the 68-token
+sequence itself â€¦ **Constraint:** *partition* equality with the post-fix Python
+`make_cache_key`, not value equality" â€” and that is what the generator does and
+what the audit verified. See the previous entry for the equivalence argument.
+
+## Strong key types
+
+`NNKey` and `RepKey` are distinct structs with one `std::uint64_t` member and an
+`explicit` constructor. Not `using NNKey = std::uint64_t;`, which the brief
+warns against and which is worth restating: an alias is the *same type*, so a
+repetition check handed a cache key compiles silently and is wrong only at
+runtime, which is the entire defect class this chunk exists to close.
+
+Rejected alternative: a single `template <class Tag> struct Key`. It gives the
+same separation in less code, and was not used because the two keys are not two
+instances of one idea â€” they answer different questions, and C6/C7 will want to
+hang different operations off them. Two named structs cost eight lines.
+
+What is asserted at compile time in `cpp/keys.hpp`, so that a build in which any
+of it is false does not produce a module:
+
+* `is_invocable_v<decltype(void(RepKey)), NNKey>` is false, and the same the
+  other way. This is acceptance criterion 3 stated in its own words.
+* neither converts to, is constructible from, or is assignable from the other;
+* neither converts to or from a bare `std::uint64_t` in either direction;
+* `nn == rep` does not compile â€” there is no heterogeneous `operator==`, so a
+  swapped key cannot even be *tested* â€” while `nn == nn` does;
+* `sizeof` is 8 and both are trivially copyable, i.e. the safety is free.
+
+`guofish_core.key_type_separation()` reports those same `<type_traits>` answers
+to Python so `tests/test_c3_keys.py` can assert them where someone is looking,
+rather than in a build log nobody re-reads. A compile-fail test that shells out
+to the compiler was considered and dropped: it would need the chess-library
+include path resolved at test time on both platforms, and it would prove nothing
+the static asserts do not already prove at every build.
+
+Deliberately **not** provided: a default constructor. A default-constructed key
+is a valid-looking key for no position. C7 will need one for hash-table slots
+and should add it then, with an explicit empty sentinel, rather than inherit a
+zero that means "the position whose payload hashed to the offset basis".
+
+## One parse, two keys (the `cpp/tokens.hpp` change)
+
+`tokenize_into()` used to walk the FEN itself. It now takes a `ParsedFen` â€” the
+placement bitboards, side to move, cleaned castling rights and raw ep square â€”
+produced by a new `parse_fen()`, and the old `string_view` overload is a
+one-line wrapper, so C2's behaviour is unchanged. `Placement` gained the four
+missing piece-type bitboards (`pawns`, `knights`, `bishops`, `queens`), filled
+in the same pass that was already filling `rooks` and `kings`.
+
+The alternative was a second parser in `keys.hpp` for `rep_key`'s fields. That
+is precisely the failure this chunk is about: two parsers can drift on a
+castling edge case and produce two internally consistent keys for two different
+boards, and every test here would still pass because each key would be
+self-consistent. There is now exactly one place where a FEN character becomes a
+bit. `rep_key`'s castling field is python-chess's `clean_castling_rights()`
+bitboard, which C2 already had to implement correctly for token 65.
+
+## The legal-en-passant rule: implemented, not delegated
+
+`rep_key` needs `has_legal_en_passant()`. Three ways to get it:
+
+1. **`Board::setFen()` then `enpassantSq() != NO_SQ`.** chess-library validates
+   the ep square on the way in via `isEpSquareValid`, which is a real legality
+   test â€” `checkMask`, both pin masks, and `generateEPMove`, which handles the
+   horizontal double-pawn pin explicitly and cites `7k/4p3/8/2KP3r/8/8/8/8` in a
+   comment. Five lines, and very nearly right.
+2. **Transcribe python-chess's decomposition** â€” `pin_mask`, `_ep_skewered`,
+   `_generate_evasions`. Faithful by construction, and a second movegen.
+3. **Compute the predicate the decomposition stands for** (chosen): apply
+   python-chess's three pseudo-legal conditions to bitboards, then for each
+   capturer build the post-capture occupancy and ask whether the mover's king is
+   attacked.
+
+(3) was chosen over (1) for two reasons. `isEpSquareValid` checks the horizontal
+skewer but not the **diagonal** one; python-chess checks both, with a comment
+saying the diagonal case "is not actually possible in a real game, because if
+the latest double pawn move covers a diagonal attack, then the other side would
+have been in check already". That is true of positions reached by legal play and
+not true of an arbitrary FEN handed to a public entry point, and `rep_key(fen)`
+is one. And (1) costs a full `setFen` â€” castling paths, Zobrist, ep validation â€”
+for a question that is a handful of bitboard operations, on a path C6 calls once
+per node; it also inherits `setFen`'s refusal of kingless boards, which C2 went
+out of its way to keep accepting.
+
+(3) over (2) because one occupancy-and-attack test *is* the predicate the pin
+masks and skewers decompose. Pins in every direction, both skewers, and the
+already-in-check case all fall out of it, in about fifteen lines, with nothing
+to keep in sync with python-chess's internal structure.
+
+Only `chess::attacks::bishop/rook/knight/king/pawn` are borrowed â€” pure
+functions of (square, occupancy) with no board state and no opinion about en
+passant. `chess::attacks::initAttacks()` is called from the module initialiser:
+it already runs at load time via a dynamic initialiser inside `chess.hpp`, so
+this is redundant today, and it is there so the dependency is stated by the code
+that has it rather than inherited from an unrelated inline variable.
+
+**Known boundary, stated because it is real.** On a FEN where the ep square is
+set but no enemy pawn stands on the square behind it, python-chess's answer is
+an artifact of its decomposition rather than a rule anyone wrote down, and this
+implementation may differ from it. No such FEN can arise from legal play, none
+is in the corpus, and both C6 and C7 feed this from positions reached by making
+moves. Reproducing python-chess's behaviour on inputs it has no defined
+behaviour for was judged not worth a second movegen. If `rep_key` is ever
+suspected on a hand-written FEN, this is the first thing to check.
+
+Verified rather than argued: all 100,000 corpus `rep_key`s match the reference
+value-exactly, including the 3,610 raw-ep positions, the 3,203 with no legal
+capture, and the 3 where Polyglot's rule disagrees with the legal one.
+
+## Byte order
+
+Both payloads are serialised a byte at a time, little-endian, rather than
+`memcpy`-ing the object representation of the token buffer or the bitboards. The
+golden payloads are defined as little-endian byte strings (`struct.pack("<...")`,
+`astype("<i4")`), and writing the byte order out removes the host's from the
+answer. FNV-1a is a byte-at-a-time loop regardless, so this costs nothing.
+
+## Python surface
+
+`nn_key(fen)` and `rep_key(fen)` return plain ints; `keys(fen)` returns both from
+one parse; `nn_keys`/`rep_keys`/`key_pairs` are the batched forms, which
+materialise the FENs and borrow their UTF-8 buffers under the GIL and then run
+the sweep with it released, exactly as `TokenBatch.fill()` does.
+
+The strong typing cannot cross the boundary â€” Python has no way to reject
+`cache[rep_key(fen)]` â€” and no attempt was made to fake it with wrapper classes,
+which would add a per-key allocation to buy a guarantee Python cannot enforce
+anyway. What protects the Python side is the domain tags: the two keys for one
+position are never equal, which `test_the_two_keys_never_coincide` checks over
+all 100k. After C7 owns the cache, no Python code holds either key at all.
+
+## Mutation check
+
+Golden mutations, run against copies in a scratch directory via the
+`GUOFISH_GOLDEN_KEYS` override so nothing under `golden/` is ever written
+(sha256 of `golden/keys.jsonl` confirmed identical before and after):
+
+* one `nn_key` bit flipped on a unique row â†’ `test_values_match_golden_exactly`
+  fails, naming row 7, its FEN, and both keys in hex.
+* one `nn_key` bit flipped on a row that *shares* its key with an earlier one â†’
+  the partition test fails too, and says which row the reference groups it with,
+  both FENs, and that the reference now has 96,069 classes where C++ has 96,068.
+* one `rep_key` bit flipped â†’ same, on the `rep` side.
+
+Implementation mutations â€” the historical defects, reintroduced on purpose,
+rebuilt and run:
+
+* **`nn_key` blinded to en-passant squares with no legal capture** (the original
+  cache defect, a key coarser than the network's own input): 7 tests fail,
+  including the partition test and the coverage test whose message names it.
+  C2's tokenizer tests stay green, correctly â€” the tokenizer was not touched.
+* **`rep_key` on the raw ep square** (nn_key's rule, misapplied): 7 tests fail.
+* **`rep_key` on Polyglot's pseudo-legal adjacency** (the third rule): 4 tests
+  fail â€” and **the partition test is not one of them**.
+
+That last result is the important one, and it changed what this suite asserts.
+The two rules disagree on 3 corpus positions, all of which are singletons in the
+partition, so relabelling them leaves the equivalence classes identical.
+**Partition equivalence over the corpus â€” the criterion the chunk brief names â€”
+is blind to a `rep_key` built on Polyglot's rule.** What catches it is the
+`ep_pinned_*` adversarial pairs and the value comparison. Two consequences worth
+carrying forward: the constructed pairs are not redundant with the 100k sweep,
+they are the only coverage of the defect the chunk is named after; and
+`test_values_match_golden_exactly` is kept even though the brief says value
+equality is "neither required nor sufficient", because it is the cheapest thing
+that fails when the partition test cannot. Its docstring says what to conclude
+if it is ever the only failure.
+
+## Build and sanitizers
+
+Warning-clean at `/W4` (MSVC 19.51) and `-Wall -Wextra` (Clang 18.1.3), on a
+forced full rebuild of the translation unit on both, with no pragmas and no
+`-Wno-*`. Full suite, 172 tests, green in four configurations:
+
+| toolchain | config | result |
+|---|---|---|
+| MSVC | Release | 172 passed in 15.42s |
+| MSVC | Debug + `/fsanitize=address`, asserts live | 172 passed in 97.81s |
+| Clang | Debug | 172 passed in 13.01s |
+| Clang | Debug + `-fsanitize=address,undefined`, asserts live | 172 passed in 22.52s |
+
+Under Clang ASan+UBSan: no non-leak sanitizer errors, no UBSan runtime errors,
+and no leaked allocation whose stack mentions `guofish_core` (the ~1.3 MB LSan
+reports is CPython's and numpy's interpreter-exit leakage, unchanged from C2 â€”
+see `build/asan-leakcheck.sh` for why it is answered this way rather than
+suppressed).
+
+`chess::Square(int)` and `generateEPMove` both assert on their preconditions, so
+the ASan/debug run is a real test of the ep path: an ep square on the wrong rank
+would abort rather than return a wrong answer. It cannot reach them â€” the
+capturer-rank filter returns first â€” but the assert in `has_legal_en_passant`
+that pins that reasoning is live in that build.
+
+## Not done
+
+* No compile-fail test that invokes the compiler; the static asserts cover the
+  same ground at every build. See above.
+* `rep_key` remains a 64-bit hash of `_transposition_key()`'s fields rather than
+  the tuple itself, so it carries a collision probability the Python engine does
+  not (~2.7e-10 at 100k entries; none in the corpus). Unchanged from the
+  golden-data entry, and still the first place to look if repetition detection
+  is ever seen misfiring.
+* Neither key is incremental. C6 and C7 call them per position from a FEN or a
+  `ParsedFen`. If that shows up in the C12 profile, an incremental update is
+  possible for `rep_key` â€” and would reintroduce exactly the re-derived-ep risk
+  this chunk was written to eliminate, so it should not be attempted without
+  re-running this suite against it.
+
+## Global Rule 1
+
+Nothing under `tests/` was modified: `tests/test_c3_keys.py` is a new file and
+`git status` over `tests/` shows one untracked file and nothing else. Nothing
+under `golden/` was written â€” the mutation check ran against copies in a scratch
+directory through an environment override, and the sha256 of
+`golden/keys.jsonl` is unchanged
+(`a901750f28aa37490ac96c2d1a321e80ad50a175f1eaa5010820b519642ca504`).
+`tools/gen_key_golden.py` was audited and not edited.
