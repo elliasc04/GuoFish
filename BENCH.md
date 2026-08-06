@@ -5,8 +5,8 @@ Accumulated performance numbers, one section per chunk.
 Machine for all numbers below: **Intel Core i5-12600K** (10 cores / 16 threads),
 Windows 11 Pro 26200. Linux figures are from WSL2 Ubuntu 24.04 on the same host.
 
-Reproduce with `python tools/bench_c0.py`, `python tools/bench_c0b.py` and
-`python tools/bench_c2.py` (see `README_BUILD.md`).
+Reproduce with `python tools/bench_c0.py`, `python tools/bench_c0b.py`,
+`python tools/bench_c2.py` and `python tools/bench_c4.py` (see `README_BUILD.md`).
 
 ---
 
@@ -397,3 +397,126 @@ key collision class recorded against the Python side.
   returns the checksum, so the encoder cannot be optimised away as dead stores.
 * Each position is written to its own row rather than reusing one, so the working
   set is 100,000 x 272 B rather than a single cache line.
+
+---
+
+## C4 — Sibling scan, Q32 vs double accumulator
+
+**This table is a design decision, not a measurement.** `value_sum` is a Q32
+fixed-point `atomic<int64>` in production, so every read of it during PUCT
+selection has to be converted back to a double. That conversion sits in the
+hottest loop in the engine — the scan of all ~32 siblings, once per node on
+every simulation's path. The chunk brief requires it decided here rather than in
+C12, because the fallback (a separate `float` array of Q values maintained on
+backup) is a second array to keep coherent, and retrofitting it after C9 is
+expensive.
+
+Reproduce with `python tools/bench_c4.py --trials 5 --sweep`.
+
+### What the loop does
+
+Reads `visit_count`, `value_sum` and `prior` for a contiguous block of 32
+siblings and reduces them to an argmax of `value_sum / visits + prior`. Both
+accumulators are filled with identical logical contents by the same LCG, both
+are warmed with an untimed pass, and both are scanned in the same call.
+
+It is deliberately **not** the PUCT formula — no cpuct, no `sqrt(parent visits)`,
+no virtual loss — because that arithmetic is out of C4's scope. The consequence
+is conservative in the right direction: the real loop does strictly more work per
+child, so the conversion's *share* of it is smaller than this table shows.
+
+Hot working set is 16 B/node (`atomic<int32>` + `atomic<int64>` + `float`), and
+it is **identical for both accumulators** — `atomic<double>` is also 8 bytes — so
+the two columns differ only in ALU work, never in memory traffic.
+
+### Windows / MSVC 19.51, Release, Python 3.13.7
+
+| working set | nodes | hot set | Q32 ns/scan | double ns/scan | Q32 ns/child | double ns/child | Q32 / double |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| L1 - one block | 32 | 512 B | 40.20 | 36.82 | 1.256 | 1.151 | 1.092x |
+| L1 - 2,048 nodes | 2,048 | 32 KB | 40.49 | 37.45 | 1.265 | 1.170 | 1.081x |
+| L2/L3 - 131k nodes | 131,072 | 2 MB | 84.93 | 80.44 | 2.654 | 2.514 | 1.056x |
+| RAM - 2.1M nodes | 2,097,152 | 32 MB | 89.35 | 85.22 | 2.792 | 2.663 | 1.048x |
+
+### Linux / Clang 18.1.3, Release, Python 3.12.3 (WSL2)
+
+| working set | nodes | hot set | Q32 ns/scan | double ns/scan | Q32 ns/child | double ns/child | Q32 / double |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| L1 - one block | 32 | 512 B | 35.70 | 34.47 | 1.116 | 1.077 | 1.036x |
+| L1 - 2,048 nodes | 2,048 | 32 KB | 35.48 | 34.70 | 1.109 | 1.084 | 1.022x |
+| L2/L3 - 131k nodes | 131,072 | 2 MB | 36.19 | 35.05 | 1.131 | 1.095 | 1.032x |
+| RAM - 2.1M nodes | 2,097,152 | 32 MB | 40.23 | 38.27 | 1.257 | 1.196 | 1.051x |
+
+### Verdict — Q32 stays in the hot path
+
+> C4 brief: *"if [the conversion] does not vanish into the loop, the fallback is
+> a separate float array updated on backup. Decide this here, not in C12."*
+
+**It effectively vanishes. Q32 stays; no separate Q array is built.**
+
+The row that decides it is the last one: at the scope's 2-3M node budget the scan
+is memory-bound and the conversion costs **4.8% on Windows and 5.1% on Linux** —
+one `cvtsi2sd` and one `mulsd` per child, mostly hidden behind the load latency
+the loop is already waiting on. In the L1-resident regime, where there is nothing
+to hide behind, it is still only 9.2% / 3.6%.
+
+Scale that against what it buys: a single `lock xadd` instead of a CAS retry loop
+whose retry rate climbs with thread count, on an accumulator every backup
+touches; and **associativity**, which makes multithreaded search bit-reproducible
+— a property the Python engine never had and which the original brief wrote off
+as permanently unreachable. A ~5% cost on one loop is not close to the price of
+giving that up.
+
+The rejected alternative is worth stating precisely, because it looks free: a
+parallel `float q[]` array updated on backup would remove the conversion but add
+a fourth stream to the scan (+4 B/node hot set, ~25% more memory traffic on the
+row that is already memory-bound), a second value that can disagree with
+`value_sum`, and a write on the backup path that has no atomic story. It is
+slower *and* less safe on the configuration that matters.
+
+### Where the two toolchains disagree, and why it does not change the answer
+
+MSVC's memory-bound row is 89 ns/scan against Clang's 40 ns — a 2.2x codegen gap
+that has nothing to do with the accumulator, since both columns move together.
+It is recorded because C12 will want to know that the scan has headroom on
+Windows specifically, and because a reader comparing the two tables would
+otherwise assume one of them is wrong. The *ratio*, which is what this section
+decides, agrees to within 4 points on every row.
+
+### Q32 conversion accuracy
+
+Not a benchmark, but it is the other half of the same decision — the conversion
+is only affordable if it is also exact enough to be uninteresting.
+
+Exhaustive sweep of **every IEEE-754 float bit pattern in [-1, 1], both signs**:
+2,130,706,434 values, 9.7 s on MSVC Release, 7.0 s on Clang Release.
+
+| property | result |
+|---|---|
+| max absolute round-trip error | 1.1641532e-10 = exactly 2^-33, half the Q32 tick |
+| largest value that is *not* bit-exact | 0.001953124884, i.e. the float just below 2^-9 |
+| Q32 -> double -> Q32 mismatches | 0 |
+| asymmetric roundings (`to_q32(-v) != -to_q32(v)`) | 0 |
+
+Every float at or above 2^-9 round-trips **bit-identically**, because at that
+magnitude a float's ulp is already 2^-32 or coarser. Below it the quantizer
+rounds, and never by more than half a tick. Against a network that emits bf16
+(8 mantissa bits) this is seven orders of magnitude finer than its own input.
+
+Overflow needs 2^31 = 2.1e9 visits at |v| = 1, against a 15k-sim budget.
+
+### Measurement notes
+
+* Benchmarked on **Release** builds. `tools/bench_c4.py` prints the compiler,
+  sanitizer and assert status in its header and warns loudly on a non-production
+  build.
+* `sibling_scan_bench` accumulates each block's argmax index and returns the
+  total as `checksum`; the harness rejects a zero checksum, so a scan whose reads
+  were optimised away cannot post a good number. The tool additionally requires
+  the checksum to be identical across trials.
+* Each configuration is run 5 times and the **median** reported.
+* One untimed warm pass per arena before timing, so the comparison is not a
+  measurement of which allocation happened to be paged in first.
+* Both arenas are filled by the same deterministic LCG (not `<random>`, whose
+  distributions are not pinned across implementations), so the two columns scan
+  identical logical trees.

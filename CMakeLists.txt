@@ -10,6 +10,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 option(GUOFISH_ASAN "Build with AddressSanitizer (plus UBSan on Clang/GCC)" OFF)
 
+# Which accumulator `guofish::DefaultArena` names — the one the engine will use.
+#
+# Both NodeArena<Q32Accumulator> and NodeArena<DoubleAccumulator> are compiled
+# and bound in EVERY build, so this switch cannot let one of them rot: it only
+# selects the default alias and the `guofish_core.NodeArena` name. `q32` is
+# production (associative, bit-reproducible under threads); `double` is the
+# Gate 1 equivalence build, which has to reproduce Python's float arithmetic.
+set(GUOFISH_VALUE_SUM "q32" CACHE STRING
+        "Accumulator for value_sum: q32 (production) or double (Gate 1 equivalence)")
+set_property(CACHE GUOFISH_VALUE_SUM PROPERTY STRINGS q32 double)
+if (NOT GUOFISH_VALUE_SUM STREQUAL "q32" AND NOT GUOFISH_VALUE_SUM STREQUAL "double")
+    message(FATAL_ERROR "GUOFISH_VALUE_SUM must be 'q32' or 'double', got '${GUOFISH_VALUE_SUM}'")
+endif ()
+
 # Where the importable extension lands. Defaults to the repo root so that
 # `import guofish_core` works with `pythonpath = .` from pytest.ini. Override it
 # to keep an out-of-tree build (see README_BUILD.md, WSL section).
@@ -96,12 +110,17 @@ FetchContent_MakeAvailable(chess_library)
 # ---------------------------------------------------------------------------
 pybind11_add_module(guofish_core
         cpp/bindings.cpp
+        cpp/arena.hpp
         cpp/keys.hpp
         cpp/movegen.hpp
         cpp/tokens.hpp
 )
 
 target_include_directories(guofish_core PRIVATE cpp/)
+
+if (GUOFISH_VALUE_SUM STREQUAL "double")
+    target_compile_definitions(guofish_core PRIVATE GUOFISH_VALUE_SUM_DOUBLE)
+endif ()
 
 # chess-library is third-party: SYSTEM keeps its headers from tripping /W4 and
 # -Wall -Wextra. This is not a warning suppression on our own code (Rule 4) —

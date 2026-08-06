@@ -30,16 +30,19 @@
 // Vendored per Global Rule 7.
 #include <chess.hpp>
 
+#include "arena.hpp"
 #include "keys.hpp"
 #include "movegen.hpp"
 #include "tokens.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
@@ -823,6 +826,512 @@ py::dict key_type_separation() {
     return d;
 }
 
+// ---------------------------------------------------------------------------
+// C4 — the SoA node arena
+//
+// The layout, the invariants and the two accumulators live in cpp/arena.hpp.
+// This section is the Python surface tests/test_c4_arena.py drives: allocate,
+// set and read every field, walk child ranges, and read back the two things
+// that are otherwise only visible to the compiler — where each array actually
+// landed in memory, and whether the atomics are lock-free.
+//
+// None of this is a search API. C5 will call NodeArena<> directly in C++; these
+// bindings exist so that a structural property can be asserted in the same
+// place as the rest of the suite instead of in a build log nobody re-reads.
+// ---------------------------------------------------------------------------
+
+// Reinterpreting a uint32 bit pattern as a float. std::memcpy rather than a
+// reinterpret_cast or a union, because it is the one spelling that is not
+// type-punning UB in C++17 and both compilers fold it to a register move.
+float float_from_bits(std::uint32_t bits) {
+    static_assert(sizeof(float) == sizeof(std::uint32_t), "unexpected float width");
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+std::string move_to_uci(std::uint16_t packed) {
+    const int from = guofish::move_from(packed);
+    const int to = guofish::move_to(packed);
+    std::string uci;
+    uci.reserve(5);
+    uci.push_back(static_cast<char>('a' + (from & 7)));
+    uci.push_back(static_cast<char>('1' + (from >> 3)));
+    uci.push_back(static_cast<char>('a' + (to & 7)));
+    uci.push_back(static_cast<char>('1' + (to >> 3)));
+    const char promo = guofish::promotion_letter(guofish::move_promotion(packed));
+    if (promo != '\0') {
+        uci.push_back(promo);
+    }
+    return uci;
+}
+
+std::uint16_t pack_move(int from, int to, int promo) {
+    if (promo < 0 || promo >= static_cast<int>(guofish::kPromotionCount)) {
+        throw py::value_error("guofish_core.pack_move: promotion code must be in [0, 5)");
+    }
+    return guofish::pack_move(from, to, static_cast<guofish::Promotion>(promo));
+}
+
+// Exhaustive float -> Q32 -> double round trip over the representable range.
+//
+// "Representable" means every IEEE-754 float bit pattern whose value lies in
+// [-1, 1], which is 2,130,706,434 of them counting both signs — the domain a
+// network value actually comes from. `stride` walks the positive bit patterns
+// in steps; stride 1 is the exhaustive sweep and anything larger is a sample
+// (the ASan build runs a strided sweep, since instrumentation makes the full
+// one take minutes rather than seconds).
+//
+// Three separate things are counted, because they fail differently:
+//
+//   max_abs_error       the criterion. Must not exceed half the Q32 resolution,
+//                       2^-33 = 1.164e-10, which is what "exact to 2.3e-10"
+//                       means for a round-to-nearest quantizer.
+//   inexact             floats that do not come back bit-identical. Every float
+//                       at or above 2^-9 has an ulp of at least 2^-32 and is
+//                       therefore *exactly* representable in Q32, so all of
+//                       these must be smaller than that — reported as
+//                       largest_inexact so the test can check the boundary
+//                       rather than just the count.
+//   code_mismatches     to_q32(from_q32(q)) != q for the codes this sweep
+//                       produced. Must be zero: from_q32 multiplies by a power
+//                       of two, which is exact in double for |q| <= 2^53, so
+//                       the value handed back to to_q32 is the integer q
+//                       itself. This is a proof rather than a measurement; the
+//                       counter is here to catch the proof's premises breaking.
+//
+// Also checked: to_q32(-v) == -to_q32(v) for every sampled v. Round-half-away-
+// from-zero is symmetric about zero, and an asymmetric quantizer would bias
+// every backup in one direction by half a tick.
+py::dict q32_roundtrip_sweep(std::uint32_t stride) {
+    if (stride == 0) {
+        throw py::value_error("guofish_core.q32_roundtrip_sweep: stride must be > 0");
+    }
+
+    // 0x3F800000 is 1.0f; bit patterns 0 .. 0x3F800000 are exactly the
+    // non-negative floats in [0, 1], denormals included.
+    constexpr std::uint32_t kOneBits = 0x3F800000u;
+
+    double max_abs_error = 0.0;
+    double max_error_at = 0.0;
+    std::uint64_t examined = 0;
+    std::uint64_t inexact = 0;
+    std::uint64_t code_mismatches = 0;
+    std::uint64_t asymmetric = 0;
+    double largest_inexact = 0.0;
+
+    {
+        py::gil_scoped_release released;
+        for (std::uint64_t b = 0; b <= kOneBits; b += stride) {
+            const float f = float_from_bits(static_cast<std::uint32_t>(b));
+            const double v = static_cast<double>(f);
+
+            const std::int64_t q = guofish::to_q32(v);
+            const double back = guofish::from_q32(q);
+            const double err = back > v ? back - v : v - back;
+
+            if (err > max_abs_error) {
+                max_abs_error = err;
+                max_error_at = v;
+            }
+            if (back != v) {
+                ++inexact;
+                if (v > largest_inexact) {
+                    largest_inexact = v;
+                }
+            }
+            if (guofish::to_q32(back) != q) {
+                ++code_mismatches;
+            }
+            if (guofish::to_q32(-v) != -q) {
+                ++asymmetric;
+            }
+            ++examined;
+        }
+    }
+
+    py::dict d;
+    d["stride"] = stride;
+    d["exhaustive"] = (stride == 1);
+    // Both signs: every sample above was checked at +v and -v.
+    d["floats_examined"] = examined * 2;
+    d["max_abs_error"] = max_abs_error;
+    d["max_error_at"] = max_error_at;
+    d["inexact"] = inexact * 2;
+    d["largest_inexact"] = largest_inexact;
+    d["code_mismatches"] = code_mismatches;
+    d["asymmetric"] = asymmetric;
+    d["resolution"] = guofish::kQ32Resolution;
+    d["half_resolution"] = guofish::kQ32Resolution * 0.5;
+    return d;
+}
+
+// The other direction, over Q32 codes rather than floats: q -> double -> q.
+//
+// This one cannot be exhaustive — [-2^32, 2^32] is 8.6e9 codes — so it walks
+// the range at `stride` and additionally pins every boundary code by hand. See
+// the note in q32_roundtrip_sweep about why the general case is a consequence
+// of the scale being a power of two rather than something a sweep establishes.
+py::dict q32_code_sweep(std::uint64_t stride) {
+    if (stride == 0) {
+        throw py::value_error("guofish_core.q32_code_sweep: stride must be > 0");
+    }
+
+    std::uint64_t examined = 0;
+    std::uint64_t mismatches = 0;
+    std::int64_t first_mismatch = 0;
+
+    {
+        py::gil_scoped_release released;
+        for (std::int64_t q = -guofish::kQ32One; q <= guofish::kQ32One;
+             q += static_cast<std::int64_t>(stride)) {
+            const double v = guofish::from_q32(q);
+            if (guofish::to_q32(v) != q) {
+                if (mismatches == 0) {
+                    first_mismatch = q;
+                }
+                ++mismatches;
+            }
+            ++examined;
+        }
+
+        // The edges, unconditionally: +-1.0, +-1 tick, 0, and the codes either
+        // side of them. A stride that steps over the extremes would otherwise
+        // certify the interior of a range whose ends are where clamping and
+        // saturation bugs live.
+        const std::int64_t edges[] = {
+            -guofish::kQ32One, -guofish::kQ32One + 1, -2, -1, 0, 1, 2,
+            guofish::kQ32One - 1, guofish::kQ32One,
+        };
+        for (std::int64_t q : edges) {
+            const double v = guofish::from_q32(q);
+            if (guofish::to_q32(v) != q) {
+                if (mismatches == 0) {
+                    first_mismatch = q;
+                }
+                ++mismatches;
+            }
+            ++examined;
+        }
+    }
+
+    py::dict d;
+    d["stride"] = stride;
+    d["codes_examined"] = examined;
+    d["mismatches"] = mismatches;
+    d["first_mismatch"] = first_mismatch;
+    d["q32_one"] = guofish::kQ32One;
+    return d;
+}
+
+// What the compiler proved about the arena's atomics while building this
+// module, plus the layout constants the SoA design is judged on. Every value is
+// folded at compile time; the build already fails if any is_always_lock_free
+// entry is false (see the static_asserts in cpp/arena.hpp).
+py::dict arena_layout() {
+    py::dict d;
+    d["int32_always_lock_free"] = std::atomic<std::int32_t>::is_always_lock_free;
+    d["int64_always_lock_free"] = std::atomic<std::int64_t>::is_always_lock_free;
+    d["uint8_always_lock_free"] = std::atomic<std::uint8_t>::is_always_lock_free;
+    d["uint32_always_lock_free"] = std::atomic<std::uint32_t>::is_always_lock_free;
+    d["double_always_lock_free"] = std::atomic<double>::is_always_lock_free;
+
+    d["sizeof_atomic_int32"] = sizeof(std::atomic<std::int32_t>);
+    d["sizeof_atomic_int64"] = sizeof(std::atomic<std::int64_t>);
+    d["sizeof_atomic_double"] = sizeof(std::atomic<double>);
+    d["sizeof_atomic_uint8"] = sizeof(std::atomic<std::uint8_t>);
+    d["alignof_atomic_int64"] = alignof(std::atomic<std::int64_t>);
+    d["alignof_atomic_double"] = alignof(std::atomic<double>);
+
+    d["bytes_per_node_q32"] = guofish::Q32Arena::bytes_per_node();
+    d["bytes_per_node_double"] = guofish::DoubleArena::bytes_per_node();
+    d["cache_line"] = guofish::kCacheLine;
+    d["default_accumulator"] = std::string(guofish::kDefaultAccumulator);
+    return d;
+}
+
+// The sibling scan, under both accumulators, over the same logical tree.
+//
+// This is the C4 design decision the chunk brief calls out: the Q32 -> double
+// conversion sits in the hottest read path in the engine, and if it does not
+// vanish into the loop the layout has to change now rather than in C12. The
+// loop reads exactly what PUCT selection reads — visit_count, value_sum and
+// prior for a contiguous block of siblings — and reduces them to an argmax so
+// the reads are observable and cannot be optimised away.
+//
+// It is deliberately NOT the PUCT formula (out of scope for this chunk): there
+// is no cpuct, no sqrt(parent visits) and no virtual loss. That makes the
+// per-child arithmetic *cheaper* than the real thing, so the conversion's share
+// of the loop is overstated here rather than flattered — the conservative
+// direction for a decision about whether it is affordable.
+template <class Arena>
+double scan_arena(const Arena &arena, std::size_t blocks, std::size_t block_size,
+                  std::size_t repeats, std::uint64_t &sink) {
+    using Acc = typename Arena::accumulator_type;
+
+    const std::atomic<std::int32_t> *visits = arena.visit_count_data();
+    const auto *values = arena.value_sum_data();
+    const float *priors = arena.prior_data();
+
+    std::uint64_t accumulated = 0;
+    const auto start = clock_type::now();
+
+    for (std::size_t r = 0; r < repeats; ++r) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::size_t base = b * block_size;
+            double best = -std::numeric_limits<double>::infinity();
+            std::size_t best_child = 0;
+
+            for (std::size_t k = 0; k < block_size; ++k) {
+                const std::int32_t n = visits[base + k].load(std::memory_order_relaxed);
+                const double sum = Acc::decode(values[base + k].load(std::memory_order_relaxed));
+                const double q = (n > 0) ? sum / static_cast<double>(n) : 0.0;
+                const double score = q + static_cast<double>(priors[base + k]);
+                if (score > best) {
+                    best = score;
+                    best_child = k;
+                }
+            }
+            accumulated += best_child;
+        }
+    }
+
+    const double elapsed_us = micros_between(start, clock_type::now());
+    sink += accumulated;
+    return elapsed_us;
+}
+
+// Deterministic filler so both arenas hold identical logical contents and the
+// two timings are comparable. A hand-rolled LCG rather than <random> because
+// the sequence has to be identical on MSVC and Clang, and the standard pins the
+// engines but not the distributions.
+template <class Arena>
+void fill_arena(Arena &arena, std::size_t nodes) {
+    const std::uint32_t first = arena.allocate(nodes);
+    assert(first == 0);
+    (void)first;
+
+    std::uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (std::size_t i = 0; i < nodes; ++i) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        const auto bits = static_cast<std::uint32_t>(rng >> 33);
+
+        // Visit counts spanning the range a real search produces, values in
+        // [-1, 1], priors in [0, 1).
+        const std::int32_t n = static_cast<std::int32_t>(bits % 4096);
+        const double v = static_cast<double>(bits % 2001) / 1000.0 - 1.0;
+        const float p = static_cast<float>(bits % 1024) / 1024.0f;
+
+        const auto idx = static_cast<std::uint32_t>(i);
+        arena.add_visits(idx, n);
+        arena.add_value(idx, v);
+        arena.set_prior(idx, p);
+    }
+}
+
+py::dict sibling_scan_bench(std::size_t blocks, std::size_t block_size, std::size_t repeats) {
+    if (blocks == 0 || block_size == 0 || repeats == 0) {
+        throw py::value_error(
+            "guofish_core.sibling_scan_bench: blocks, block_size and repeats must all be > 0");
+    }
+    const std::size_t nodes = blocks * block_size;
+    if (nodes / blocks != block_size) {
+        throw py::value_error("guofish_core.sibling_scan_bench: blocks * block_size overflows");
+    }
+
+    guofish::Q32Arena q32(nodes);
+    guofish::DoubleArena f64(nodes);
+    fill_arena(q32, nodes);
+    fill_arena(f64, nodes);
+
+    std::uint64_t sink = 0;
+    double q32_us = 0.0;
+    double f64_us = 0.0;
+
+    {
+        py::gil_scoped_release released;
+        // One untimed pass each so the comparison is not a measurement of which
+        // arena happened to be paged in first.
+        std::uint64_t warm = 0;
+        scan_arena(q32, blocks, block_size, 1, warm);
+        scan_arena(f64, blocks, block_size, 1, warm);
+        sink += warm;
+
+        q32_us = scan_arena(q32, blocks, block_size, repeats, sink);
+        f64_us = scan_arena(f64, blocks, block_size, repeats, sink);
+    }
+
+    const auto scans = static_cast<double>(blocks) * static_cast<double>(repeats);
+    const double children = scans * static_cast<double>(block_size);
+
+    py::dict d;
+    d["blocks"] = blocks;
+    d["block_size"] = block_size;
+    d["repeats"] = repeats;
+    d["nodes"] = nodes;
+    d["scans"] = static_cast<std::uint64_t>(scans);
+    // Bytes of the three scanned fields per node; what the working set is made
+    // of, and the number that decides whether this run is L1-resident.
+    d["hot_bytes_per_node_q32"] =
+        sizeof(std::atomic<std::int32_t>) + sizeof(std::atomic<std::int64_t>) + sizeof(float);
+    d["hot_bytes_per_node_double"] =
+        sizeof(std::atomic<std::int32_t>) + sizeof(std::atomic<double>) + sizeof(float);
+    d["q32_ns_per_scan"] = q32_us * 1000.0 / scans;
+    d["double_ns_per_scan"] = f64_us * 1000.0 / scans;
+    d["q32_ns_per_child"] = q32_us * 1000.0 / children;
+    d["double_ns_per_child"] = f64_us * 1000.0 / children;
+    d["q32_total_s"] = q32_us / 1e6;
+    d["double_total_s"] = f64_us / 1e6;
+    d["q32_over_double"] = f64_us > 0.0 ? q32_us / f64_us : 0.0;
+    d["checksum"] = sink;
+    return d;
+}
+
+// Bind one NodeArena instantiation. Called twice, so the Q32 and double arenas
+// have identical Python surfaces and a test can drive both through the same
+// code path — which is what "both accumulator builds are exercised by tests"
+// requires, and what an #ifdef alone would not give.
+template <class Acc>
+void bind_arena(py::module_ &m, const char *name, const char *doc) {
+    using Arena = guofish::NodeArena<Acc>;
+
+    py::class_<Arena>(m, name, doc)
+        .def(py::init<std::size_t>(), py::arg("capacity"))
+        .def_property_readonly("capacity", &Arena::capacity, "Nodes this arena can ever hold.")
+        .def_property_readonly("size", &Arena::size, "Nodes allocated so far.")
+        .def_property_readonly_static(
+            "accumulator", [](const py::object &) { return std::string(Acc::name()); },
+            "\"q32\" or \"double\" — which representation value_sum is stored in.")
+        .def_property_readonly_static(
+            "bytes_per_node", [](const py::object &) { return Arena::bytes_per_node(); },
+            "Sum of the per-node field widths. There is no node struct; this is what one "
+            "would cost if there were.")
+
+        .def("allocate", &Arena::allocate, py::arg("count"),
+             "Claim `count` consecutive nodes and return the index of the first. The block is "
+             "reset to a clean unexpanded state first. Raises RuntimeError if the arena is "
+             "exhausted.")
+        .def(
+            "try_allocate",
+            [](Arena &self, std::size_t count) -> py::object {
+                const std::uint32_t first = self.try_allocate(count);
+                if (first == guofish::kNoNode) {
+                    return py::none();
+                }
+                return py::cast(first);
+            },
+            py::arg("count"),
+            "As allocate(), but returns None instead of raising when the arena is full. This "
+            "is the form the search uses.")
+        .def("reset", &Arena::reset,
+             "Drop every allocation. O(1) — the storage is cleared by allocate(), not here.")
+
+        .def("visit_count", &Arena::visit_count, py::arg("index"))
+        .def("value_sum", &Arena::value_sum, py::arg("index"),
+             "value_sum as a double, decoded from whatever the accumulator stores.")
+        .def("value_sum_raw", &Arena::value_sum_raw, py::arg("index"),
+             "value_sum in the accumulator's own representation: the Q32 integer under the "
+             "fixed-point accumulator, the same double under the floating-point one.")
+        .def("vloss_count", &Arena::vloss_count, py::arg("index"))
+        .def("prior", &Arena::prior, py::arg("index"))
+        .def("move", &Arena::move, py::arg("index"))
+        .def("children_offset", &Arena::children_offset, py::arg("index"))
+        .def("children_count", &Arena::children_count, py::arg("index"))
+        .def("terminal_value", &Arena::terminal_value, py::arg("index"))
+
+        .def("state", &Arena::state_bits, py::arg("index"),
+             "The raw state byte: lifecycle in the low two bits, TERMINAL_BIT in the high one.")
+        .def(
+            "lifecycle",
+            [](const Arena &self, std::uint32_t i) {
+                return static_cast<std::uint8_t>(self.lifecycle(i));
+            },
+            py::arg("index"), "STATE_UNEXPANDED, STATE_PENDING or STATE_EXPANDED.")
+        .def("is_terminal", &Arena::is_terminal, py::arg("index"))
+        .def(
+            "is_expanded",
+            [](const Arena &self, std::uint32_t i) {
+                return self.lifecycle(i) == guofish::NodeState::Expanded;
+            },
+            py::arg("index"))
+
+        .def("set_prior", &Arena::set_prior, py::arg("index"), py::arg("prior"))
+        .def("set_move", &Arena::set_move, py::arg("index"), py::arg("packed_move"),
+             "Store a packed move. The field is a raw uint16; use pack_move() to build one.")
+        .def("add_visits", &Arena::add_visits, py::arg("index"), py::arg("delta"))
+        .def("add_value", &Arena::add_value, py::arg("index"), py::arg("value"),
+             "Add a value in [-1, 1] to the accumulator: one lock xadd under Q32, a CAS loop "
+             "under double.")
+        .def("add_value_raw", &Arena::add_value_raw, py::arg("index"), py::arg("raw"),
+             "Add a quantity already in the accumulator's representation, so a test can put an "
+             "exact Q32 integer in without going through the conversion it is testing.")
+        .def("add_vloss", &Arena::add_vloss, py::arg("index"), py::arg("delta"))
+
+        .def("try_claim_pending", &Arena::try_claim_pending, py::arg("index"),
+             "CAS UNEXPANDED -> PENDING. False means another thread claimed this leaf first.")
+        .def("release_pending", &Arena::release_pending, py::arg("index"),
+             "PENDING -> UNEXPANDED. Raises RuntimeError if the node is not pending.")
+        .def("set_children", &Arena::set_children, py::arg("index"), py::arg("offset"),
+             py::arg("count"),
+             "Publish a child range and mark the node expanded. Raises ValueError on a count of "
+             "zero — an expanded node with no children is the bestmove 0000 defect and is not "
+             "representable here — IndexError if the range leaves the allocated region, and "
+             "RuntimeError if the node is terminal or already expanded.")
+        .def("mark_terminal", &Arena::mark_terminal, py::arg("index"), py::arg("value"),
+             "Set the TERMINAL bit and record the game result. Raises RuntimeError if the node "
+             "already has children.")
+
+        .def("child", &Arena::child, py::arg("index"), py::arg("k"),
+             "The arena index of the k-th child. Raises IndexError past children_count.")
+        .def(
+            "children",
+            [](const Arena &self, std::uint32_t i) {
+                return py::make_tuple(self.children_offset(i), self.children_count(i));
+            },
+            py::arg("index"), "(children_offset, children_count).")
+        .def(
+            "children_indices",
+            [](const Arena &self, std::uint32_t i) {
+                const std::uint16_t count = self.children_count(i);
+                py::list out;
+                for (std::uint16_t k = 0; k < count; ++k) {
+                    out.append(self.child(i, k));
+                }
+                return out;
+            },
+            py::arg("index"), "Every child index, in order. Empty for an unexpanded node.")
+
+        .def(
+            "array_info",
+            [](const Arena &self) {
+                py::list out;
+                self.for_each_array([&out](const typename Arena::ArrayInfo &info) {
+                    py::dict d;
+                    d["field"] = std::string(info.field);
+                    d["element_type"] = std::string(info.element_type);
+                    d["address"] = info.address;
+                    d["element_size"] = info.element_size;
+                    d["element_align"] = info.element_align;
+                    d["requested_align"] = info.requested_align;
+                    d["naturally_aligned"] = info.naturally_aligned;
+                    d["cache_line_aligned"] = info.cache_line_aligned;
+                    out.append(d);
+                });
+                return out;
+            },
+            "One entry per SoA array, in layout order: where it landed in memory and whether "
+            "that address satisfies its element's alignment. The runtime half of the guarantee "
+            "the static_asserts start — and unlike assert(), this is live in a Release build.");
+    // Deliberately no per-object `is_lock_free()` accessor. It would report
+    // nothing new — the standard says is_always_lock_free is true only if every
+    // object of the type is lock-free, and the static_asserts already require
+    // that — and on libstdc++ it is an out-of-line call to
+    // __atomic_is_lock_free, which lives in libatomic and is not linked by
+    // default. The Clang build failed to import with an undefined symbol. See
+    // DECISIONS.md; the property is covered by arena_layout() plus the
+    // alignment entries above.
+}
+
 }  // namespace
 
 PYBIND11_MODULE(guofish_core, m) {
@@ -903,6 +1412,113 @@ PYBIND11_MODULE(guofish_core, m) {
           "them while this module was built. Every 'accepted', 'converts', 'assignable' and "
           "'comparable' entry crossing the two types must be False; the build itself fails "
           "if one is not.");
+
+    // -----------------------------------------------------------------------
+    // C4 — the SoA node arena.
+    // -----------------------------------------------------------------------
+
+    m.attr("Q32_SCALE") = guofish::kQ32Scale;
+    m.attr("Q32_ONE") = guofish::kQ32One;
+    m.attr("Q32_RESOLUTION") = guofish::kQ32Resolution;
+    m.attr("CACHE_LINE") = guofish::kCacheLine;
+    m.attr("NO_NODE") = guofish::kNoNode;
+    m.attr("NO_MOVE") = guofish::kNoMove;
+    m.attr("DEFAULT_ACCUMULATOR") = std::string(guofish::kDefaultAccumulator);
+
+    m.attr("STATE_UNEXPANDED") = static_cast<std::uint8_t>(guofish::NodeState::Unexpanded);
+    m.attr("STATE_PENDING") = static_cast<std::uint8_t>(guofish::NodeState::Pending);
+    m.attr("STATE_EXPANDED") = static_cast<std::uint8_t>(guofish::NodeState::Expanded);
+    m.attr("STATE_LIFECYCLE_MASK") = guofish::kLifecycleMask;
+    m.attr("TERMINAL_BIT") = guofish::kTerminalBit;
+
+    // Alphabetical by UCI letter, not by piece value: canonical move order is
+    // the byte order of the UCI string, so b < n < q < r, and None is 0 so a
+    // four-character move sorts before any promotion of the same from/to.
+    m.attr("PROMO_NONE") = static_cast<std::uint16_t>(guofish::Promotion::None);
+    m.attr("PROMO_BISHOP") = static_cast<std::uint16_t>(guofish::Promotion::Bishop);
+    m.attr("PROMO_KNIGHT") = static_cast<std::uint16_t>(guofish::Promotion::Knight);
+    m.attr("PROMO_QUEEN") = static_cast<std::uint16_t>(guofish::Promotion::Queen);
+    m.attr("PROMO_ROOK") = static_cast<std::uint16_t>(guofish::Promotion::Rook);
+
+    m.def(
+        "q32_from_float", [](double v) { return guofish::to_q32(v); }, py::arg("value"),
+        "A value in [-1, 1] as a Q32 fixed-point integer, rounding half away from zero. "
+        "Outside that range the debug build asserts; the domain is a network value, not a sum.");
+
+    m.def(
+        "q32_to_float", [](std::int64_t q) { return guofish::from_q32(q); }, py::arg("q"),
+        "A Q32 integer back as a double. Exact for |q| <= 2^53, which is every value and every "
+        "sum below 2.1M visits at full magnitude.");
+
+    m.def("q32_roundtrip_sweep", &q32_roundtrip_sweep, py::arg("stride") = 1,
+          "float -> Q32 -> double over every IEEE-754 float bit pattern in [-1, 1] (both signs) "
+          "at the given stride; stride 1 is the exhaustive sweep of all 2,130,706,434 of them. "
+          "Reports the largest absolute round-trip error, how many values are not bit-exact and "
+          "the largest of those, and whether the quantizer is symmetric about zero.");
+
+    m.def("q32_code_sweep", &q32_code_sweep, py::arg("stride") = 4099,
+          "Q32 -> double -> Q32 over the code range [-2^32, 2^32] at the given stride, plus "
+          "every boundary code unconditionally. Must report zero mismatches.");
+
+    m.def("arena_layout", &arena_layout,
+          "Compile-time facts about the arena's atomics and per-node widths, as the compiler "
+          "answered them while building this module. Every '*_always_lock_free' entry must be "
+          "True; the build fails if one is not.");
+
+    m.def("pack_move", &pack_move, py::arg("from_square"), py::arg("to_square"),
+          py::arg("promotion") = 0,
+          "Pack (from, to, promotion) into the uint16 the arena's move field holds: "
+          "from << 10 | to << 4 | promo, with squares numbered rank * 8 + file.");
+
+    m.def(
+        "move_from", [](std::uint16_t p) { return guofish::move_from(p); }, py::arg("packed_move"));
+    m.def(
+        "move_to", [](std::uint16_t p) { return guofish::move_to(p); }, py::arg("packed_move"));
+    m.def(
+        "move_promotion",
+        [](std::uint16_t p) { return static_cast<std::uint16_t>(guofish::move_promotion(p)); },
+        py::arg("packed_move"));
+
+    m.def(
+        "canonical_move_key", [](std::uint16_t p) { return guofish::canonical_move_key(p); },
+        py::arg("packed_move"),
+        "A uint16 whose integer order is exactly the byte order of the move's UCI string, i.e. "
+        "C1's canonical (from, to, promotion) order. Sorting packed moves directly does NOT "
+        "give that order — square indices are rank-major and UCI is file-major — and because "
+        "PUCT breaks ties by child order, getting it wrong makes C++ and Python explore "
+        "different moves at equal priors rather than failing loudly.");
+
+    m.def("move_to_uci", &move_to_uci, py::arg("packed_move"),
+          "A packed move as its UCI string. No castling normalisation: that is a property of a "
+          "generated move and belongs at the movegen boundary (C1), not in the packing.");
+
+    bind_arena<guofish::Q32Accumulator>(
+        m, "NodeArenaQ32",
+        "The production node arena: struct-of-arrays, value_sum in Q32 fixed-point "
+        "atomic<int64>. Integer addition is associative, so multithreaded backup is "
+        "bit-reproducible.");
+
+    bind_arena<guofish::DoubleAccumulator>(
+        m, "NodeArenaDouble",
+        "The Gate 1 equivalence arena: identical layout, value_sum in atomic<double> so C++ "
+        "reproduces Python's float arithmetic exactly. Addition is a CAS loop and is not "
+        "associative.");
+
+    // Which one this build's engine uses. Both classes exist in every build so
+    // neither can rot behind an #ifdef; this alias is what GUOFISH_VALUE_SUM
+    // switches.
+#if defined(GUOFISH_VALUE_SUM_DOUBLE)
+    m.attr("NodeArena") = m.attr("NodeArenaDouble");
+#else
+    m.attr("NodeArena") = m.attr("NodeArenaQ32");
+#endif
+
+    m.def("sibling_scan_bench", &sibling_scan_bench, py::arg("blocks"), py::arg("block_size") = 32,
+          py::arg("repeats") = 1,
+          "Time the PUCT-shaped sibling scan — visit_count, value_sum and prior over a "
+          "contiguous block of siblings — under both accumulators over identical data. The "
+          "number this exists to produce is q32_over_double: whether the Q32 to double "
+          "conversion disappears into the loop.");
 
     m.def("tokenize_bench", &tokenize_bench, py::arg("fens"), py::arg("repeats") = 1,
           "Single-threaded tokenization throughput over `fens`, repeated `repeats` times. The "

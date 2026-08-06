@@ -1417,3 +1417,354 @@ directory through an environment override, and the sha256 of
 `golden/keys.jsonl` is unchanged
 (`a901750f28aa37490ac96c2d1a321e80ad50a175f1eaa5010820b519642ca504`).
 `tools/gen_key_golden.py` was audited and not edited.
+
+---
+
+# C4 — Arena and node storage (2026-08-06)
+
+`cpp/arena.hpp` holds the layout, the Q32 helpers, the packed-move encoding and
+the `NodeArena<Accumulator>` template; `cpp/bindings.cpp` binds it for
+`tests/test_c4_arena.py`. There is no golden data for this chunk and there could
+not be — what C4 delivers is a shape, not an answer — so the acceptance is a set
+of structural properties plus one exhaustive numeric sweep.
+
+## The decision the chunk was run to make: Q32 stays in the hot path
+
+The brief says to decide here, not in C12, whether the Q32 -> double conversion
+is affordable inside the sibling scan. **It is: 4.8% on Windows and 5.1% on
+Linux at the 2.1M-node working set the scope budgets, 9.2% / 3.6% L1-resident.**
+Full tables and the rejected alternative are in BENCH.md; the short version is
+that a parallel `float q[]` array would remove one `cvtsi2sd`+`mulsd` per child
+and pay for it with a fourth stream in the scan (+25% memory traffic on the row
+that is already memory-bound), a second value that can disagree with
+`value_sum`, and a write on the backup path with no atomic story. It is slower
+*and* less safe on the configuration that matters.
+
+Two things about the benchmark that decide how much to trust it:
+
+* **The loop is deliberately cheaper than real PUCT** — no cpuct, no
+  `sqrt(parent visits)`, no virtual loss, because that arithmetic is C5's. The
+  real loop does strictly more work per child, so the conversion's share of it
+  is *smaller* than the table shows. Conservative in the right direction.
+* **The hot working set is byte-identical between the two accumulators**
+  (`atomic<double>` is also 8 bytes), so the columns differ only in ALU work.
+  Had the double arena been narrower, the comparison would have been measuring
+  cache behaviour and calling it conversion cost.
+
+MSVC's memory-bound row is 2.2x slower than Clang's (89 vs 40 ns/scan) with both
+columns moving together, so it is a codegen difference rather than an
+accumulator one. Recorded in BENCH.md rather than chased: it does not change the
+ratio, and C12 is where scan codegen becomes worth attacking.
+
+## What Q32 actually is, and why the scale is a power of two
+
+`v * 2^32`, rounded, in an `int64`. The scale is not tuning:
+
+* `q * 2^-32` only changes a double's exponent, so it is **exact** for every
+  |q| <= 2^53. The int -> double -> int round trip is therefore exact by
+  construction over the whole code range, not merely measured to be.
+* Resolution 2^-32 = 2.3283e-10, against a network emitting bf16 with 8 mantissa
+  bits — seven orders finer than its own input.
+* Overflow at 2^31 = 2.1e9 visits of magnitude 1, against a 15k-sim budget.
+
+**Rounding is `std::llround`, i.e. half away from zero.** Chosen over truncation
+and over `rint`'s half-to-even because the standard pins it, both toolchains
+implement it identically, and it is symmetric about zero — an asymmetric
+quantizer would bias every backup in one direction by half a tick. Ties are
+reachable, not theoretical: a float in [2^-10, 2^-9) has an ulp of 2^-33, so
+`v * 2^32` lands exactly on k + 0.5 for half of them.
+
+The obvious faster spelling — `(int64)(v * scale + copysign(0.5, v))` — is
+exactly equivalent on this domain (|scaled| <= 2^32, so `x + 0.5` is exact) and
+was not used. `to_q32` is called once per backup, not once per child in the
+scan, so it is not on the path the benchmark above measures, and correctness
+that is obvious beats correctness that requires the preceding sentence.
+
+### "Exhaustive" means every float, and that needed defining
+
+The brief asks for "exhaustive round-trip tests across the representable range
+[-1.0, 1.0]". Two ranges could be meant and they are not the same size:
+
+* **every `float` in [-1, 1]** — 2,130,706,434 bit patterns, denormals included.
+  This is the domain a network value actually comes from, and it is what
+  `q32_roundtrip_sweep(1)` walks. 9.7 s on MSVC Release, 7.0 s on Clang, 52 s
+  under MSVC ASan/Debug. Run in full in every configuration.
+* **every Q32 code in [-2^32, 2^32]** — 8,589,934,593 of them, which is not
+  testable in a suite anyone will run. `q32_code_sweep` walks it at a stride and
+  pins every boundary code unconditionally.
+
+The second is not weaker than it looks, and the reason is worth stating because
+it is the only place this chunk substitutes an argument for a measurement:
+`from_q32` multiplies by a power of two, which is exact in double for
+|q| <= 2^53, so `to_q32` is handed the integer `q` back unchanged. The sweep
+exists to catch that premise breaking, not to establish the property. Both
+`q32_roundtrip_sweep`'s `code_mismatches` counter and `q32_code_sweep` report 0.
+
+The exhaustive sweep's results are exact, not approximate:
+
+| property | result |
+|---|---|
+| max absolute round-trip error | 2^-33, exactly half the tick |
+| largest value that is not bit-exact | the float just below 2^-9 |
+| Q32 -> double -> Q32 mismatches | 0 |
+| asymmetric roundings | 0 |
+
+**Every float at or above 2^-9 round-trips bit-identically**, because at that
+magnitude a float's ulp is already 2^-32. That boundary is asserted directly
+rather than the inexact *count*, because a count is a number nobody can check
+and a boundary is a claim that either holds or does not.
+
+## Both accumulators are compiled in every build
+
+The brief allows "templated or `#ifdef`-switched". Templated, and both
+instantiations are bound to Python in **every** build as `NodeArenaQ32` and
+`NodeArenaDouble`; `GUOFISH_VALUE_SUM=double` only selects which one the
+`guofish_core.NodeArena` alias and `guofish::DefaultArena` name.
+
+*Alternative:* a real `#ifdef` on the storage type, so one build has the Q32
+arena and the other has the double one. *Why not:* the brief requires "both must
+be exercised by tests", and under an `#ifdef` each test run exercises exactly
+one. The equivalence build is a rarely-flipped switch, which is precisely the
+configuration that rots — a compile error in the `atomic<double>` branch would
+be found at Gate 1, months after it was introduced. Templating costs nothing
+here (the two policies are eight lines each) and lets
+`test_q32_accumulation_is_order_independent_and_double_is_not` compare the two
+in one process, which is the test that states *why* there are two.
+
+Both accumulator settings were still built and run through the full suite on
+their own, because "the code builds under both" is a separate claim from "both
+types compile".
+
+**`DoubleAccumulator::add` is a CAS loop**, not `fetch_add`: C++17 has no
+floating-point `fetch_add` (it arrived in C++20). That is not a workaround, it
+is the cost the scope names — the retry rate climbs with thread count on an
+accumulator every backup touches, and it is one of the two reasons production
+uses Q32. Single-threaded, which is what Gate 1 runs, it never retries.
+
+## Terminal-ness: refused at the door, not asserted afterwards
+
+The scope requires terminal to be a distinct bit from expanded so the
+`bestmove 0000` defect class is unrepresentable. Implemented as: lifecycle
+(`UNEXPANDED`/`PENDING`/`EXPANDED`) in the low two bits of the state byte,
+`TERMINAL` at bit 7, and four rejections on the way in:
+
+| refused | why it is a real state, not a hypothetical |
+|---|---|
+| `set_children(count = 0)` | the defect itself — an expanded node the move selector finds nothing in |
+| `set_children` on a terminal node | a node where the game ends has no moves; allowing it reaches "expanded, zero children" by a second route |
+| `set_children` on an expanded node | double expansion orphans the first child block, and its visits leave the tree silently |
+| `mark_terminal` on a node with children | the same invariant from the other side |
+
+Checked on the way in rather than by an invariant-checking pass, because a pass
+has to be called and the call is what gets forgotten. `mark_terminal` ORs the
+bit into whatever lifecycle is there rather than replacing the byte, so
+`PENDING` + terminal is representable — which it has to be, since a leaf is
+claimed on selection but its terminality is only discovered when the position is
+examined.
+
+Rejections are typed so Python can tell them apart: `ValueError` for a bad
+argument (count of zero), `IndexError` for a range outside the arena,
+`RuntimeError` (via `std::logic_error`) for a structural violation.
+
+## Fixed capacity, and a bump pointer that clears what it hands out
+
+**The arena never reallocates.** Growth would move every base pointer while
+other threads are mid-scan, and making that safe costs an indirection on the
+hottest read path in the engine. The scope sizes this from measurement (~40
+nodes/sim, 15k sims, game-long reuse, 2-3M nodes peak), so the allocation
+happens once and the bump pointer runs out instead.
+
+`try_allocate` returns `kNoNode` on exhaustion and `allocate` throws; C5's
+expansion path uses the former, because a full arena is a condition to handle,
+not a bug. The bump is a CAS loop on an `atomic<uint32>` even though expansion
+is single-threaded by construction (scope 2.2) — it costs nothing uncontended
+and removes a thing to remember in C9.
+
+**`try_allocate` clears the block it returns; `reset()` clears nothing.** The
+alternative — clear on reset — makes `reset()` a 19 MB memset for a 2M-node
+arena and clears slots that will never be handed out. The chosen split means
+C8's ping-pong recycle is O(1) and a recycled node cannot arrive carrying the
+previous search's visit count. That failure mode is why it is worth stating: a
+stale visit count does not crash, it biases selection toward a node that was
+never visited in this search, and it is invisible in any single position.
+
+Consequence: **indices are bounded by `size()`, not `capacity()`.** An
+unallocated slot is memory, not a node, and reading one would read whatever the
+last search left there.
+
+## Packed moves, and the sort key that is not the packing
+
+`move` is `from << 10 | to << 4 | promo`, squares numbered as chess-library
+numbers them (rank * 8 + file).
+
+**A raw integer sort of this packing is not canonical order**, and that is the
+trap this section exists to mark. Square indices are rank-major (a1, b1, ... h1,
+a2); C1's canonical order is the UCI string's, which is file-major (a1, a2, ...
+a8, b1). They disagree on almost every position — measured at more than half the
+corpus in `test_sorting_packed_moves_directly_is_the_wrong_order` — and because
+PUCT resolves ties by child order, sorting on the wrong one does not fail
+loudly: C++ and Python simply explore different moves at equal priors. C1's
+DECISIONS entry raised exactly this hazard; C4 is where the field that would
+embody it gets defined.
+
+`canonical_move_key(packed)` returns
+`from_file << 13 | from_rank << 10 | to_file << 7 | to_rank << 4 | promo`, whose
+unsigned order is exactly the byte order of the UCI string.
+`test_canonical_move_key_reproduces_c1_ordering_on_the_golden_corpus` drives it
+against 4,000 positions of `golden/movegen.jsonl` — C1's own reference, read
+only — so the claim is checked against the artifact C1 was judged on rather than
+against an argument.
+
+*Alternative considered:* make the packing itself file-major so a raw sort is
+canonical. Rejected: packing and unpacking would then need a bit shuffle on
+every use, including on the selection path that has to reconstruct a
+`chess::Move`, to save a key function that is called once per expansion.
+
+**Promotion codes are alphabetical by UCI letter** — none 0, bishop 1, knight 2,
+queen 3, rook 4 — not by piece value. This looks wrong and is what makes the
+promotion field already canonical: UCI compares `b < n < q < r`, and a
+four-character move sorts before any promotion sharing its from/to because the
+absent letter is less than every letter.
+
+`kNoMove` is 0, which is `a1a1` — a legal *pattern* that is not a legal *move*.
+There is no spare bit pattern (all 65,536 are well-formed triples), so the
+root's move slot holds this and nothing should read it as a move.
+
+## The `is_lock_free()` accessor that Clang deleted
+
+An early version exposed a per-object `atomic<T>::is_lock_free()` to Python,
+reasoning that `is_always_lock_free` is a claim about the *type* while the
+arrays are about specific objects at specific addresses.
+
+**The Clang build failed to import**: `undefined symbol: __atomic_is_lock_free`.
+On libstdc++ the runtime query is an out-of-line call into libatomic, which is
+not linked by default. It could have been fixed with `-latomic`, and was not,
+because the accessor reports nothing new: the standard says `is_always_lock_free`
+is true only if *every* object of the type is lock-free, and the static_asserts
+already require it. The property is now asserted as the two things that compose
+it — `arena_layout()`'s compile-time flags plus the alignment entries — which is
+what actually establishes it.
+
+Recorded because it is Global Rule 8 earning its keep on the first chunk that
+touches atomics, and because the MSVC build linked it without complaint.
+
+## Alignment: reported against constants, not against the request
+
+Each array is a separate over-aligned allocation
+(`::operator new(n, align_val_t(64))`, C0's spelling, for C0's portability
+reasons) at a **full cache line** rather than at `alignof(T)`. Natural alignment
+is what correctness requires; the cache line is so that a 32-sibling scan reads
+the minimum number of lines rather than one extra at each end.
+
+`assert()` is compiled out under NDEBUG, so the constructor's checks are live in
+exactly the builds that do not ship. `array_info()` therefore reports every base
+address to Python and the tests assert on it in whatever build is running.
+
+**The mutation drill found a defect in this reporter**, and it is the most useful
+thing the drill did. `is_aligned()` originally asked
+`address % alignment() == 0` — against the alignment that had been *requested*.
+Under the mutation that cut `alignment()` to `alignof(T)`, it dutifully reported
+"aligned", and `test_alignment_holds_across_repeated_allocation` passed while the
+arrays were no longer cache-line aligned at all. A check that answers its own
+question is not a check. It now asks against `kCacheLine` and `alignof(T)`
+directly, and the test additionally asserts `requested_align >= CACHE_LINE` so
+the request itself is pinned. Post-fix, that mutation fails 8 tests instead of 6.
+
+## Mutation check
+
+C4 has no golden data, so the implementation was mutated, per the procedure C0
+and C0b used. Amendment B: the drill ran against the working tree with pristine
+copies held in a scratch directory and restored after every mutation; nothing
+under `golden/` was written, and the sha256 of all four golden files is
+unchanged (`movegen.jsonl` `1754e3aa...de6151a2`).
+
+Twelve mutations, one per property the suite claims. All twelve were caught:
+
+| mutation | result |
+|---|---|
+| M1 array alignment cut to `alignof(T)` | 8 failed — both cache-line tests and both repeated-allocation tests |
+| M2 `set_children` accepts zero children | 2 failed — `test_a_node_cannot_be_expanded_with_no_children` |
+| M3 `set_children` no longer refuses a terminal node | 2 failed |
+| M4 `mark_terminal` no longer refuses a node with children | 2 failed |
+| M5 `to_q32` truncates instead of rounding to nearest | 3 failed — including the exhaustive sweep, whose max error doubles |
+| M6 Q32 scale is 2^31 | 12 failed |
+| M7 `canonical_move_key` is the identity | 2 failed — both golden-corpus ordering tests |
+| M8 `allocate()` hands out blocks without clearing them | 2 failed — the recycle test |
+| M9 `child(i, k)` ignores `children_offset` | 6 failed |
+| M10 `set_children` does not validate the child range | 2 failed |
+| M11 `try_claim_pending` is a load-then-store, not a CAS | 2 failed |
+| M12 `mark_terminal` clobbers the lifecycle instead of ORing the bit | 2 failed — the PENDING-then-terminal test |
+
+M1's original result (6 failures) is what exposed the reporter defect above; the
+8 in the table is post-fix. Every mutation was reverted and the suite re-run.
+
+## Build and sanitizers
+
+Warning-clean at `/W4` (MSVC 19.51) and `-Wall -Wextra` (Clang 18.1.3) on a
+forced full rebuild of the translation unit on both, no pragmas and no `-Wno-*`.
+Clang caught one unused helper (`bits_from_float`) that MSVC did not; it was
+deleted rather than suppressed.
+
+Full suite, 294 tests (122 of them C4's), green in seven configurations:
+
+| toolchain | config | accumulator | result |
+|---|---|---|---|
+| MSVC | Release | q32 | 294 passed in 29.12s |
+| MSVC | Release | double | 294 passed in 29.11s |
+| MSVC | Debug + `/fsanitize=address`, asserts live | q32 | 294 passed in 238.54s |
+| MSVC | Debug + `/fsanitize=address`, asserts live | double | 294 passed in 226.64s |
+| Clang | Debug | q32 | 294 passed in 33.36s |
+| Clang | Debug | double | 294 passed in 33.11s |
+| Clang | Debug + `-fsanitize=address,undefined`, asserts live | q32 | 294 passed in 55.24s |
+
+The one pytest warning in the Clang runs is C0b's documented
+`max`-on-a-non-authoritative-platform notice, unrelated to this chunk.
+
+No ASan or UBSan runtime errors. The arena's nine allocations per instance were
+leak-checked with the quantitative method README_BUILD.md prescribes rather than
+by reading the summary: 1 vs 500 `(NodeArenaQ32(20000), NodeArenaDouble(20000))`
+pairs give a **byte-identical** 941,456 bytes in 858 allocations — the same
+CPython/numpy baseline C0 and C2 measured — where a leak would have added
+~660 MB. No leaked allocation's stack mentions `guofish_core`, in that check or
+in the full ASan/UBSan suite run (whose 1,348,338 bytes in 1,252 allocations is
+the same interpreter-exit leakage C3 recorded).
+
+The ASan/Debug runs are a real test of the Q32 domain, not only of memory:
+`to_q32` asserts `-1 <= v <= 1` and rejects NaN, so a value outside the network's
+range reaching the accumulator aborts rather than converting to an unspecified
+integer.
+
+## Not done
+
+* **No concurrency test.** Every atomic here is exercised single-threaded.
+  `try_claim_pending`'s CAS is verified to be a CAS (the second claim fails), but
+  nothing runs two threads at it — pybind11 holds the GIL across these calls, so
+  a Python-level thread test would prove nothing it did not already know. Real
+  contention is C9's, and C9 should not treat C4's green suite as evidence about
+  it.
+* **No false-sharing padding.** Two threads backing up through adjacent siblings
+  write `visit_count` entries 4 bytes apart, i.e. on the same line. That is
+  inherent to SoA and is the trade the layout makes — the scan wants them
+  adjacent. If C9's scaling curve flattens early this is the first suspect, and
+  the fix (padding, or per-thread shards) is a change to this file. Flagged, not
+  pre-optimised.
+* **No `chess::Move` interop.** `pack_move` takes integers. C5 will want
+  `pack_move(chess::Move)` including the king-takes-rook castling normalisation
+  C1 established; it is not here because there is no golden data for it in this
+  chunk and it would ship unverified.
+* **No ping-pong compaction.** C8's, explicitly out of scope. The pieces it will
+  need are in place: offsets not pointers throughout, and `set_children`
+  validates every remapped range against the live region, which is where a fixup
+  off-by-one surfaces.
+* **`set_move` does not validate its argument.** It is a raw `uint16` field
+  setter; `pack_move` is the validating constructor. A promotion code above 4 can
+  be stored and would decode to a nonsense promotion. Deliberate — the setter is
+  on the expansion path — but it means `move` is only as canonical as its writer.
+
+## Global Rule 1
+
+Nothing under `tests/` was modified: `tests/test_c4_arena.py` is a new file and
+`git status` over `tests/` shows one untracked file and nothing else. Nothing
+under `golden/` was written — see "Mutation check" for the before/after hashes.
+`golden/movegen.jsonl` is read by the canonical-ordering tests and never opened
+for writing.

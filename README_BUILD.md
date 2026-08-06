@@ -15,6 +15,7 @@ hand; the first configure needs network access.
 |---|---|---|
 | `GUOFISH_ASAN` | `OFF` | AddressSanitizer; also UndefinedBehaviorSanitizer on Clang. Strips `/RTC1` and disables incremental linking on MSVC. Keeps `assert()` live even in release configs. |
 | `GUOFISH_MODULE_OUTPUT_DIR` | repo root | Where the built `.pyd`/`.so` is written. |
+| `GUOFISH_VALUE_SUM` | `q32` | Which accumulator `guofish::DefaultArena` and `guofish_core.NodeArena` name: `q32` (production) or `double` (Gate 1 equivalence). Both `NodeArena` types are compiled and bound in *every* build; this only selects the default. |
 
 Windows and Linux artifacts have different suffixes
 (`guofish_core.cp313-win_amd64.pyd` vs `guofish_core.cpython-312-x86_64-linux-gnu.so`)
@@ -66,7 +67,13 @@ Or, from any shell (it runs `vcvars64.bat` for you):
 ```bat
 build\win.bat build/msvc-release Release
 build\win.bat build/msvc-asan Debug asan
+build\win.bat build/msvc-release-double Release - double
 ```
+
+The fourth argument is `GUOFISH_VALUE_SUM`; `-` in the third slot means "no
+ASan". Since both arena types are compiled either way, this switch only needs
+exercising when you want to confirm the *default alias* is wired correctly —
+`guofish_core.DEFAULT_ACCUMULATOR` reports what you got.
 
 Arguments are positional because `cmd` splits argv on `=`, so a
 `-DCMAKE_BUILD_TYPE=Release` forwarded through `%1` arrives at CMake as two
@@ -183,9 +190,11 @@ would hide our leaks along with theirs. Two checks that actually discriminate:
 
 * No leaked allocation's stack should mention `guofish_core`:
   `grep guofish_core <log>` over the ASan output should find nothing.
-* The leak total should not grow with the number of buffers allocated. Comparing
+* The leak total should not grow with the number of allocations made. Comparing
   a 1-buffer run against a 500-buffer run (500 x 272 KB = ~136 MB) gives a
-  byte-identical total when the buffers are being freed properly.
+  byte-identical total when the buffers are being freed properly. C4 applies
+  the same test to the arena: 1 vs 500 `(NodeArenaQ32(20000), NodeArenaDouble(20000))`
+  pairs, where a leak would add ~660 MB.
 
 Helper scripts for all of the above live in `build/` (gitignored).
 
@@ -193,7 +202,7 @@ Helper scripts for all of the above live in `build/` (gitignored).
 
 ## Benchmarks
 
-Neither script writes to `golden/`; both are benchmarks, not reference
+None of these scripts write to `golden/`; they are benchmarks, not reference
 implementations (Global Rule 2). Results are transcribed into `BENCH.md`.
 
 | command | what it produces |
@@ -204,6 +213,8 @@ implementations (Global Rule 2). Results are transcribed into `BENCH.md`.
 | `python tools/bench_c0b.py --repeat 10` | gate stability: 10 × 2,000 samples of config C at batch 256 |
 | `python tools/bench_c2.py` | C2 table: tokenization throughput, encoder vs `TokenBatch.fill` |
 | `python tools/bench_c2.py --python` | as above, plus the `board_to_tokens` reference on this machine (imports torch) |
+| `python tools/bench_c4.py --trials 5` | C4 table: sibling scan under both accumulators, four working sets |
+| `python tools/bench_c4.py --sweep` | as above, plus the exhaustive Q32 round-trip sweep over all 2.13e9 floats in [-1, 1] (~10 s on Release, ~52 s under ASan) |
 
 On Linux, prefix with the build directory as usual:
 
@@ -216,7 +227,7 @@ doubles the callback cost and materially widens the latency tail — enough to
 change how often the C0b gate's `max` criterion is met (see BENCH.md, "Gate
 stability"). `tools/bench_c0b.py` and `tools/bench_c2.py` print `asan=True/False`
 in their headers so a mistake is visible in the output rather than silently
-transcribed; `bench_c2.py` additionally prints a warning banner.
+transcribed; `bench_c2.py` and `bench_c4.py` additionally print a warning banner.
 
 `tools/bench_c0b.py` imports its experiment from `tests/test_c0b_contention.py`
 rather than reimplementing it, so the published numbers and the asserted numbers
