@@ -450,3 +450,196 @@ chunks where agent-authored tests are unavoidable.
 covering the new payload (that it is a stable, zero-copy, aligned, correctly
 sized view, and that it survives past the call). From C1 onward this rule is
 hard and this must not be treated as precedent.
+
+# C1 — Movegen parity (2026-08-05)
+
+`legal_moves(fen) -> list[str]` is exposed from `cpp/bindings.cpp`; the
+generation and formatting live in `cpp/movegen.hpp` so that C4/C5 can include
+them without pulling in the benchmark machinery. Acceptance is
+`tests/test_c1_movegen.py` against `golden/movegen.jsonl` — 100,000 positions,
+0 mismatches.
+
+## Castling normalisation
+
+chess-library encodes castling as **king-takes-rook**: for White kingside,
+`from()` is e1 and `to()` is **h1**, the rook's square, not the king's
+destination. That is the UCI_Chess960 convention and it is what the library's
+own `makeMove()` expects back, but it is not what a standard UCI GUI or
+python-chess emits.
+
+`uci_destination()` rewrites it: on a `CASTLING` move it returns file **G** when
+the rook is to the king's right and file **C** when it is to the left, on the
+king's own rank. The left/right test is `move.to() > move.from()` rather than a
+hard-coded e1/h1, so it is still correct on a shuffled back rank.
+
+Three alternatives were considered:
+
+* **Call `chess::uci::moveToUci(move, false)`**, which does the same rewrite.
+  Rejected: its `chess960` parameter *defaults to false*, so a caller who
+  forgets the argument gets silently wrong output on a 960 board, and the brief
+  asks for this normalisation to be ours and auditable. Our version reads
+  `board.chess960()` itself instead of taking a defaultable flag, so it cannot
+  be called wrongly.
+* **Normalise at the FEN/parse layer** — not possible; the encoding is a
+  property of the generated move, not of the position.
+* **Let the search carry king-takes-rook internally and normalise only at the
+  UCI boundary.** Deferred, not rejected: it is the right answer for C5, but C1
+  is judged on strings and carrying two representations in one chunk would make
+  the parity result harder to trust, not easier.
+
+**Chess960 is passed through untouched** when `board.chess960()` is set, because
+there king-takes-rook *is* the correct UCI. This mirrors python-chess's
+`Board.uci()`, which normalises only when `self.chess960` is false. Every FEN in
+the golden file is standard, so this branch is not covered by the parity run; it
+exists so the helper is not silently wrong the first time a 960 board reaches
+it. `legal_moves(fen)` cannot construct one — there is no 960 flag on the API —
+so it is currently unreachable from Python.
+
+The failure mode if the normalisation is skipped is quiet, which is why it gets
+this much attention: `e1h1` is a well-formed UCI string that simply never
+appears in a reference list, so it reads as "one move missing, one move extra"
+rather than as a formatting bug. `format_mismatch()` in the test therefore names
+it explicitly when it sees one.
+
+## Canonical order
+
+**Byte-wise lexicographic sort of the UCI strings**, via `std::sort` on
+`std::vector<std::string>`.
+
+Every string is `[file][rank][file][rank][promo?]` over a fixed ASCII alphabet,
+so this is exactly the `(from, to, promotion)` tuple order the brief asks for,
+and it is the order `tools/gen_movegen_golden.py` writes. Python's `str` sort
+compares code points and `std::char_traits<char>::compare` compares as unsigned
+bytes; both are ASCII here, so the two agree, including on the shorter-first
+rule for prefixes.
+
+**It is deliberately not a sort on chess-library's square index.** Index order
+is rank-major (a1, b1, … h1, a2, …); UCI string order is file-major (a1, a2, …
+a8, b1, …). They disagree on almost every position. Because PUCT resolves ties
+by child order, picking the wrong one would not fail loudly — C++ and Python
+would just explore different moves at equal priors, which is precisely the class
+of divergence this chunk exists to prevent. `test_output_is_in_canonical_order`
+asserts sortedness directly, independently of the golden comparison, so an
+ordering that merely happens to match the file is not what is being certified.
+
+A 4-character and a 5-character move can never share a from/to pair — a pawn
+reaching the back rank must promote — so the prefix case never arises between
+two real moves. `legal_moves_uci()` asserts the sorted list has no adjacent
+duplicates, which is how a normalisation that collided with a real king move
+would surface.
+
+## Rejecting a FEN early enough
+
+**The king count is checked before `setFen()` is called, not after.** This
+started as the obvious "parse, then validate" and it was wrong.
+
+`Board::setFen()` does not merely accept a kingless position. On its way out it
+builds the castling paths, and that loop calls `kingSq()` for **both colours
+unconditionally, before it consults the castling rights** (chess.hpp:3471).
+`kingSq()` is `assert(pieces(KING, color) != 0ull)` followed by `lsb()` on the
+king bitboard — an assertion failure in a debug build, an out-of-range square in
+a release one. Validating afterwards is too late by one function call.
+
+This passed the MSVC Release suite and aborted the interpreter the moment the
+suite ran against the ASan/debug module (`Assertion failed: Expression:
+pieces(PieceType::King, color) != 0ull`). It is a good advertisement for Global
+Rule 5: the release build reported 78 passed.
+
+`count_kings()` therefore scans the FEN's piece-placement field as text, before
+a `Board` exists, mirroring chess-library's own leading-space trim and
+split-on-first-space so it reads the same field the parser will. Exactly one `K`
+and one `k` are required. Two kings of one colour are refused for the same
+reason: `lsb()` would silently pick one.
+
+Rejecting rather than tolerating is a judgement call. python-chess is equally
+undefined on a kingless board in practice, and nothing in `golden/movegen.jsonl`
+is affected either way, but `legal_moves` is reachable from Python and a
+caller's typo should not be able to reach UB. Both rejections raise
+`std::invalid_argument`, which pybind11's stock translator turns into
+`ValueError` with no custom registration.
+
+## Where the test could have fooled itself
+
+`test_golden_corpus_covers_the_edge_cases` exists because a parity run over 100k
+quiet middlegames would be green with the castling normalisation deleted. It
+counts, from the *reference* lists, how many positions offer castling, a
+promotion, an en-passant target square, and no move at all, and fails if any
+bucket is thin.
+
+The first version identified castling by looking for the literal strings `e1g1 /
+e1c1 / e8g8 / e8c8`. **That is wrong**, and the mutation drill below found it by
+landing its "de-normalise a castle" mutation on
+`1N6/2p2K2/8/5p1P/2k2b2/2P5/8/4q3 b - - 1 49` — a position with a **Black queen
+on e1**, where `e1g1`, `e1c1`, `e1a1` and `e1h1` are all ordinary queen moves.
+The e-file back-rank square is not always the king's.
+
+`has_legal_castling()` now looks the side-to-move's king square up out of the
+FEN and asks whether any move starts there and crosses two files on the same
+rank, which is a castle and nothing else.
+`test_castling_detector_is_anchored_on_the_king_square` pins both lookalikes,
+including one where the castling field is non-empty so the `-` shortcut is not
+what saves it.
+
+The same strings are still used in `format_mismatch()`, but only as a *hint* in
+a report that has already failed for another reason, and the comment there says
+so.
+
+## Mutation check
+
+The brief asks for a golden value to be corrupted, the diagnostic inspected, and
+the file restored. Global Rules 1 and 2 say `golden/` is never written to. Those
+are reconcilable and the rules win: the parity test reads an optional
+`GUOFISH_GOLDEN_MOVEGEN` environment variable, so the drill ran against a
+**corrupted copy in the scratch directory** and `golden/movegen.jsonl` was never
+opened for writing. Its SHA-256 was `1754e3aa…de6151a2` before the drill and
+`1754e3aa…de6151a2` after.
+
+Four mutations in one file, one per failure mode the report must tell apart. All
+four produced the required diagnostic, and the other 99,996 positions stayed
+green:
+
+| mutation | what the report said |
+|---|---|
+| dropped `c3a5` from line 1 | `extra in C++ : ['c3a5']` |
+| invented `z9z9` on line 2 | `missing from C++ : ['z9z9']` |
+| swapped two moves on line 3 | `ORDER ONLY … first difference at index 0: C++ 'a7a3' vs python 'a7a4'` |
+| `e1g1` → `e1h1` on line 1112 | `missing from C++ : ['e1h1']`, `extra in C++ : ['e1g1']` |
+
+Because the corruption is in the *reference*, the fourth case does not trigger
+the `CASTLING NOT NORMALISED` hint — that fires on the real direction, C++
+emitting `e1h1`. Four `test_diagnostic_*` tests exercise the formatter directly
+so the requirement is covered by the suite and not only by a one-off drill.
+
+## Python versioning
+
+C0b asked that C1 record the interpreter pin for golden data. What can be
+verified from this repo: `golden/movegen.jsonl` agrees exactly with
+**python-chess 1.11.2 on Python 3.13.7** (Windows), which is the interpreter
+`tools/gen_movegen_golden.py` runs under here. The file was generated by the
+project lead and the generating interpreter is not recorded inside it, so that
+is a checked agreement, not a provenance claim. **Recording it inside the file —
+a header line carrying the interpreter, python-chess version, seed and
+arguments — is the fix, and it belongs to whoever next regenerates it.**
+
+The consuming side needs no pin at all: `tests/test_c1_movegen.py` does not
+import `chess`. The reference's answers reach it only through the golden file,
+so the parity test cannot drift into re-deriving its expectation from the same
+library that produced it, and it gives the same verdict on 3.12 (Linux) and 3.13
+(Windows).
+
+## Not done
+
+* **No GIL release around the generation.** `legal_moves` is a validation
+  helper, not a search path; the full 100k-position sweep is 0.65 s on the
+  Release build, and `py::call_guard` would add a release/acquire pair per call
+  for no benefit. C5's search will not call this function.
+* **No batch entry point.** Per-call pybind overhead is not the bottleneck at
+  this scale and the brief specifies the single-FEN signature.
+* **Strings, not packed integers.** Explicitly what the brief asks for; the
+  production core will carry the 16-bit `chess::Move` and format only at the UCI
+  boundary.
+
+## Global Rule 1
+
+No existing test file was modified. `tests/test_c1_movegen.py` is new; `git
+status` over `tests/` shows one untracked file and nothing else.

@@ -1,7 +1,7 @@
-// GuoFish C0 / C0b — toolchain spike and GIL contention probe.
+// GuoFish C0 / C0b / C1 — toolchain spike, GIL contention probe, movegen parity.
 //
-// No engine logic lives here. This translation unit exists to prove four
-// things before any of it gets written:
+// The C0/C0b half of this translation unit holds no engine logic. It exists to
+// prove four things before any of it gets written:
 //
 //   1. the extension builds warning-clean and imports on MSVC and Clang,
 //   2. a C++-owned, 64-byte-aligned buffer reaches NumPy with no copy, so the
@@ -14,13 +14,18 @@
 //
 // (3) measures the mechanism. (4) measures the queue in front of it. They are
 // different numbers by four orders of magnitude; see BENCH.md.
+//
+// C1 adds the first real engine surface: legal_moves(fen). The generation and
+// UCI normalisation live in cpp/movegen.hpp; this file only binds them.
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
-// Vendored per Global Rule 7. C0 only proves it compiles and links; C1 is the
-// chunk that actually generates moves with it.
+// Vendored per Global Rule 7.
 #include <chess.hpp>
+
+#include "movegen.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -521,7 +526,16 @@ py::dict contention_bench(std::size_t rows, std::size_t iters, const py::object 
 }  // namespace
 
 PYBIND11_MODULE(guofish_core, m) {
-    m.doc() = "GuoFish C++ core — C0 toolchain spike, C0b GIL contention probe";
+    m.doc() = "GuoFish C++ core — C0 toolchain spike, C0b GIL contention probe, C1 movegen";
+
+    // C1. std::invalid_argument is translated to ValueError by pybind11's stock
+    // exception translator, so a bad FEN surfaces in Python as ValueError
+    // without a custom registration.
+    m.def("legal_moves", &guofish::legal_moves, py::arg("fen"),
+          "Every legal move in `fen` as standard UCI strings, in canonical "
+          "(from, to, promotion) order. Castling is normalised away from "
+          "chess-library's king-takes-rook encoding (e1h1 -> e1g1). Raises "
+          "ValueError on a FEN that cannot be parsed or has no king.");
 
     m.def("ping", &ping, "Import health check; returns \"pong\".");
 
