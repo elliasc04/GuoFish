@@ -2670,3 +2670,178 @@ brief names. `git diff core/mctsv4.py` is 53 added lines and zero changed ones.
 **Global Rule 3.** The full suite passes on all four builds: 821 passed, 48
 skipped, on Windows/MSVC Release and ASan and on Linux/Clang Release and
 ASan+UBSan. Every previous chunk's tests are included and none was modified.
+
+---
+
+# C3b — Reference regression tests (2026-08-07)
+
+Python-only chunk. One new file, `tests/test_reference_defects.py`, holding the
+three defects fixed in `b43a7f0` down and pinning the determinism of the
+configuration that generates C5's and C6's golden data. No C++ source was
+touched; `core/mctsv4.py` was not changed.
+
+## Why the reverts were targeted rather than `git checkout b43a7f0^`
+
+The obvious way to prove the tests catch the pre-fix behaviour is to check out
+the parent of the fix commit. That is wrong here: `b43a7f0^` predates C5, so it
+also lacks `GATE1_CANONICAL_ORDER` and `_canonicalize_children`, and the failures
+would then be a mixture of "the defect is back" and "an unrelated feature is
+missing". So each defect was reverted **separately**, as the minimal edit that
+restores exactly that bug on top of today's file, and only the one test that owns
+it was run.
+
+The three reverts, and what each test said:
+
+| revert | hunks | test | first failure |
+|---|---|---|---|
+| `make_cache_key` returns the bare Zobrist hash | 1 | `test_ep_cache_key` | 2 of 7 en-passant twins collide on a key, with both FENs and both token-66 values printed |
+| draw path sets `is_expanded`, `or not root.children` recovery and last-resort nets removed, stale-terminal clear removed | 6 | `test_terminal_guard` | 22 of 22 claimable-draw terminal nodes marked `is_expanded`, each listed with its FEN |
+| noise mixes into `child.prior` in place | 1 | `test_dirichlet_idempotence` | all 20 priors moved on application 2 despite an identical seeded draw, with the 64-bit patterns |
+
+The terminal revert's *first* assertion fires on the flag, before the test
+reaches the promotion guard, so the forfeit itself was demonstrated separately
+under the same revert: `search()` returns `None` — UCI `bestmove 0000` — and
+`get_policy()` returns an empty dict on `8/8/4k3/8/8/4K3/8/4R3 b - - 100 100`, a
+position with 8 legal moves that python-chess does not consider over. Post-fix
+the same script plays `e6e7` and returns a full 8-move policy.
+
+## Line endings: why `git checkout --` is not a safe restore here
+
+`core.autocrlf` is `true` and `core/mctsv4.py` has no `.gitattributes` entry, but
+the working-tree copy is **LF**. `git checkout -- core/mctsv4.py` therefore
+rewrote it as CRLF: `git status` went clean, `git diff` was empty — and the
+file's SHA-256 changed from `c0dae236...` to `ea106432...`.
+
+That matters because `golden/gate1_manifest.json`'s
+`provenance.reference_sha256` is `c0dae236...`, i.e. it is taken over the LF
+bytes. A restore that leaves git clean while changing the reference's digest
+would silently break the provenance link between the golden data and the file
+that produced it, and nothing in the suite would notice.
+
+So the drill restores by writing `git show HEAD:core/mctsv4.py` back **in
+binary**, asserting the digest before the write. Recorded here because the same
+trap is waiting for any future mutation drill on a tracked file. (Amendment B
+already forbids drills against `golden/`; this is its equivalent for `core/`.)
+Final state: `c0dae2369d1daafff1cdf4b491ec512829a899046fc79f91e3a802571e427fac`,
+equal to the manifest's pin.
+
+## Judgment calls the brief did not specify
+
+**A stub network for defects 2 and 3.** Both are tree-logic defects — which flags
+a node carries, and which field the noise is a function of — and neither reads
+the network's output. They run against `_StubNet`, a v5-shaped module whose
+policy and value are a closed form of the token sum, rather than the 10.9M
+checkpoint. Alternatives were loading the real checkpoint (slow, needs CUDA, and
+makes a failure ambiguous between the net and the tree) or hand-building
+`MCTSNode` trees (fast, but then `search()`, `apply_move()` and `_expand_root` —
+the code that actually broke — are never executed). The stub keeps the real
+control flow and makes a failure provably about the tree. `require_v5_config` is
+duck-typed on `.config` by deliberate design, so this needs no production change.
+
+**`test_equivalence_determinism` is parametrized over VL 0.0 and 2.5.** The brief
+names VL 0. `tools/gen_gate1_golden.py` sweeps both and runs its own determinism
+self-check at **2.5**, which is the magnitude where `select_child` reads
+`parent_visits = N + 1*VL` and the apply/repay ordering is exercised at all.
+Pinning only 0.0 would leave the setting the golden data is actually checked
+under unpinned, so both are covered. Cost is about 30 s.
+
+**`GATE1_CANONICAL_ORDER = True` during that test.** Also not in the brief's
+list, and also part of the configuration the golden files were written under
+(`gate1_manifest.json.config.canonical_order_patch: true`). Pinning the
+determinism of a configuration the generator does not use would pin the wrong
+thing. Both this and `VIRTUAL_LOSS` are module globals, so an
+`equivalence_globals` fixture restores them in a `finally` — otherwise the test
+would silently reconfigure every test that follows it in the session.
+
+**The diff is `repr` on floats, not `==` — and the reason is not only precision.**
+The brief asks for `repr` to catch drift. It also fixes two things `==` gets
+wrong outright: `nan == nan` is False, so an equality diff reports a spurious
+divergence on a NaN *both* runs produced, and `-0.0 == 0.0` is True, so it hides
+a real sign difference. `repr` round-trips exactly for finite floats in CPython
+and separates both cases.
+
+**The diff covers every node, not the visited subtree.** 68,427 nodes at 2,000
+simulations, unvisited children included — they carry real priors in an order
+that is itself part of what the golden trees record.
+
+**`collide_under_zobrist` is computed, not hardcoded.** Polyglot folds the
+en-passant file in whenever an enemy pawn is *adjacent*, without checking
+legality, so of the seven `ep_twin` pairs it collides on exactly the two with no
+adjacent capturer — the three `ep_pinned_*` pairs have an adjacent pawn whose
+capture is illegal, and Polyglot separates those while agreeing with neither
+token 66 nor the legal-ep rule. Hardcoding "2" would turn a corpus change into a
+confusing failure; the test instead asserts the colliding subset is non-empty and
+says plainly that an empty one invalidates the test rather than relaxing it.
+
+**"Claimable draw" is measured, not assumed.**
+`_assert_claimable_draws_are_not_expanded` decides which terminal nodes must stay
+unexpanded by asking whether the node's own board is `is_game_over()`. Every
+terminal path other than `_draw_by_rule` is gated on that call, so a terminal node
+whose board is *not* over can only have come from the fifty-move / threefold
+branch. This avoids duplicating the reference's branch conditions in the test,
+which would make the test agree with the code by construction.
+
+## Why this file skips on the Linux builds
+
+Every other file under `tests/` imports neither `chess` nor `torch` — they test
+`guofish_core` and reach the reference only through golden files. That is why the
+Linux build boxes carry a minimal venv (numpy + pytest). This file is the
+exception by definition: it is a test *of* the Python reference, and the
+reference *is* python-chess + torch + `core.mctsv4`. It therefore opens with
+`pytest.importorskip`, and the Linux runs report it as one skip (48 to 49) rather
+than a collection error that would fail the whole suite for a reason unrelated to
+the sanitizers. Amendment A already pins the golden data to Windows / Python
+3.13.7 / python-chess 1.11.2, so Windows is where the reference is checked.
+
+Installing torch into the Linux venv was the alternative. Rejected: it would put
+a ~2 GB dependency on the sanitizer boxes to run a test whose subject is a
+Windows-pinned artifact.
+
+## Global Rules
+
+**Rule 1 — nothing under `tests/` was modified.** `tests/test_reference_defects.py`
+is a new untracked file; `git status` over `tests/` shows it and nothing else, and
+`git diff -- tests/` is empty.
+
+**Rule 2 — no golden data was produced or regenerated.** This chunk generates
+nothing. All ten files in `golden/` carry the same SHA-256s recorded at the end of
+C6, verified after every drill:
+
+```
+b0332e8f0adfd7b4f9112210342e004610d7d6215920fe5e9eb7cf609426256e  gate1_dump.npz
+e0b9c342555a1e280ab80efbb339467aaf88a8e9051fef01e23f28caf3ac6748  gate1_manifest.json
+8e2e1d34e7752e7116730017d8ee5a38c11f2fd39a08f85d397dc3c14532b9ac  gate1_terminal_dump.npz
+c08d8eb173bd2008c8a0c78b54b18575d870ec55c59ab6463514c049a6809f48  gate1_terminal_manifest.json
+b45008fd142d0bbca9081360e0b6ebf27c3592ed349251da0f2ed40975da3f40  gate1_terminal_trees.npz
+aec5135e0a82f0f5baa1ef4cf39a5372090946bc40b940c83fe255371e357440  gate1_trees.npz
+a901750f28aa37490ac96c2d1a321e80ad50a175f1eaa5010820b519642ca504  keys.jsonl
+b0a91bc7e4e1a0f598a2577ad8b331bd6d9e46dac610d51e46f267e55c3e96fc  keys_adversarial.jsonl
+1754e3aab46825f6c0289a9a7b26dd0ca6ead4a58bc0d287a886e1b0de6151a2  movegen.jsonl
+ea9bf8dfe40196460b6c2d4a0c47217d64998193eb1b4a9f7bb2697b413ce562  tokens.npz
+```
+
+**Rule 3 — the full suite passes on all four builds.** No C++ source changed, so
+both Linux builds and the Windows ASan build reported `ninja: no work to do` or
+relinked only.
+
+| build | result |
+|---|---|
+| Windows / MSVC Release | 826 passed, 48 skipped (94 s) |
+| Windows / MSVC ASan (`asserts: True`) | 826 passed, 48 skipped (583 s), zero ASan errors |
+| Linux / clang Release | 821 passed, 49 skipped (23 s) |
+| Linux / clang ASan+UBSan | 821 passed, 49 skipped (149 s), no non-leak ASan error, no UBSan runtime error, no leaked allocation whose stack mentions `guofish_core` |
+
+The Windows/Linux difference is exactly this chunk's five tests plus the one
+module skip that replaces them; C6's totals were 821 passed / 48 skipped
+everywhere.
+
+**Rules 4, 5, 6, 7, 8 — not exercised.** No C++ was written, no dependency added.
+The ASan builds above were rebuilds of unchanged sources, run to confirm the new
+tests are clean under them.
+
+**`core/mctsv4.py` is byte-identical to its state at the start of the chunk**, and
+to `HEAD`'s blob:
+`c0dae2369d1daafff1cdf4b491ec512829a899046fc79f91e3a802571e427fac`, which is the
+digest `golden/gate1_manifest.json` records as the reference that produced the
+Gate 1 data. The three reverts were applied and undone in the working tree only;
+none was committed, and each was followed by a digest check.
