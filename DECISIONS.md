@@ -1768,3 +1768,905 @@ Nothing under `tests/` was modified: `tests/test_c4_arena.py` is a new file and
 under `golden/` was written — see "Mutation check" for the before/after hashes.
 `golden/movegen.jsonl` is read by the canonical-ordering tests and never opened
 for writing.
+
+---
+
+# C5 — Search core, no terminals (2026-08-06)
+
+Gate 1 passes on the quiet corpus. 48 recorded runs — 20 positions x 2
+virtual-loss magnitudes at 5,000 simulations, plus 4 positions x 2 magnitudes at
+800 simulations recording every node — compare bit-exactly: visit counts equal
+as integers, `value_sum` identical as a 64-bit pattern, priors identical as a
+32-bit pattern, same nodes in the same canonical DFS order.
+
+## The discovery this chunk turned on: the reference softmaxes root priors on a different device
+
+`ParallelMCTS._expand_root` runs its own forward pass and hands
+`policy_logits[0]` straight to `MCTSNode.expand` **while it is still a CUDA
+tensor**, so the legal-move gather, the `.float()` and the `torch.softmax` all
+execute on the GPU. Interior nodes arrive through `BatchedEvaluator`, which does
+a bulk `.cpu()` before distributing, so their softmax runs on the CPU.
+
+Those disagree. Measured on this checkpoint at a middlegame position: **6 of 37
+priors differ, maximum absolute delta 1.9e-9**. That is far above the bit level
+Gate 1 compares at, and it is load-bearing rather than cosmetic — priors feed
+PUCT, so the difference propagates into visit counts.
+
+It only becomes visible when the root position **recurs as an interior node**,
+which a middlegame reaches in four plies. It did so on the first candidate
+position at 200 simulations, and it surfaced as the golden generator refusing to
+write: the recorder found one `nn_key` expanded twice with different children.
+
+**Chosen: key the replay dump by `(nn_key, is_root)`, two tables in C++.**
+
+* *Alternative rejected — make `_expand_root` softmax on the CPU under the Gate 1
+  flag.* One extra `.cpu()` and the asymmetry disappears, and the golden data
+  would become slightly more portable (the root's priors would stop depending on
+  which GPU generated them). But it is a change to search behaviour beyond the
+  canonical-ordering patch the brief sanctions, and Gate 1 exists to reproduce
+  the reference **as it is**, not as it would be if tidied. Scope 1 lists
+  preserved defects under "replicate exactly, flag, do not fix"; this belongs
+  with them.
+* *Alternative rejected — pick one of the two prior sets and use it everywhere.*
+  Silently wrong at whichever node got the other one, and wrong by an amount too
+  small to notice and large enough to reorder a PUCT tie.
+
+Cost: 26 extra dump entries (one per distinct root, including rejected
+candidates) and one bool through the lookup path. **Flagged for C10**, which is
+where a decision about whether production should carry this asymmetry at all
+belongs — it is a real numerical inconsistency in the engine, not just a porting
+inconvenience.
+
+## Search state carries its own raw en-passant square
+
+The brief required this and recon predicted it; what this chunk adds is the
+measurement and the pin. At revision `53e6a84`, `Board::makeMove`:
+
+```cpp
+if (Square::value_distance(move.to(), move.from()) == 16) {
+    Bitboard ep_mask = attacks::pawn(stm_, move.to().ep_square());
+    if (ep_mask & pieces(PAWN, ~stm_)) {              // pseudo-legal adjacency
+        if constexpr (EXACT) { ... isEpSquareValid ... }   // legal capture
+        if (found != 0) ep_sq_ = move.to().ep_square();
+    }
+}
+```
+
+so `makeMove<false>` (the default) sets ep on pseudo-legal adjacency and
+`makeMove<true>` on the legal-capture rule. **Neither is the raw rule token 66
+needs**, and `setFen` applies the legal rule again on the way in. Four
+conventions; three of them wrong for this purpose; all four free to reach for.
+
+`SearchBoard` therefore holds `raw_ep_` plus a stack, derived from the move just
+made — a double push always sets it, which is python-chess's rule by
+construction — and `unmake_move` restores it from the stack while
+`Board::unmakeMove` restores the library's from its own. The library's ep state
+is left to do the one job it is right for: generating moves.
+
+`tests/test_c5_ep_pin.py` pins all four conventions on three constructed
+positions and asserts they differ, so a re-pin fails a named test rather than
+moving token 66 on ~3% of positions. The pinned revision is passed into the
+build from CMake (`GUOFISH_CHESS_LIBRARY_PIN`) rather than restated in C++, so
+the test cannot pass against a build of some other revision.
+
+**A construction note worth recording**, because the first draft of the pin
+position was wrong in a way that silently weakened the test: the legality of an
+en-passant capture is judged against the **capturer's** king. Aiming the skewer
+at the side that just pushed leaves the capture perfectly legal, and the position
+then fails to separate `makeMove<false>` from `makeMove<true>` at all — it just
+looks like it does.
+
+## `set_fen` self-audits the board-derived tokenization against the FEN parser
+
+`SearchBoard::parsed()` rebuilds a `ParsedFen` from chess-library's bitboards.
+`parse_fen` builds one from the FEN text, and C2 verified that path against
+100,000 positions. They must agree, and `set_fen` asserts they do by comparing
+`nn_key` — every position, every build, release included.
+
+Chosen because the failure it catches is otherwise undiagnosable. A castling
+cleaning difference or a square-numbering slip in the rebuild would tokenize
+*every node of the tree* differently from the reference, and the only symptom
+would be a replay-dump miss at some arbitrary depth, pointing at the descent
+rather than at the root conversion.
+
+## `promoted` is left empty, and that is exact rather than approximate
+
+python-chess's `promoted` bitboard tracks the X-FEN `~` suffix and the squares
+its own `push()` promoted onto. `SearchBoard::parsed()` sets it to 0.
+
+This is not an approximation. Every reader of `promoted` in `cpp/tokens.hpp` and
+`cpp/keys.hpp` masks it against `kings` — `clean_castling_rights`,
+`has_castling_right` and `parse_castling_field` all spell `kings & ~promoted` —
+and a promoted piece is never a king. The one case that looks like it might
+matter (a pawn promoting to a rook on h8 while Black still claims kingside
+rights) cannot arise: python-chess's `push()` clears rights for both the origin
+and destination squares, so capturing or occupying h8 has already removed it.
+
+## The depth cap is implemented, though the brief lists it under C6
+
+Terminal handling is C6's and none of it is here — no checkmate, stalemate,
+repetition or fifty-move detection. The depth cap is the one exception.
+
+*Chosen: implement it, matching the reference exactly (back up 0.0, do NOT mark
+the node terminal), and report the hit count.* It is five lines, it is
+unconditional in the reference, and if Python ever hit it while C++ did not, the
+trees would diverge structurally with nothing in the diagnostic pointing at the
+cause. Measured hits over the whole corpus: **0**, asserted per run in
+`test_search_accounting_matches_the_reference`, so the corpus's quietness in this
+respect is a measurement rather than an assumption.
+
+The other terminal paths are handled the opposite way — by making them loud
+rather than by implementing them. A position with no legal moves throws
+`TerminalReached`; a position the reference never evaluated is a dump miss.
+
+## "Quiet" is measured per position, not assumed
+
+C5 excludes terminal handling, which is only safe if the corpus contains none of
+it **within search range** — and that is not something position selection can
+promise. A quiet-looking middlegame can hold a mate in 6 that 5,000 simulations
+will find, and 7 of the 27 candidates did exactly that.
+
+So every candidate is run first and audited afterwards. The generator walks the
+finished reference tree and requires, for every node with `visit_count > 0`:
+`is_terminal` false; `is_expanded` with children (a visited node that is neither
+is precisely the depth-cap signature); depth below `MAX_TREE_DEPTH`. Plus a
+direct counter on `_draw_by_rule` returning True. Rejections are recorded in the
+manifest with their reason, so they are auditable rather than invisible:
+
+| reason | candidates |
+|---|---:|
+| a node in range is terminal (mate found) | 6 |
+| `_draw_by_rule` fired (repetition / fifty-move) | 1 |
+
+`test_corpus_is_certified_quiet` re-asserts those counters from the manifest and
+additionally requires the rejected list to be **non-empty** — a corpus selected
+without the audit ever firing is a corpus whose quietness nobody checked.
+
+## Positions come from the benchmark PGNs, reconstructed from their own FENs
+
+Sampled one per game from the 200-game fixed-node match (the 2687.7 anchor),
+seeded, filtered on piece count, halfmove clock, branching, not-in-check and no
+repetition in history. Game-realistic rather than constructed, per scope 3.
+
+Each accepted position is then **rebuilt from `board.fen(en_passant="fen")`**,
+which does two things:
+
+* drops the move stack, so `build_repetition_history` sees only the position
+  itself and the run is fully reproducible from what the manifest records — the
+  C++ side is handed a FEN and has no game history either;
+* keeps the ep square after a double push with no legal capture. python-chess's
+  **default** `fen()` omits it, which would move token 66 and therefore the
+  `nn_key` on ~3% of positions. Same trap as C2's, in a new place.
+
+## Golden layout: visited subtree at 5,000 sims, full tree at 800
+
+A 5,000-simulation tree holds ~175,000 nodes, of which ~5,000 have any visits.
+Serialising all of them for 40 runs would be ~420 MB.
+
+*Chosen: the 5,000-simulation runs record the **visited** subtree; four positions
+are additionally run at 800 simulations recording **every** node.* Unvisited
+nodes carry visit 0 and `value_sum` 0.0 on both sides by construction, but their
+priors are not trivial and their order **is** the canonical ordering under test —
+so the full-tree runs are what make the whole-tree claim measured rather than
+argued. Result: 431,862 nodes across 48 runs, 2.0 MB compressed.
+
+* *Alternative rejected — a digest of the unvisited children.* Cheaper, but a
+  digest cannot name the divergent node, and the brief is explicit that a bare
+  "trees differ" is an immediate fail.
+
+Priors are stored as **float32** and that is lossless, not a compromise:
+`expand()` softmaxes a float32 tensor and `.tolist()` promotes exactly, so every
+prior is the exact double promotion of a float32. Asserted per value in
+`write_dump` rather than argued, because if it ever stopped being true the golden
+file would silently lose the bits Gate 1 compares. `value_sum` stays float64 — it
+is an accumulated sum and there is nothing exact about it.
+
+## `c_puct` is exposed, and the generator was left on pure Python anyway
+
+The brief requires `c_puct(n)` exposed so a harness can put the same log on both
+sides and libm differences cannot fail the gate. It is exposed
+(`guofish_core.c_puct`, and per-instance `ReplaySearch.c_puct`).
+
+*Chosen: do not route the golden generator through it.* Instead
+`test_c_puct_matches_python_bit_for_bit` sweeps every integer parent-visit count
+to 20,000 at both virtual-loss offsets (40,002 values) and asserts C++ and
+CPython agree **bit-for-bit**. They do — both resolve `log` through the same
+UCRT on Windows. So the guarantee the brief wanted is obtained by *proof* rather
+than by construction, and Global Rule 2 stays clean: nothing in
+`tools/gen_gate1_golden.py` imports `guofish_core`, so the golden trees owe
+nothing to the implementation under test.
+
+If that test ever fails, the reasoning is void and the generator must be changed
+to call the binding. The test says so in its failure message.
+
+## `c_factor` is guarded rather than multiplied
+
+`1.0 * x == x` holds exactly in IEEE-754 for every finite x, so an unconditional
+multiply would also be safe. It is written as `if (c_factor != 1.0) c *= factor;`
+anyway, so "the default path does not touch the value" is visible in the code
+rather than resting on a footnote — and it mirrors how the reference guards
+`policy_temperature`. `test_c_factor_defaults_to_a_true_no_op` asserts the
+default agrees with the free function bit-for-bit and that a non-default factor
+actually applies.
+
+## Virtual loss: integer count, magnitude at read time
+
+Required by the brief and implemented as required, but worth recording *why* the
+obvious alternative is not merely inelegant. Mutating the stored `value_sum` by
+the penalty and un-mutating it on repay leaves a floating-point residue at
+VL 2.5, because the two operations are not exact inverses in double. A quiescent
+tree would then not return to its pre-descent state, and Gate 1's VL 2.5 run —
+the semantically representative one — would be unreachable. With an integer
+count, apply and repay are exact inverses at any magnitude.
+
+Repayment is a destructor (`Unwind`), not a `finally`. This is what lets C8
+delete `_reset_virtual_loss`'s defensive full-tree walk (3.4 ms at 2k sims,
+937 ms per game) rather than porting it.
+
+## `parent_` and `raw_move_` live outside the SoA arena
+
+Two parallel `std::vector`s indexed by node, not two more arena arrays.
+
+Neither is read by the sibling scan. `parent_` is walked once per backup and
+`raw_move_` once per descent step, whereas `visit_count`/`value_sum`/`prior` are
+read for **every sibling** at **every** selection step. Putting either in the
+arena would add cache lines to the one loop C4's layout exists to keep tight,
+for no benefit to the loops that do read them.
+
+`raw_move_` is the library's packed move; `arena.move()` is the *normalised*
+packing (castling as e1g1, not e1h1). Both are needed and they are not the same
+value — which is also why the diagnostic path prints the arena's: re-deriving the
+normalisation from the raw move would need the board as it stood before the
+castle, and the descent has already moved past it.
+
+## Mutation check
+
+`tools/drill_c5_gate1.py`, Amendment B: corrupted copies in a scratch directory,
+the suite pointed at them through `GUOFISH_GOLDEN_GATE1_*`, `golden/` never
+opened for writing. All four drills produced a failure naming the divergent
+node's path from the root.
+
+| drill | result | first divergence |
+|---|---|---|
+| `gate1_trees.npz` `value_sum[1]`, one ulp | FAILED as required | DFS index 1, path `a1a2` |
+| `gate1_trees.npz` `visits[1]`, +1 | FAILED as required | DFS index 1, path `a1a2` |
+| `gate1_dump.npz` first prior of each root entry, one ulp | FAILED as required | DFS index 1, path `a1a2` |
+| `gate1_dump.npz` interior values, +1e-9 | FAILED as required | DFS index 0, `(root)` |
+
+SHA-256, before and after the whole drill, unchanged:
+
+```
+gate1_dump.npz       b0332e8f0adfd7b4f9112210342e004610d7d6215920fe5e9eb7cf609426256e
+gate1_manifest.json  e0b9c342555a1e280ab80efbb339467aaf88a8e9051fef01e23f28caf3ac6748
+gate1_trees.npz      aec5135e0a82f0f5baa1ef4cf39a5372090946bc40b940c83fe255371e357440
+```
+
+**Two failed drills that were the drill's fault, and are worth recording because
+each is a way a mutation check gives a false all-clear.**
+
+1. *Mutating `priors[0]`.* The dump is sorted by `(nn_key, is_root)`, so an
+   entry's index says nothing about which position it belongs to — and the dump
+   also carries entries from the 7 rejected candidates, which no accepted run
+   ever looks up. The first drill corrupted a position nothing reads and the
+   suite stayed green. Fixed by mutating the first prior of **every** root entry
+   (26 of them), which is still a 26-float change out of ~4 million and is
+   guaranteed to include the position under test.
+
+2. *One ulp on the **root's** value.* This genuinely does not diverge the tree,
+   and that is a real property rather than a gap. The root's `value_sum` is
+   seeded with the value and then accumulates ~800 backups; once the running sum
+   passes ~1, its own ulp (2.2e-16) swallows a 1e-16 seed difference. The root's
+   value is also never read back by selection — only its children's are. So the
+   value drill perturbs **interior** entries, whose values enter each node's Q
+   and therefore selection. Recorded because "one ulp anywhere must diverge the
+   tree" is a plausible-sounding claim that is false, and a future drill built on
+   it would silently pass.
+
+## Build and sanitizers
+
+| build | result |
+|---|---|
+| Windows / MSVC 19.51, Release, `/W4` | clean, 419 passed in 34 s |
+| Windows / MSVC 19.51, Debug + `/fsanitize=address`, asserts live | clean, 419 passed in 257 s |
+| Linux / Clang 18, Debug + `-fsanitize=address,undefined`, `-Wall -Wextra` | clean, 419 passed in 90 s |
+
+No `-Wno-*`, no warning pragmas, no `#pragma pack`. `cpp/search.hpp` contains no
+`reinterpret_cast`. LSan reports 1.35 MB leaked in 1,254 allocations, all in
+CPython and NumPy import paths; `build/asan-leakcheck.sh` confirms **no leaked
+allocation's stack mentions `guofish_core`**. UBSan: no runtime errors.
+
+**One warning, caught by Clang and not by MSVC**, which is Global Rule 8 paying
+for itself directly: an unused `chess::Move` local in `ep_pin_probe`. MSVC does
+not warn on an unused const local initialised by a function call, since the call
+may have side effects. Removed.
+
+## Amendment C
+
+Rule 6 as stated for this chunk requires the comment on the **preceding** line.
+The pre-existing `reinterpret_cast` in `cpp/bindings.cpp`'s `AlignedBuffer`
+constructor already carries it there, as do both in `cpp/arena.hpp`. Nothing to
+fix; the amendment is discharged.
+
+## Not done
+
+* **`bestmove` / move selection.** The search builds and serialises a tree; it
+  does not pick a move. Nothing in Gate 1 needs it and it would ship unverified.
+* **Terminal handling** (C6), **cache** (C7), **tree reuse** (C8),
+  **concurrency** (C9), **real evaluator** (C10) — all out of scope, and none of
+  them is stubbed. `set_children` still refuses a zero child count and
+  `mark_terminal` still refuses a node with children, so C6 inherits the
+  structural invariant rather than having to add it.
+* **Fivefold repetition and the seventy-five-move rule** are not detected even as
+  errors. A position with no legal moves throws and any position the reference
+  did not evaluate is a dump miss, which covers checkmate and stalemate; the
+  remaining `is_game_over()` conditions are covered only by the generator's audit
+  certifying they never arise in this corpus. C6 makes them first-class.
+* **`Q32ReplaySearch` is bound but not compared against golden data.** It exists
+  so the fixed-point instantiation cannot rot behind an `#ifdef`, on the same
+  reasoning as C4's two arenas. It does not reproduce Python's float arithmetic
+  and Gate 1 does not run it; C9 is where it becomes the accumulator under test.
+* **The dump carries entries from rejected candidates** (108,966 entries against
+  ~200,000 expansions across accepted runs, with sharing). Harmless — nothing
+  looks them up — but it inflates the file, and it is what made the first
+  mutation drill a no-op. Left as generated rather than regenerated, since
+  regenerating golden data to tidy it is exactly the habit Rule 2 exists to
+  prevent.
+* **C3b is still open**, and the chunk list marks it as blocking C5. See the
+  handback note: the three defect fixes in `core/mctsv4.py` still have no
+  committed test, so this chunk's golden data rests on a reference nothing in the
+  repository regression-tests. What C5 could do about it without straying into
+  C3b's scope, it did: the manifest records the SHA-256 of `core/mctsv4.py`, and
+  the generator asserts the equivalence configuration is bit-deterministic across
+  runs (verified over 5,000 nodes), which is one of the four things C3b asks for.
+
+## Global Rule 1
+
+Nothing under `tests/` was modified: `tests/test_c5_gate1_quiet.py` and
+`tests/test_c5_ep_pin.py` are new files, and `git status` over `tests/` shows two
+untracked files and nothing else. Nothing under `golden/` was modified —
+`gate1_dump.npz`, `gate1_trees.npz` and `gate1_manifest.json` are new, generated
+by `tools/gen_gate1_golden.py` from the Python reference, and the four existing
+golden files are untouched. The drill's before/after hashes above are the proof
+for the new ones.
+
+`core/mctsv4.py` was changed, and only as the brief's canonical-ordering patch
+requires: a `GATE1_CANONICAL_ORDER` flag defaulting to **False**, a
+`_canonicalize_children` helper, and one call at each of the two sites the brief
+names. With the flag off the search executes the same instructions it did before.
+
+---
+
+# C6 — Terminal handling, full Gate 1 (2026-08-06)
+
+Gate 1 passes on the FULL corpus. 106 recorded runs compare bit-exactly — C5's
+48 quiet runs re-run through the new code, plus 58 new terminal runs (25
+positions x 2 virtual-loss magnitudes, plus 4 positions x 2 magnitudes recording
+every node) — on visit counts as integers, `value_sum` as a 64-bit pattern,
+priors as a 32-bit pattern, the terminal bit, the cached terminal value, and the
+same nodes in the same canonical DFS order. 12,428 of the 206,704 recorded
+terminal-corpus nodes carry the terminal bit.
+
+The brief calls this the second-highest-risk chunk and says the engine's
+historical defects clustered here. They did, and all of them are the same defect
+wearing different clothes: **one flag was asked to answer two questions.**
+`MCTSNode.is_expanded` meant both "has anyone generated this node's children" and
+"is there anything to generate", and `bestmove 0000` is what happens when those
+two answers differ. Almost every decision below is downstream of separating them.
+
+## The structural fix, and the one place C++ deliberately does NOT copy the reference
+
+`cpp/arena.hpp` already had the shape from C4: a three-valued **lifecycle** in the
+low bits of an atomic byte and a **terminal bit** in the high bit, with
+`set_children()` refusing a zero count or a terminal node and `mark_terminal()`
+refusing a node with children. C6 is the chunk that finally exercises it.
+
+The consequence is a knowing behavioural difference from the reference, and it is
+worth being explicit about rather than burying:
+
+| | reference | C++ |
+|---|---|---|
+| checkmate / stalemate leaf | `is_terminal = True`, **`is_expanded = True`**, `children = {}` | terminal bit set, lifecycle stays `Unexpanded` |
+| fifty-move / threefold leaf | `is_terminal = True`, `is_expanded` left `False` | identical |
+| depth cap | nothing marked | identical |
+
+The reference's own comment (`core/mctsv4.py:1287`) explains why setting
+`is_expanded` on the checkmate path is "harmless WITHIN the search" — selection's
+condition is `is_expanded AND children`, so it bails on the empty dict either
+way. That is true, and it is exactly why the difference is *unobservable in the
+tree*: the C++ node is `Unexpanded` with zero children, the Python node is
+`Expanded` with zero children, and the loop condition rejects both. Gate 1
+compares 90 runs node for node and cannot see it.
+
+What it is not is harmless *outside* the search, which is the reference's other
+comment (`core/mctsv4.py:1222`) and the reason `search()` and `get_policy()` both
+carry an `or not root.children` recovery. C++ does not need the recovery because
+it never writes the state. Given the choice between transcribing a flag the
+reference itself has to defend against and not writing it, this chunk does not
+write it — and `tests/test_c6_terminal_invariants.py` asserts the state is
+unrepresentable in both orders (`mark_terminal` then `set_children`, and the
+reverse), on the API and over every node of every corpus tree.
+
+**Alternatives rejected.** Making `TERMINAL` a fourth `NodeState` was the obvious
+compaction and is wrong for a specific reason: the two questions would share a
+field again, so "terminal" would necessarily overwrite "unexpanded", and a
+terminal node promoted to a root could no longer say *"I have never been
+expanded, expand me"* — which is the whole recovery path. Asserting the invariant
+in a test rather than enforcing it at the write site was the other option; a test
+catches it after the fact and only where a test looks.
+
+## The depth-1 mate short-circuit is replicated verbatim (brief requirement)
+
+```python
+if depth == 1 and node.terminal_value == 1.0 and node.move is not None:
+    self.stats['mating_move'] = node.move
+    self.completion_event.set()
+```
+
+`ReplaySearch::maybe_mate_short_circuit` is that, transcribed, at both call sites
+the reference has it (the cached-terminal fast path and the first-visit
+`is_game_over` path). **It is not improved, generalised or tidied**, per the
+brief. Recording what makes it a hack rather than a feature, so a later reader
+does not mistake the transcription for an endorsement:
+
+* it is welded to `depth == 1` and to the exact double `1.0`, so a mate in one
+  found at depth 3 by a transposition does nothing;
+* it fires from inside a worker by side-effecting a shared `defaultdict` and
+  setting the completion event, i.e. control flow through mutable shared state;
+* **it truncates the search.** The tree the caller gets back is whatever had been
+  built when it fired. On the three `mate1` corpus positions the reference stops
+  at `root.visit_count == 2` — one seeded visit plus one simulation — out of a
+  requested 5,000.
+
+That last point is the one with teeth for this chunk, and it is why the terminal
+manifest records `root_visits` and `early_exit` per run rather than assuming
+`root_visits == sims` as the C5 manifest could. The C++ `search()` loop checks
+`mating_move_` at the TOP of its loop, which is where `MCTSWorker._work_loop`
+checks `completion_event`, so the simulation that fired it is counted and the
+next never starts. `test_search_accounting_matches_the_reference` requires the
+same truncation rather than merely the same tree — a C++ that ran the full budget
+would fail the tree comparison too, but as a shape divergence at an arbitrary
+node, which says nothing about the cause.
+
+`mating_move_` is reset at the start of every `search()` call, because the
+reference builds a fresh `stats` dict per call and a mate found by a previous
+call must not stop the next one before it starts.
+
+## `is_game_over()` is transcribed, not delegated to chess-library
+
+chess-library has `Board::isGameOver()`. It answers a different question, and the
+difference is the shape of the whole chunk:
+
+| | chess-library | python-chess (`claim_draw=False`) |
+|---|---|---|
+| repetition | **threefold** | **fivefold** |
+| move rule | **fifty-move** | **seventy-five-move** |
+| insufficient material | yes | yes |
+| checkmate / stalemate | yes | yes |
+
+The library reports the **claimable** draws; python-chess ends a game only on the
+**automatic** ones and leaves the claimable pair to the caller. The reference
+handles that pair itself, in `MCTSWorker._draw_by_rule`, path-dependently and
+against a history the position alone does not carry — and it deliberately leaves
+those nodes unexpanded so a host that declines the claim can still play from
+them. Delegating to `isGameOver()` would collapse the two categories into one and
+reintroduce the exact defect this chunk exists to remove.
+
+Its repetition counter is wrong for us for a second, independent reason: it
+counts over `prev_states_`, which chess-library fills from its own `makeMove`.
+Our history is not that stack — it is the game handed in at the root plus the
+current simulation's path — so the count has to be taken there.
+
+So `cpp/terminal.hpp` transcribes `Board.outcome()`'s clauses one at a time.
+`tests/test_c6_gate1_full.py` diffs each against python-chess directly (via the
+`terminal_reason`, `insufficient_material` and `move_rule_probe` bindings), and
+during development the same predicates were fuzzed over 4,000 random self-played
+games — 4,000 positions and ~24,000 move classifications, including 184
+checkmates, 12 stalemates and 1 insufficient-material position — with zero
+disagreements. The end-to-end gate is the acceptance criterion; these exist
+because the gate is a *poor diagnostic*. A wrong bishop clause shows up there as
+"the trees have different node counts at ply 14".
+
+### The order of the tests is part of the answer
+
+`Board.outcome()` asks: checkmate, **insufficient material**, stalemate,
+seventy-five moves, fivefold. Insufficient material comes *before* stalemate, so
+a bare king stalemated by a lone king and knight is reported as
+INSUFFICIENT_MATERIAL. Both back up 0.0, so nothing in this chunk can observe the
+difference — which is precisely why it is transcribed in the reference's order
+and pinned by a test (`test_insufficient_material_is_asked_before_stalemate`).
+The moment anything reads the reason rather than the value, a reordering starts
+lying.
+
+### `has_insufficient_material` has two quirks and both are transcribed
+
+* The bishop clause's same-complex test reads **`self.bishops`** — both colours'
+  bishops — and `self.pawns` / `self.knights` globally, not this colour's. So
+  "I have only a bishop" is judged against the whole board. That is the correct
+  reading of the FIDE rule and it is what the reference does. The first draft of
+  the `threefold-opp-bishops` corpus spec walked straight into it: a bishop each
+  on the *same* complex made the root position insufficient material and
+  therefore already over. It is now on opposite complexes, and the quirk has its
+  own test case.
+* The knight clause requires the OPPONENT to hold nothing but kings and queens,
+  because a knight can force a selfmate against anything else.
+
+### The terminal value is 1.0 or 0.0, and -1.0 is unreachable
+
+The reference derives it from `board.result()`:
+
+```
+"1-0" -> +1.0 if Black is to move else -1.0
+"0-1" -> +1.0 if White is to move else -1.0
+draw  ->  0.0
+```
+
+Checkmate is the only decisive outcome available here, and its winner is
+`not turn` *by definition*, so the first branch is always the +1.0 one: the side
+that just moved is the side that mated. `terminal_value_of` therefore returns
+`reason == Checkmate ? 1.0 : 0.0`, with the derivation written out above it. The
+alternative — transcribing all four branches — would have been more literal and
+less honest, since a terminal node carrying -1.0 would mean the mated side had
+somehow just moved. The brief flags value perspective as a named risk; this is
+where it was discharged, and
+`test_a_checkmate_or_stalemate_terminal_genuinely_has_no_moves` re-derives it
+from the other end (every +1.0 node in the corpus must be a checkmate with no
+legal moves).
+
+## Fivefold repetition and the seventy-five-move rule are implemented and unreachable
+
+`_draw_by_rule` runs at **every descent step** and returns at a halfmove clock of
+100 and at a *threefold*. So by the time a leaf reaches `is_game_over()`, the
+clock is below 100 and no position has occurred three times — which puts the
+seventy-five-move rule (150) and fivefold repetition (5) out of reach *by
+construction*, not by luck of the corpus. Both are still implemented, because
+"unreachable" is a claim about the CALLER and `outcome_of` is a transcription of
+a function that asks. `test_the_seventyfive_move_and_fivefold_rules_never_fire`
+pins the claim over the whole corpus: if C8's tree reuse ever makes one
+reachable, that test fails and the implementation is already there to be checked
+rather than written under pressure.
+
+`ReplaySearch::is_repetition` is python-chess's `is_repetition(count)` including
+its two stopping rules — the walk-back halts at the first irreversible move, and
+at the point where too few moves remain to reach `count` — and its occupancy
+pre-check. It runs over the simulation's own path plus the sim root, because the
+reference's simulation board is `root_board.copy(stack=False)` and python-chess's
+move stack there holds exactly this simulation's pushes.
+
+## The claimable draws: path-dependent, tree-node only
+
+`draw_by_rule` returns a **bool**. The 0.0 is produced by the caller and handed
+to `backpropagate` and to nothing else. There is no function that could write it
+anywhere keyed by position, which is the type discipline the brief asks C6 to
+start and C7's cache has to inherit.
+`test_a_claimable_draw_is_not_a_property_of_the_position` demonstrates the reason
+on real nodes: ask a fifty-move node's position on its own — which is all a
+position-keyed cache could do — and `terminal_reason` says the game is not over.
+
+The transcription keeps one detail the reference has and a tidier version would
+drop: the fifty-move branch returns **before** the repetition key is counted into
+the path tally. It is unobservable (the caller ends the simulation either way),
+and it is kept so a reader can check the two functions line by line.
+
+`path_counts` is a flat `vector<pair<uint64_t,int>>` rather than a hash map. The
+path is at most `MAX_TREE_DEPTH` long, the scan is linear over a contiguous
+12-byte record, and clearing a vector between simulations does not touch the
+allocator — where an `unordered_map` cleared 5,000 times a search would.
+
+## The repetition history crosses the boundary as FENs
+
+`build_repetition_history(board)` walks the root's move stack back
+`min(halfmove_clock, plies)` plies and counts transposition keys, seeding the
+counter with the root itself. The C++ side is handed a FEN, which carries no move
+stack, so `set_position(fen, history)` takes the walked-back positions as a list
+of FENs and counts the root internally.
+
+**FENs rather than pre-computed `rep_key`s**, deliberately. A caller that
+computed keys itself would be a second implementation of the rule C3 exists to
+have exactly one of; passing FENs sends them through the same
+`parse_fen` -> `rep_key` path as everything else, so the raw-ep discipline is
+inherited rather than restated. The generator writes them with `fen_of()` (raw ep
+square) for the same reason C2 gives: python-chess's default `fen()` omits an ep
+square with no legal capture, which would move token 66 on ~3% of positions.
+
+This is also the only input that can be silently ignored without failing anything
+else in the repository — every position in C5's quiet corpus has an empty
+history, so a `set_position` that dropped the argument would pass the whole of
+Gate 1's quiet half and then claim draws no game had reached.
+`test_history_changes_the_draw_verdict` runs one FEN twice, with and without its
+recorded history, and requires the draw count to move.
+
+## Board state: our own halfmove clock, and one `ParsedFen` per descent step
+
+`SearchBoard` now carries a halfmove clock alongside its raw ep square, with its
+own stack so `unmake_move` restores it exactly. It is an `int`, not a read of
+`Board::halfMoveClock()`, because chess-library stores that field in a
+`std::uint8_t`. The search cannot in fact drive it past 150 — a node at 100 is a
+fifty-move draw and is never descended through — but a silent wrap at 255 in the
+rule this chunk is *about* is not a dependency worth taking on a field's width.
+
+`make_move` takes `zeroing` as an argument rather than computing it. That looks
+like a leak of responsibility and is a measured one: `is_zeroing` needs the
+`ParsedFen` of the position *before* the move, the descent is already holding one
+(the previous step's *after* is this step's *before*), and computing it inside
+`SearchBoard` would mean a second full 64-square rebuild per step. The descent
+therefore threads one `ParsedFen` through, and it serves three consumers: the
+move classifiers for the next step, `rep_key` for this one, and `nn_key` at the
+leaf. **One rebuild per descent step, not three.**
+
+Both move classifiers are fed the **normalised** UCI destination (g1/c1), never
+chess-library's king-takes-rook encoding. For `is_zeroing` the two happen to
+agree — the rook square holds our own rook, not the opponent's — but
+`_reduces_castling_rights` compares the destination against the castling rights,
+and the castling rights *are* the rook squares, so there the two encodings give
+different answers and every castle would read as irreversible for the wrong
+reason.
+
+## `best_move()` exists now, and C5 said it would not
+
+C5's "Not done" list says the search builds and serialises a tree and does not
+pick a move, because nothing in Gate 1 needed it. C6's acceptance criterion 3 —
+"a terminal node promoted to root still yields a legal move" — is a statement
+about the move, so it is added here:
+`max(root.children.items(), key=visit_count)` returns the *first* maximal element
+in dict order, and dict order is insertion order, which the Gate 1 patch makes
+canonical order, so a strict `>` over the children in arena order is the same
+tie-break. The mating move takes precedence, as it does in the reference.
+
+It is compared against the reference's own return value for every run of both
+corpora (`test_the_best_move_agrees_with_the_reference`). A wrong tie-break would
+be invisible in the tree and wrong at the board.
+
+## The depth cap is exercised at 4-7, not at 80
+
+**This is the judgment call in this chunk most likely to be questioned, so it is
+stated plainly rather than buried.**
+
+`MAX_TREE_DEPTH` is 80. A line reaching ply 80 without first repeating a position
+or crossing the fifty-move clock would have to be forty moves of non-repeating,
+clock-resetting play. MCTS does not build one inside 5,000 simulations — every
+attempt ended as a threefold at ply 4 or a fifty-move draw at ply 6, because that
+is what deep shuffling actually produces. Measured for calibration: the C5 quiet
+corpus reaches depth 10-19 at 5,000 simulations.
+
+So the cap is exercised by **lowering it on both sides** and recording the value
+per run in the manifest. The reference reads `mctsv4.MAX_TREE_DEPTH` as a module
+global at each descent step; the C++ side reads `SearchConfig.max_tree_depth`. A
+run at 6 executes exactly the code a run at 80 would, with a constant that is
+reachable. Four quiet C5 midgames run at caps 4, 5, 6 and 7 — chosen so the cap
+fires in the first few hundred simulations rather than only at the very end.
+
+What this does *not* test is the number 80 itself, and that is covered
+separately: `test_the_reference_default_depth_cap_is_still_eighty` asserts the
+C++ default, both manifests' recorded default, and that at least one run used it
+and at least one did not. The drill `depth cap moved by one` corrupts the per-run
+value in the manifest and requires the gate to fail, which is what proves the
+per-run cap is read rather than defaulted.
+
+The depth-cap specs are drawn from the C5 corpus precisely because the C5 audit
+already certified them as reaching no terminal and no draw at full depth. So on
+those runs the cap is the *only* thing that can fire, and
+`test_the_depth_cap_does_not_mark_a_node_terminal` can assert zero terminal marks
+alongside a non-zero cap count — the two halves of "capped is not terminal".
+
+## Two sets of golden files, not a regenerated one
+
+C6 writes `golden/gate1_terminal_{dump,trees,manifest}` and does not touch the
+C5 files. Global Rule 2 forbids regenerating golden data to make a test pass, and
+the cheapest way to be sure that did not happen is for the C5 files' bytes to be
+untouched by this chunk — their SHA-256s are unchanged and the drill prints them.
+
+`tests/test_c6_gate1_full.py` loads both and runs both. Re-running the quiet
+corpus is not redundancy: C6 changed the code that produces it. Terminal
+detection runs at every descent step and every leaf, the clock and the repetition
+key are maintained on every move, and `set_position` now builds a history. The
+only way to know none of that perturbs a quiet tree is to run them again through
+the new code — and doing it here means a C6 regression that only shows on quiet
+positions fails a C6 test rather than being blamed on C5.
+
+`write_trees` gained `terminal` and `terminal_value` columns. The quiet files
+predate them; `_golden_run` fills the missing columns with zeros, which is the
+reference's answer for a corpus certified to contain no terminal node and which
+the C++ side is then required to match exactly. A quiet run that produced a
+terminal node fails there.
+
+## The corpus is hand-specified, and every position arises from legal moves
+
+25 positions across the eight classes the brief names. Hand-specified rather than
+sampled because the thing being tested is rare on purpose: C5's audit rejected 7
+of 27 benchmark midgames for touching *any* of this machinery, which is the rate
+at which it turns up by accident.
+
+The brief's validation clause says the corpus must not accidentally rely on the
+`has_legal_en_passant` boundary from C3, where a hand-written FEN can name an ep
+square no legal double push could have set and `rep_key` and `nn_key` then
+disagree about a position no game reaches. Two things close it, both asserted by
+`test_the_terminal_corpus_cannot_rely_on_the_en_passant_inconsistency`:
+
+* every base FEN's ep field is `-`, so there is nothing to be inconsistent about,
+  and each base is checked with `Board.is_valid()`;
+* every root that is not a base is reached by **pushing legal moves** onto one, so
+  its ep square is whatever python-chess's own `push()` set — the raw rule, by
+  construction, which is the rule the C++ side derives.
+
+**The halfmove clock IS written by hand** on the fifty-move specs (94-96), and
+that is a different thing from the ep field, not an exception to the rule. The
+clock is cross-checked against nothing, no key reads it, and a FEN carrying 92 is
+exactly as consistent as one carrying 0. Reaching 92 by playing 92 reversible
+moves would produce the same position and ninety lines of move list.
+
+The repetition specs are built by playing a shuffle onto the base, which is what
+gives the root a move stack and therefore a repetition history — a threefold is
+otherwise nearly unreachable inside search range.
+
+## Two corpus specs that did not test what they claimed, and why that matters
+
+Both were caught by the generator's coverage guard, which refuses to write golden
+data if any class never fired. Recorded because they are the failure mode a
+hand-specified corpus has, and a `categories` label is not evidence:
+
+* **`fifty-rooks`, first draft.** Rooks facing on the d-file at clock 90.
+  Produced *zero* fifty-move hits in 1,500 simulations. The reason is a property
+  of MCTS, not of the rule: `Rxd8` wins a rook, its prior is near 1 and its Q
+  near +0.9, and at `FPU_ROOT` 0.0 an unvisited sibling scores
+  `c*P*sqrt(N)/1 ~ 0.05`. The winning capture is never displaced, so every
+  simulation went down it, the clock was zeroed at ply one every time, and the
+  other nineteen root moves were never visited at all. A spec meant to exercise a
+  rule must not contain a move that eats the whole search. Now rooks that cannot
+  capture each other, in a dead-drawn R+K vs R+K at clock 96.
+* **`threefold-pawn-chain` and `threefold-opp-bishops`, first drafts.** Primed
+  with a four-ply shuffle, so only the ROOT position's history was raised to 2 and
+  a threefold needed MCTS to close a four-ply loop. At five to fourteen moves a
+  side it never did. Now primed with eight plies — two loops — which raises the
+  history of *every* position on the loop, so a threefold is reachable one ply
+  into a simulation.
+
+The guard itself is the point: `_run_terminal` counts what the reference actually
+did and returns non-zero rather than writing a file a test would then certify as
+covering C6.
+
+## Performance: terminal handling costs ~40% on a quiet position
+
+Measured, not estimated. The C5 corpus under the C6 build: **5.63 -> 8.25 us/sim
+at VL 0.0, 6.44 -> 8.62 at VL 2.5.** Every bit of that is work done on positions
+where none of the machinery fires — the C5 corpus is certified to contain no
+terminal and no draw — so it is the pure overhead of establishing that nothing
+happened: a `ParsedFen` rebuild, an FNV-1a over ~90 bytes for `rep_key`, a linear
+scan of the path tally, a clock update and two move classifiers per descent step,
+plus `inCheck()` and a legal-move count at every leaf.
+
+The headroom claim scope 2.2 rests on survives: 29x the Python engine's 236
+us/sim of real CPU work, down from 37-42x and still nearly 3x the "conservative
+10x" the scope projected, which is ~7x headroom on a single thread against
+batch-64 GPU throughput. The C9 worker count stays a selection-quality decision.
+
+What would remove most of the cost is making `rep_key` incremental — updating it
+from the move rather than rebuilding from the board. That is deliberately NOT
+done here: C3's entire argument for FNV over an explicit serialisation, rather
+than a Zobrist, is that an incremental update is where the three en-passant rules
+silently diverge. It is a change with its own correctness surface and it is not
+this chunk's.
+
+The terminal corpus benches *faster* (3.5 us/sim), which is not a paradox and is
+not a cost measurement: a simulation that ends in a claimable draw at ply four
+never reaches the leaf, so it never tokenizes, never looks anything up and never
+expands. It is recorded as a regression tripwire on the two pieces of C6 whose
+cost is not obviously bounded — the per-path tally and the fivefold walk-back.
+Full numbers and the reasoning in BENCH.md.
+
+## Mutation check
+
+`tools/drill_c6_gate1.py`, Amendment B: seven corruptions of the terminal golden
+data, each required to fail its suite **naming the divergent node's path from the
+root**, with `golden/`'s SHA-256 printed before and after to prove it was never
+written to. All seven produced the required failure and all three digests are
+unchanged. Four of the seven have no C5 equivalent because the fields did not
+exist:
+
+| drill | how it fails |
+|---|---|
+| terminal bit cleared | `terminal : golden 0 c++ 1 <-- DIFFERS` at `a1a8` |
+| terminal bit set | `terminal : golden 1 c++ 0 <-- DIFFERS` at `(root)` |
+| terminal value flipped | `terminal_value : golden 0x0 (0.0) c++ 0x3f800000 (1.0)` at `a1a8` |
+| depth-cap frontier visits +1 | `visit_count : golden 2 c++ 1` at a 17-move path |
+| depth cap moved by one | ReplayMiss naming the FEN, key and path `h2h3 c6d4 e3d4 b7b6` |
+| repetition history dropped | ReplayMiss naming the path `e1e2 e8e7` |
+| dump root priors, one ulp | `prior : 0x3d68a3b1 vs 0x3d68a3b2` at `b4a4` |
+
+The last two deserve a note. Both fail through a **replay dump miss** rather than
+through the tree comparison, and that is the louder of the two failures, not the
+weaker one: the search walked into a position the reference never evaluated, and
+the message carries the FEN, the `nn_key`, the raw ep square and the path. The
+drill's evidence check accepts either shape and was widened to say so — the first
+version rejected the depth-cap drill for "printing no DFS path" when it had
+printed a better one.
+
+`tools/drill_c5_gate1.py` was re-run unchanged: all four C5 drills still produce
+a path-naming failure, and the C5 golden digests are unchanged.
+
+## Build and sanitizers
+
+Warning-clean at `/W4` (MSVC 19.51) and `-Wall -Wextra` (Clang 18), no
+suppressions, no `-Wno-*`, no pragmas.
+
+| build | result |
+|---|---|
+| Windows / MSVC, Release | 821 passed, 48 skipped, 36 s |
+| Windows / MSVC, Debug + `/fsanitize=address` | 821 passed, 48 skipped, 399 s |
+| Linux / Clang, Release | 821 passed, 48 skipped, 25 s |
+| Linux / Clang, Debug + ASan + UBSan + LSan | 821 passed, 48 skipped, 151 s |
+
+UBSan: **no runtime errors**. LeakSanitizer reports 1,348,938 bytes in 1,254
+allocations, which is the documented CPython + numpy interpreter-lifetime
+baseline; `grep guofish_core` over the leak report finds **nothing**, which is
+the discriminating check README_BUILD.md specifies rather than a suppression.
+
+The 48 skips are `test_the_terminal_census_matches_the_reference` on the 48 quiet
+runs: the C5 manifest predates the census columns, so the test skips with a
+reason rather than asserting against absent data.
+
+## Not done
+
+* **The claimable-draw value still has no *type* that forbids caching** — there
+  is no cache yet to forbid it from. What C6 owes is that the value is produced
+  as a `bool` return and consumed by `backpropagate`, with no storage in between,
+  and that is what it does. C7 adds the entry type that makes the prohibition
+  compile-time.
+* **Tree reuse** (C8) is what makes an already-expanded interior node able to
+  *become* a draw. The reference's draw check runs on every descent step for that
+  reason, and C6 transcribes it, but with no reuse a node's verdict is fixed by
+  its path and cannot change between simulations. So the code is exercised; the
+  scenario that motivated it is not.
+* **A natural depth-80 hit.** See above; the cap is exercised at 4-7 and the
+  constant is checked separately.
+* **`Q32ReplaySearch` is still bound but not compared against golden data**, on
+  the same reasoning as C5.
+* **`terminal_nodes()` re-derives every path by make/unmake** rather than caching
+  FENs at mark time. It is a test-facing diagnostic called once per run, not a
+  search path.
+
+## Global Rule 1
+
+**Nothing under `tests/` was modified.** `tests/test_c6_gate1_full.py` and
+`tests/test_c6_terminal_invariants.py` are new files; `git status` over `tests/`
+shows four untracked files (two of them C5's, still uncommitted) and no
+modifications.
+
+**Nothing under `golden/` was modified.** The three C6 files are new and were
+produced by `tools/gen_gate1_golden.py --corpus terminal`, i.e. by the Python
+reference, with no C++ in the process — the generator imports `chess`, `torch`
+and `core.mctsv4`, and does not import `guofish_core`. The seven pre-existing
+golden files are untouched; their SHA-256s were recorded before the C6 run and
+verified unchanged after it, and both mutation drills print the same digests
+before and after their own runs.
+
+```
+8e2e1d34e7752e7116730017d8ee5a38c11f2fd39a08f85d397dc3c14532b9ac  gate1_terminal_dump.npz      (new)
+b45008fd142d0bbca9081360e0b6ebf27c3592ed349251da0f2ed40975da3f40  gate1_terminal_trees.npz     (new)
+c08d8eb173bd2008c8a0c78b54b18575d870ec55c59ab6463514c049a6809f48  gate1_terminal_manifest.json (new)
+b0332e8f0adfd7b4f9112210342e004610d7d6215920fe5e9eb7cf609426256e  gate1_dump.npz               (unchanged)
+aec5135e0a82f0f5baa1ef4cf39a5372090946bc40b940c83fe255371e357440  gate1_trees.npz              (unchanged)
+e0b9c342555a1e280ab80efbb339467aaf88a8e9051fef01e23f28caf3ac6748  gate1_manifest.json          (unchanged)
+1754e3aab46825f6c0289a9a7b26dd0ca6ead4a58bc0d287a886e1b0de6151a2  movegen.jsonl                (unchanged)
+ea9bf8dfe40196460b6c2d4a0c47217d64998193eb1b4a9f7bb2697b413ce562  tokens.npz                   (unchanged)
+a901750f28aa37490ac96c2d1a321e80ad50a175f1eaa5010820b519642ca504  keys.jsonl                   (unchanged)
+b0a91bc7e4e1a0f598a2577ad8b331bd6d9e46dac610d51e46f267e55c3e96fc  keys_adversarial.jsonl       (unchanged)
+```
+
+The terminal data was in fact generated twice. The first run's determinism
+self-check landed on `mate1-backrank`, where the depth-1 short-circuit stops the
+reference at two nodes — re-running that and finding it identical proves almost
+nothing — so the generator was changed to pick the LARGEST recorded tree instead
+and the corpus was regenerated. The two runs produced identical coverage counters
+and identical node totals, which is itself a determinism result; the committed
+files are the second run's, whose check is over 4,975 nodes. **That is a fix to
+the generator, not a regeneration to make a test pass** (Global Rule 2): no test
+was failing, and the check the second run performs is strictly stronger.
+
+**`core/mctsv4.py` was not touched by this chunk.** It still carries exactly C5's
+canonical-ordering patch — a `GATE1_CANONICAL_ORDER` flag defaulting to False, a
+`_canonicalize_children` helper, and one call at each of the two sites the C5
+brief names. `git diff core/mctsv4.py` is 53 added lines and zero changed ones.
+
+**Global Rule 3.** The full suite passes on all four builds: 821 passed, 48
+skipped, on Windows/MSVC Release and ASan and on Linux/Clang Release and
+ASan+UBSan. Every previous chunk's tests are included and none was modified.

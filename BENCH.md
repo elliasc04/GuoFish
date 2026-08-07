@@ -520,3 +520,177 @@ Overflow needs 2^31 = 2.1e9 visits at |v| = 1, against a 15k-sim budget.
 * Both arenas are filled by the same deterministic LCG (not `<random>`, whose
   distributions are not pinned across implementations), so the two columns scan
   identical logical trees.
+
+---
+
+## C5 — Search throughput on the replay evaluator
+
+**Read this as a headroom check, not as a Gate 4 projection.** What is measured
+is the traverse loop and only the traverse loop: PUCT selection over ~35 siblings
+per descent step, virtual-loss apply and repay, tokenization and `nn_key` at
+every leaf, a hash lookup, expansion of ~35 children, and backup to the root.
+Everything Gate 1 compares, and nothing else.
+
+Two things that dominate the real engine are absent, and quoting this number as
+a throughput projection would be flattering in exactly the wrong direction:
+
+* **No network.** The replay evaluator is an `unordered_map` lookup. In
+  production a leaf costs a batched GPU forward — 4.86 ms at batch 64, ~13.2k
+  evals/s — which is the actual ceiling. This measures the CPU spent *around*
+  that ceiling.
+* **No cache, no tree reuse, no concurrency.** C7, C8 and C9.
+
+Reproduce with `python tools/bench_c5.py --trials 5 --markdown`.
+
+### Windows / MSVC 19.51, Release, Python 3.13.7 (i5-12600K)
+
+20 quiet positions x 4,999 simulations each = 99,980 delivered simulations per
+trial, median of 5 trials, single-threaded.
+
+| virtual loss | positions | sims | median s | sims/s | us/sim | vs Python CPU |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.0 | 20 | 99,980 | 0.562 | 177,761 | 5.63 | 42x |
+| 2.5 | 20 | 99,980 | 0.644 | 155,321 | 6.44 | 37x |
+
+Dump load (108,966 entries / 3,989,554 moves, from NumPy arrays into two hash
+tables and two vectors): **0.01–0.02 s**.
+
+### What the ratio means
+
+Scope 2.2 sizes C9's worker count on the claim that *CPU descent capacity is not
+the constraint*, and it projected "a conservative 10x for C++" against the
+Python engine's measured 236 us/sim of real CPU work (479 ms per 2,030
+simulations, recon). **The measured factor is 37–42x**, so the projection holds
+with a wide margin:
+
+* At 5.63 us/sim, one thread delivers ~178k sims/s against the ~16.5k sims/s
+  that batch-64 GPU throughput supports at a ~20% cache hit rate. That is ~11x
+  headroom on a single thread, before any of C9's eight.
+* The C9 default of **W = 8, K = 8** therefore stays a *selection-quality*
+  decision rather than a throughput one, which is what scope 2.2 argued and this
+  is the first measurement that supports it.
+
+The VL 2.5 column costs **14% more per simulation** than VL 0.0. That is not
+overhead in the virtual-loss bookkeeping — the apply/repay path is identical, an
+integer increment either way — it is the search doing different work: a nonzero
+virtual loss widens selection, so descents run marginally longer and touch more
+distinct nodes. Worth recording because C9 will re-measure it under contention,
+where the same 14% could easily be mistaken for a synchronisation cost.
+
+### Measurement notes
+
+* Benchmarked on a **Release** build; `tools/bench_c5.py` prints the compiler,
+  sanitizer and assert status in its header. The ASan build runs the same suite
+  roughly 7x slower (256 s vs 34 s for the full test run) and is not what these
+  numbers come from.
+* The timed region excludes `set_position` and `load_dump`, and excludes the
+  NumPy comparison the test suite does afterwards. It is `search()` only.
+* One untimed warm pass before timing, so the first position is not paying for
+  cold arena pages and a cold hash table.
+* `simulations` as reported by `search()` is used as the denominator, not the
+  requested budget — the reference seeds the root with one visit, so a 5,000-sim
+  search delivers 4,999. This is the "report delivered, not nominal" discipline
+  scope 3 requires of `playv6.py`, applied to the bench that establishes the
+  baseline.
+* The arena is sized from the golden trees (218,821 nodes for the largest run)
+  and recycled between positions by `set_position`, so no run is timed against a
+  fresh 2M-node allocation.
+
+---
+
+## C6 — What terminal handling costs
+
+**The C5 numbers above were measured before terminal handling existed, and they
+are no longer what this build does.** C6 added work to every descent step and to
+every leaf, and the honest way to price it is to re-run the same corpus on the
+same machine under the new code. That is the `quiet` row below; the C5 table is
+left in place as the before.
+
+Reproduce with `python tools/bench_c6.py --trials 9 --markdown`.
+
+### Windows / MSVC 19.51, Release, Python 3.13.7 (i5-12600K)
+
+| corpus | virtual loss | positions | sims | median s | sims/s | us/sim | vs Python CPU | sims ending in a claimable draw |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| quiet | 0.0 | 20 | 99,980 | 0.825 | 121,256 | 8.25 | 29x | 0% |
+| quiet | 2.5 | 20 | 99,980 | 0.862 | 115,977 | 8.62 | 27x | 0% |
+| terminal | 0.0 | 25 | 97,981 | 0.346 | 283,510 | 3.53 | 67x | 18% |
+| terminal | 2.5 | 25 | 97,981 | 0.344 | 285,226 | 3.51 | 67x | 18% |
+
+Run-to-run spread over five separate invocations was **7.6–8.3 us/sim** on the
+quiet corpus and **3.1–3.8** on the terminal one, i.e. roughly ±5%. Quote the
+band, not the third decimal.
+
+### The tax on a quiet position: 5.63 -> ~8 us/sim, about 40%
+
+None of C6's machinery *fires* on a quiet position — no draw is ever claimed and
+no terminal is ever found, which is exactly what the C5 corpus was selected for —
+so the whole of that 40% is work done to establish that nothing happened:
+
+* a `ParsedFen` rebuild per descent step (64 squares plus nine bitboards),
+* FNV-1a over ~90 bytes for `rep_key`, per descent step,
+* a linear scan of the path's repetition tally, per descent step,
+* a halfmove-clock update and two move classifiers, per descent step,
+* at every leaf, `inCheck()` plus the legal-move count fed to `outcome_of`.
+
+The `ParsedFen` rebuild is the expensive one and it is already shared three ways:
+the descent threads a single one through, so it serves the move classifiers for
+the next step, `rep_key` for this one, and `nn_key` at the leaf. Rebuilding per
+consumer would have been three per step instead of one.
+
+**This is the minimum the rules need at this stage, not the minimum possible.**
+The repetition key is a function of the whole position, so *something* has to
+walk the board once per step. What would remove most of the cost is making it
+incremental — updating a key from the move rather than rebuilding from the
+board — and that is a change with its own correctness surface (C3's entire
+argument for FNV over a serialisation rather than Zobrist is that an incremental
+update is where the en-passant rules silently diverge). It is not a C6 change.
+
+### Headroom is unaffected, which is the number that matters
+
+Scope 2.2 sizes C9's worker count on the claim that CPU descent capacity is not
+the constraint, projecting "a conservative 10x for C++" against the Python
+engine's 236 us/sim of real CPU work. At 8.25 us/sim the measured factor is
+**29x**, down from 37–42x and still nearly 3x the projection. One thread delivers
+~121k sims/s against the ~16.5k sims/s that batch-64 GPU throughput supports at a
+20% cache hit rate — **~7x headroom on a single thread**, before any of C9's
+eight. The C9 default of W = 8, K = 8 stays a selection-quality decision rather
+than a throughput one.
+
+### The terminal corpus is FASTER, and that is not a paradox
+
+3.5 us/sim against the quiet corpus's 8.25. A simulation that ends in a claimable
+draw at ply four is *cheaper* than a normal one, not dearer: it never reaches the
+leaf, so it never tokenizes, never computes an `nn_key`, never looks anything up
+in the dump, and never expands ~35 children. 18% of the terminal corpus's
+simulations end that way, and on the two blocked-pawn specs it is over 90%.
+
+So this number is not a cost measurement and must not be read as one. What it is
+good for is the opposite of a headroom check: it is the number that would
+collapse if the per-path repetition tally were accidentally quadratic in the path
+length, or if the fivefold walk-back ran on every leaf instead of behind its
+occupancy pre-check. It is a regression tripwire on the two pieces of C6 whose
+cost is not obviously bounded.
+
+Note also that the VL 0.0 / VL 2.5 gap, a consistent 14% in C5, has closed to
+nothing on the terminal corpus and to ~4% on the quiet one. The C5 reading of
+that gap was that virtual loss widens selection so descents run longer and touch
+more distinct nodes; the per-step cost has roughly doubled, so the same extra
+steps are now a smaller share of a bigger total. C9 will re-measure it under
+contention, where a residual gap could otherwise be mistaken for a
+synchronisation cost.
+
+### Measurement notes
+
+Everything in the C5 section's measurement notes applies unchanged. Two
+additions:
+
+* The terminal corpus runs four positions at a **lowered `max_tree_depth`** (4 to
+  7 — see DECISIONS.md, C6), so `tools/bench_c6.py` keeps one engine per
+  (virtual loss, cap) pair rather than one per virtual loss. Those four runs are
+  at 2,000 simulations rather than 5,000, which is why the terminal corpus
+  delivers 97,981 simulations from 25 positions where the quiet one delivers
+  99,980 from 20.
+* `set_position` is passed each position's recorded repetition history, as the
+  test suite does. Building it is outside the timed region; consulting it is
+  inside, and it is one `unordered_map` lookup per descent step.

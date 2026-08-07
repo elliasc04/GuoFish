@@ -94,10 +94,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(pybind11)
 
+# The pinned revision, named once. C5 asserts en-passant behaviour that lives in
+# chess-library's makeMove() — which is a *property of this revision*, not of the
+# library in general — so the pin is passed into the build as a string and
+# tests/test_c5_ep_pin.py checks it. A re-pin then fails a named test instead of
+# silently moving token 66 on ~3% of positions.
+set(GUOFISH_CHESS_LIBRARY_PIN "53e6a841dcda7059a2af363d85f785ef1817304a")
+
 FetchContent_Declare(
         chess_library
         GIT_REPOSITORY https://github.com/Disservin/chess-library.git
-        GIT_TAG        53e6a841dcda7059a2af363d85f785ef1817304a  # v0.9.4
+        GIT_TAG        ${GUOFISH_CHESS_LIBRARY_PIN}  # v0.9.4
         # chess-library is header-only. Pointing SOURCE_SUBDIR at a directory
         # with no CMakeLists.txt makes FetchContent fetch the sources without
         # add_subdirectory()-ing its test/benchmark targets into our build.
@@ -113,10 +120,15 @@ pybind11_add_module(guofish_core
         cpp/arena.hpp
         cpp/keys.hpp
         cpp/movegen.hpp
+        cpp/search.hpp
+        cpp/terminal.hpp
         cpp/tokens.hpp
 )
 
 target_include_directories(guofish_core PRIVATE cpp/)
+
+target_compile_definitions(guofish_core PRIVATE
+        GUOFISH_CHESS_LIBRARY_PIN="${GUOFISH_CHESS_LIBRARY_PIN}")
 
 if (GUOFISH_VALUE_SUM STREQUAL "double")
     target_compile_definitions(guofish_core PRIVATE GUOFISH_VALUE_SUM_DOUBLE)

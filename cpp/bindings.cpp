@@ -33,6 +33,7 @@
 #include "arena.hpp"
 #include "keys.hpp"
 #include "movegen.hpp"
+#include "search.hpp"
 #include "tokens.hpp"
 
 #include <algorithm>
@@ -1332,6 +1333,413 @@ void bind_arena(py::module_ &m, const char *name, const char *doc) {
     // alignment entries above.
 }
 
+// ---------------------------------------------------------------------------
+// C5 — the search core on a replay evaluator
+//
+// The search itself, the raw-en-passant board state and the replay dump live in
+// cpp/search.hpp. This section is the surface tests/test_c5_gate1_quiet.py
+// drives, plus two probes that exist to pin things the search silently depends
+// on: `c_puct` (so a libm difference cannot enter the equivalence path) and
+// `ep_pin_probe` (so a chess-library re-pin fails a test rather than a parity
+// run).
+// ---------------------------------------------------------------------------
+
+// Find the legal move in `board` whose NORMALISED UCI is `uci`.
+//
+// Normalised: C1's castling rewrite is applied before comparing, so "e1g1"
+// matches the king-takes-rook move chess-library actually generated. Matching
+// on the raw encoding instead would make every castling probe fail with
+// "no such legal move", which reads as a bad test rather than as the encoding
+// mismatch it is.
+chess::Move find_legal_move(const chess::Board &board, std::string_view uci) {
+    chess::Movelist movelist;
+    chess::movegen::legalmoves(movelist, board);
+    for (const auto &move : movelist) {
+        if (guofish::move_to_uci(board, move) == uci) {
+            return move;
+        }
+    }
+    throw py::value_error("guofish_core: no legal move " + std::string(uci) + " in this position");
+}
+
+std::string square_or_dash(int square) {
+    if (square < 0) {
+        return "-";
+    }
+    std::string out;
+    out += static_cast<char>('a' + (square & 7));
+    out += static_cast<char>('1' + (square >> 3));
+    return out;
+}
+
+int square_index_or_none(chess::Square square) {
+    return (square == chess::Square::NO_SQ) ? -1 : square.index();
+}
+
+// THE PIN TEST'S DATA SOURCE.
+//
+// Reports, for one (position, move) pair, what each of the four en-passant
+// conventions in play says. The point is not that any one of them is right —
+// each is right for its own consumer — but that they DIFFER, and that the
+// search must therefore carry its own. tests/test_c5_ep_pin.py asserts the
+// specific values at chess-library revision 53e6a84, so an upstream re-pin that
+// changes `makeMove`'s behaviour fails a named test instead of quietly moving
+// token 66 on ~3% of positions.
+py::dict ep_pin_probe(std::string_view fen, std::string_view uci) {
+    py::dict d;
+
+    // What the FEN literally says, via C2's own parser.
+    const guofish::ParsedFen parsed = guofish::parse_fen(fen);
+    d["fen_ep"] = square_or_dash(parsed.ep_square);
+
+    // What chess-library kept after setFen(), i.e. after isEpSquareValid().
+    chess::Board board;
+    guofish::set_fen_or_throw(board, fen);
+    d["library_ep_after_setfen"] = square_or_dash(square_index_or_none(board.enpassantSq()));
+
+    // Each block below re-finds the move on its own board. A `chess::Move`
+    // carries square indices, not a board reference, so one lookup would do —
+    // but the three boards are deliberately independent, and sharing a move
+    // between them would make it easy to later change one board's FEN and have
+    // the others silently keep playing the old position's move.
+
+    // makeMove<false> — the default. Sets ep on PSEUDO-LEGAL adjacency: an
+    // enemy pawn merely stands beside the pushed pawn.
+    chess::Board pseudo;
+    guofish::set_fen_or_throw(pseudo, fen);
+    const chess::Move pseudo_move = find_legal_move(pseudo, uci);
+    pseudo.makeMove(pseudo_move);
+    d["library_ep_default"] = square_or_dash(square_index_or_none(pseudo.enpassantSq()));
+    pseudo.unmakeMove(pseudo_move);
+    d["library_ep_unmade"] = square_or_dash(square_index_or_none(pseudo.enpassantSq()));
+
+    // makeMove<true> — the EXACT template. Additionally requires the capture to
+    // be legal.
+    chess::Board exact;
+    guofish::set_fen_or_throw(exact, fen);
+    const chess::Move exact_move = find_legal_move(exact, uci);
+    exact.makeMove<true>(exact_move);
+    d["library_ep_exact"] = square_or_dash(square_index_or_none(exact.enpassantSq()));
+
+    // And what the search carries: the RAW rule, derived from the move.
+    guofish::SearchBoard search_board;
+    search_board.set_fen(fen);
+    const chess::Move raw_move = find_legal_move(search_board.board(), uci);
+    d["raw_ep_before"] = square_or_dash(search_board.raw_ep());
+    search_board.make_move(raw_move, guofish::is_zeroing(parsed, raw_move.from().index(),
+                                                        guofish::uci_destination(
+                                                            search_board.board(), raw_move).index()));
+    d["raw_ep"] = square_or_dash(search_board.raw_ep());
+    // Token 66 is the only thing that consumes it, so report that too: this is
+    // the number the network actually sees and the number nn_key hashes.
+    std::int32_t tokens[guofish::kSeqLength];
+    guofish::tokenize_into(search_board.parsed(), tokens);
+    d["token_66"] = tokens[guofish::kIdxEnPassant];
+    d["nn_key"] = guofish::nn_key(search_board.parsed()).value;
+    search_board.unmake_move(raw_move);
+    d["raw_ep_unmade"] = square_or_dash(search_board.raw_ep());
+
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// C6 — the rules that end a game, exposed one at a time
+//
+// The Gate 1 comparison is end-to-end: two trees, node for node. That is the
+// acceptance criterion and it is the right one, but it is a poor DIAGNOSTIC —
+// `has_insufficient_material` reading `self.bishops` instead of this colour's
+// bishops shows up there as "the trees have different node counts at ply 14".
+//
+// So each predicate is also bound on its own, over a FEN, and
+// tests/test_c6_gate1_full.py diffs them against python-chess across the
+// existing C1 movegen corpus. A transcription error then fails as
+// "insufficient_material disagrees on <fen>" before the tree comparison ever
+// runs. Nothing in the search calls these; they are the same inline functions
+// the search calls, reached through a FEN instead of through search state.
+// ---------------------------------------------------------------------------
+
+// python-chess's `Board.outcome()` reason, as a lowercase string, for a position
+// given by FEN alone.
+//
+// FIVEFOLD REPETITION IS NOT ASKED, and cannot be: it is a property of the game
+// leading to the position, which a FEN does not carry. The search evaluates it
+// against its own path (ReplaySearch::is_repetition); here it is passed as
+// False, which is what python-chess itself answers for a board built from a FEN
+// with no move stack. Same for the seventy-five-move rule's dependence on the
+// clock — that one IS in the FEN, and is read from it.
+std::string terminal_reason(std::string_view fen) {
+    const guofish::ParsedFen parsed = guofish::parse_fen(fen);
+    chess::Board board;
+    guofish::set_fen_or_throw(board, fen);
+
+    chess::Movelist movelist;
+    chess::movegen::legalmoves(movelist, board);
+
+    return guofish::terminal_reason_name(
+        guofish::outcome_of(parsed, board.inCheck(), static_cast<std::size_t>(movelist.size()),
+                            static_cast<int>(board.halfMoveClock()),
+                            /*fivefold_repetition=*/false));
+}
+
+bool insufficient_material(std::string_view fen) {
+    return guofish::is_insufficient_material(guofish::parse_fen(fen).placement);
+}
+
+// `Board.is_zeroing(move)` and `Board.is_irreversible(move)`, on the NORMALISED
+// UCI destination — g1/c1 for castling, which is the square python-chess indexes
+// its bitboards with. Feeding chess-library's king-takes-rook `to()` here would
+// make `_reduces_castling_rights` compare the rook square against the castling
+// rights, which are the rook squares, and every castle would read as
+// irreversible for the wrong reason.
+py::dict move_rule_probe(std::string_view fen, std::string_view uci) {
+    const guofish::ParsedFen parsed = guofish::parse_fen(fen);
+    chess::Board board;
+    guofish::set_fen_or_throw(board, fen);
+    const chess::Move move = find_legal_move(board, uci);
+
+    const int from = move.from().index();
+    const int to = guofish::uci_destination(board, move).index();
+
+    py::dict d;
+    d["zeroing"] = guofish::is_zeroing(parsed, from, to);
+    d["reduces_castling_rights"] = guofish::reduces_castling_rights(parsed, from, to);
+    d["has_legal_en_passant"] = guofish::has_legal_en_passant(parsed);
+    d["irreversible"] = guofish::is_irreversible(parsed, from, to);
+    return d;
+}
+
+// Bind one ReplaySearch instantiation, exactly as C4 binds one NodeArena: twice,
+// so neither accumulator can rot behind an #ifdef and a test can drive both
+// through one code path. Gate 1 runs the double build, which is the one that has
+// to reproduce Python's float arithmetic.
+template <class Acc>
+void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
+    using Search = guofish::ReplaySearch<Acc>;
+
+    py::class_<Search>(m, name, doc)
+        .def(py::init<const guofish::SearchConfig &>(), py::arg("config"))
+
+        .def(
+            "load_dump",
+            [](Search &self,
+               py::array_t<std::uint64_t, py::array::c_style | py::array::forcecast> keys,
+               py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast> is_root,
+               py::array_t<std::uint64_t, py::array::c_style | py::array::forcecast> move_offset,
+               py::array_t<std::uint16_t, py::array::c_style | py::array::forcecast> moves,
+               py::array_t<float, py::array::c_style | py::array::forcecast> priors,
+               py::array_t<double, py::array::c_style | py::array::forcecast> values) {
+                const auto entries = static_cast<std::size_t>(keys.size());
+                const auto move_count = static_cast<std::size_t>(moves.size());
+                if (static_cast<std::size_t>(is_root.size()) != entries ||
+                    static_cast<std::size_t>(values.size()) != entries ||
+                    static_cast<std::size_t>(move_offset.size()) != entries + 1) {
+                    throw py::value_error(
+                        "guofish_core: keys, is_root and values must be the same length and "
+                        "move_offset must be one longer");
+                }
+                if (static_cast<std::size_t>(priors.size()) != move_count) {
+                    throw py::value_error("guofish_core: moves and priors must be the same length");
+                }
+                self.dump().load(keys.data(), is_root.data(), move_offset.data(), entries,
+                                 moves.data(), priors.data(), move_count, values.data());
+            },
+            py::arg("keys"), py::arg("is_root"), py::arg("move_offset"), py::arg("moves"),
+            py::arg("priors"), py::arg("values"),
+            "Load golden/gate1_dump.npz. `is_root` selects between the two tables: the "
+            "reference softmaxes root priors on the GPU and interior priors on the CPU, and "
+            "the two disagree by up to ~2e-9 on the same position, so one nn_key can carry "
+            "two different sets of priors.")
+
+        .def(
+            "set_position",
+            [](Search &self, const std::string &fen, const std::vector<std::string> &history) {
+                self.set_position(fen, history);
+            },
+            py::arg("fen"), py::arg("history") = std::vector<std::string>{},
+            "Reset the tree and load a root position. The RAW en-passant square is taken "
+            "from the FEN text, never from chess-library's filtered board state. Raises "
+            "RuntimeError if the board-derived tokenization disagrees with the FEN-derived "
+            "one.\n\n"
+            "`history` is the pre-root game history that `build_repetition_history` walks: "
+            "the FENs of the positions before each of the last min(halfmove_clock, plies) "
+            "moves, most recent first. The root's own position is counted internally, so an "
+            "empty history is a position with no game behind it — not a position whose "
+            "history is unknown.")
+
+        .def(
+            "search",
+            [](Search &self, int num_simulations) {
+                const guofish::SearchStats stats = self.search(num_simulations);
+                py::dict d;
+                d["simulations"] = stats.simulations;
+                d["expansions"] = stats.expansions;
+                d["depth_cap_hits"] = stats.depth_cap_hits;
+                d["max_depth"] = stats.max_depth;
+                d["select_steps"] = stats.select_steps;
+                d["root_visits"] = self.arena().visit_count(self.root());
+                d["nodes"] = self.arena().size();
+                // C6.
+                d["draw_by_rule_hits"] = stats.draw_by_rule_hits;
+                d["fifty_move_hits"] = stats.fifty_move_hits;
+                d["threefold_hits"] = stats.threefold_hits;
+                d["checkmates"] = stats.checkmates;
+                d["stalemates"] = stats.stalemates;
+                d["insufficient_material"] = stats.insufficient_material;
+                d["seventyfive_moves"] = stats.seventyfive_moves;
+                d["fivefold_repetitions"] = stats.fivefold_repetitions;
+                d["terminal_fast_path_hits"] = stats.terminal_fast_path_hits;
+                d["mate_short_circuits"] = stats.mate_short_circuits;
+                d["mating_move"] = self.mating_move() == guofish::kNoMove
+                                       ? py::none().cast<py::object>()
+                                       : py::cast(move_to_uci(self.mating_move()));
+                d["best_move"] = self.best_move() == guofish::kNoMove
+                                     ? py::none().cast<py::object>()
+                                     : py::cast(move_to_uci(self.best_move()));
+                return d;
+            },
+            py::arg("num_simulations"),
+            "Run until the root has `num_simulations` visits, matching "
+            "ParallelMCTS.search's target_new_sims arithmetic — unless the depth-1 mate "
+            "short-circuit fires, which ends the search early exactly as the reference's "
+            "completion_event does. Raises RuntimeError on a replay-dump miss (naming the "
+            "FEN, the move path and the key) or if the ROOT itself has no legal moves.")
+
+        .def(
+            "terminal_nodes",
+            [](Search &self) {
+                py::list out;
+                for (const guofish::TerminalNode &node : self.terminal_nodes()) {
+                    py::dict d;
+                    d["path"] = node.path;
+                    d["fen"] = node.fen;
+                    d["value"] = node.value;
+                    d["visits"] = node.visits;
+                    d["children"] = node.children;
+                    d["expanded"] = node.expanded != 0;
+                    d["depth"] = node.depth;
+                    out.append(d);
+                }
+                return out;
+            },
+            "Every node carrying the terminal bit, with the FEN it stands for.\n\n"
+            "The FEN is re-loadable — it carries the search's own raw ep square and its own "
+            "halfmove clock — so a fifty-move draw node can be handed straight back to "
+            "set_position(). That is what a promotion probe is, and it is how "
+            "'a terminal node promoted to root still yields a legal move' is demonstrated "
+            "rather than asserted.")
+
+        .def(
+            "dump_tree",
+            [](const Search &self, std::int32_t min_visits) {
+                const std::vector<guofish::TreeRecord> records = self.dump_tree(min_visits);
+                py::list out;
+                for (const auto &record : records) {
+                    out.append(py::make_tuple(move_to_uci(record.move), record.visits,
+                                              record.value_sum, record.prior));
+                }
+                return out;
+            },
+            py::arg("min_visits") = 0,
+            "The tree in canonical DFS order as (move, visit_count, value_sum, prior) "
+            "tuples. min_visits=0 emits every node; 1 emits the visited subtree.")
+
+        .def(
+            "dump_tree_arrays",
+            [](const Search &self, std::int32_t min_visits) {
+                const std::vector<guofish::TreeRecord> records = self.dump_tree(min_visits);
+                const auto n = static_cast<py::ssize_t>(records.size());
+
+                py::array_t<std::uint16_t> depth(n);
+                py::array_t<std::uint16_t> move(n);
+                py::array_t<std::int32_t> visits(n);
+                py::array_t<double> value_sum(n);
+                py::array_t<float> prior(n);
+                py::array_t<std::uint16_t> children(n);
+                py::array_t<std::uint8_t> terminal(n);
+                py::array_t<float> terminal_value(n);
+
+                std::uint16_t *depth_p = depth.mutable_data();
+                std::uint16_t *move_p = move.mutable_data();
+                std::int32_t *visits_p = visits.mutable_data();
+                double *value_sum_p = value_sum.mutable_data();
+                float *prior_p = prior.mutable_data();
+                std::uint16_t *children_p = children.mutable_data();
+                std::uint8_t *terminal_p = terminal.mutable_data();
+                float *terminal_value_p = terminal_value.mutable_data();
+
+                for (std::size_t i = 0; i < records.size(); ++i) {
+                    depth_p[i] = records[i].depth;
+                    move_p[i] = records[i].move;
+                    visits_p[i] = records[i].visits;
+                    value_sum_p[i] = records[i].value_sum;
+                    prior_p[i] = records[i].prior;
+                    children_p[i] = records[i].children;
+                    terminal_p[i] = records[i].terminal;
+                    terminal_value_p[i] = records[i].terminal_value;
+                }
+
+                py::dict d;
+                d["depth"] = depth;
+                d["move"] = move;
+                d["visits"] = visits;
+                d["value_sum"] = value_sum;
+                d["prior"] = prior;
+                d["children"] = children;
+                d["terminal"] = terminal;
+                d["terminal_value"] = terminal_value;
+                return d;
+            },
+            py::arg("min_visits") = 0,
+            "The same traversal as dump_tree(), as NumPy arrays. This is the comparison "
+            "surface: golden/gate1_trees.npz stores the reference in the same layout, so a "
+            "run of 200,000 nodes is compared without materialising 200,000 Python tuples, "
+            "and value_sum can be compared on its bit pattern rather than by ==.\n\n"
+            "`terminal` is the arena's terminal BIT, not a lifecycle value. A terminal node "
+            "is Unexpanded, so `terminal == 1 and children > 0` is not a state this arena "
+            "can represent — which is the C6 structural requirement, checked over the whole "
+            "corpus by tests/test_c6_terminal_invariants.py.")
+
+        .def("c_puct", &Search::c_puct_of, py::arg("parent_visits"),
+             "This instance's c(N), including its c_factor. Exposed so a harness can use "
+             "the C++ implementation on both sides of a comparison.")
+
+        .def_property_readonly(
+            "dump_size", [](const Search &self) { return self.dump().size(); },
+            "Entries in the loaded replay dump, both tables.")
+        .def_property_readonly(
+            "dump_root_size", [](const Search &self) { return self.dump().root_size(); })
+        .def_property_readonly(
+            "accumulator", [](const Search &) { return std::string(Acc::name()); })
+        .def_property_readonly(
+            "nodes", [](const Search &self) { return self.arena().size(); },
+            "Arena nodes allocated so far.")
+        .def_property_readonly(
+            "root_visits",
+            [](const Search &self) { return self.arena().visit_count(self.root()); })
+        .def_property_readonly(
+            "root_value_sum",
+            [](const Search &self) { return self.arena().value_sum(self.root()); })
+        .def_property_readonly(
+            "best_move",
+            [](const Search &self) {
+                const std::uint16_t move = self.best_move();
+                return move == guofish::kNoMove ? py::none().cast<py::object>()
+                                                : py::cast(move_to_uci(move));
+            },
+            "ParallelMCTS.search's answer: the mating move if the depth-1 hack fired, "
+            "otherwise the most-visited root child, ties going to the first in canonical "
+            "order — which is what `max(root.children.items(), key=visit_count)` returns.")
+        .def_property_readonly(
+            "mating_move",
+            [](const Search &self) {
+                const std::uint16_t move = self.mating_move();
+                return move == guofish::kNoMove ? py::none().cast<py::object>()
+                                                : py::cast(move_to_uci(move));
+            },
+            "The move the depth-1 mate short-circuit seized on, or None. Not None means the "
+            "search stopped early, so root_visits is below the requested count.");
+}
+
 }  // namespace
 
 PYBIND11_MODULE(guofish_core, m) {
@@ -1519,6 +1927,102 @@ PYBIND11_MODULE(guofish_core, m) {
           "contiguous block of siblings — under both accumulators over identical data. The "
           "number this exists to produce is q32_over_double: whether the Q32 to double "
           "conversion disappears into the loop.");
+
+    // -----------------------------------------------------------------------
+    // C5 — search core on a replay evaluator.
+    // -----------------------------------------------------------------------
+
+    // The revision chess-library is pinned to, taken from the CMake variable
+    // that pins it rather than restated here, so the pin test cannot pass
+    // against a build of some other revision.
+    m.attr("CHESS_LIBRARY_PIN") = std::string(GUOFISH_CHESS_LIBRARY_PIN);
+
+    py::class_<guofish::SearchConfig>(
+        m, "SearchConfig",
+        "The search knobs. Every default is core.mctsv4's, except c_factor, which does not "
+        "exist in the reference at all: scope 3 adds it as a tunable and it defaults to 1.0, "
+        "applied only when it is not 1.0 so the default path is bit-identical.")
+        .def(py::init([](double c_init, double c_base, double c_factor, double fpu_root,
+                         double fpu_tree, double virtual_loss, int max_tree_depth,
+                         std::size_t arena_capacity) {
+                 guofish::SearchConfig config;
+                 config.c_init = c_init;
+                 config.c_base = c_base;
+                 config.c_factor = c_factor;
+                 config.fpu_root = fpu_root;
+                 config.fpu_tree = fpu_tree;
+                 config.virtual_loss = virtual_loss;
+                 config.max_tree_depth = max_tree_depth;
+                 config.arena_capacity = arena_capacity;
+                 return config;
+             }),
+             py::arg("c_init") = 1.43, py::arg("c_base") = 19652.0, py::arg("c_factor") = 1.0,
+             py::arg("fpu_root") = 0.0, py::arg("fpu_tree") = 0.30,
+             py::arg("virtual_loss") = 0.0, py::arg("max_tree_depth") = 80,
+             py::arg("arena_capacity") = static_cast<std::size_t>(1u << 21))
+        .def_readwrite("c_init", &guofish::SearchConfig::c_init)
+        .def_readwrite("c_base", &guofish::SearchConfig::c_base)
+        .def_readwrite("c_factor", &guofish::SearchConfig::c_factor)
+        .def_readwrite("fpu_root", &guofish::SearchConfig::fpu_root)
+        .def_readwrite("fpu_tree", &guofish::SearchConfig::fpu_tree)
+        .def_readwrite("virtual_loss", &guofish::SearchConfig::virtual_loss)
+        .def_readwrite("max_tree_depth", &guofish::SearchConfig::max_tree_depth)
+        .def_readwrite("arena_capacity", &guofish::SearchConfig::arena_capacity);
+
+    m.def("c_puct", &guofish::c_puct, py::arg("parent_visits"), py::arg("c_init") = 1.43,
+          py::arg("c_base") = 19652.0,
+          "AlphaZero's visit-scaled exploration constant, c(N) = c_init + "
+          "log((N + c_base + 1) / c_base), associated exactly as Python associates it. "
+          "Exposed so an equivalence harness can put the SAME log on both sides of a "
+          "comparison, rather than discovering that CPython's libm and this translation "
+          "unit's disagree in the last ulp.");
+
+    m.def("ep_pin_probe", &ep_pin_probe, py::arg("fen"), py::arg("uci"),
+          "What each en-passant convention says about one (position, move) pair: the FEN's "
+          "own field, what chess-library kept after setFen, what makeMove<false> and "
+          "makeMove<true> set, and the RAW square the search derives. They disagree, which "
+          "is why the search carries its own. tests/test_c5_ep_pin.py pins the library's "
+          "answers at CHESS_LIBRARY_PIN.");
+
+    // -----------------------------------------------------------------------
+    // C6 — the terminal rules, one predicate at a time.
+    // -----------------------------------------------------------------------
+
+    m.def("terminal_reason", &terminal_reason, py::arg("fen"),
+          "python-chess's Board.outcome() reason for this FEN — 'none', 'checkmate', "
+          "'insufficient-material', 'stalemate', 'seventy-five-moves' — in the reference's "
+          "own test order (insufficient material is asked BEFORE stalemate). Fivefold "
+          "repetition is a property of the game and not of the FEN, so it is answered False "
+          "here, exactly as python-chess answers it for a board with no move stack; the "
+          "search evaluates it against its own path instead.");
+
+    m.def("insufficient_material", &insufficient_material, py::arg("fen"),
+          "Board.is_insufficient_material(): neither side can force a mate. Transcribed "
+          "including the quirk that the bishop clause tests BOTH colours' bishops for the "
+          "same-colour-complex question.");
+
+    m.def("move_rule_probe", &move_rule_probe, py::arg("fen"), py::arg("uci"),
+          "Board.is_zeroing / _reduces_castling_rights / has_legal_en_passant / "
+          "is_irreversible for one legal move, on the NORMALISED UCI destination. These are "
+          "what the halfmove clock and the repetition walk-back are built out of.");
+
+    bind_replay_search<guofish::DoubleAccumulator>(
+        m, "ReplaySearchDouble",
+        "The Gate 1 equivalence search: value_sum in atomic<double>, so C++ reproduces "
+        "Python's float arithmetic exactly. Single-threaded; the evaluator is a lookup into "
+        "the golden dump, never a network.");
+
+    bind_replay_search<guofish::Q32Accumulator>(
+        m, "ReplaySearchQ32",
+        "The same search over the production Q32 accumulator. Bound so the fixed-point "
+        "instantiation cannot rot behind an #ifdef; it does NOT reproduce Python's float "
+        "arithmetic and is not what Gate 1 compares.");
+
+#if defined(GUOFISH_VALUE_SUM_DOUBLE)
+    m.attr("ReplaySearch") = m.attr("ReplaySearchDouble");
+#else
+    m.attr("ReplaySearch") = m.attr("ReplaySearchQ32");
+#endif
 
     m.def("tokenize_bench", &tokenize_bench, py::arg("fens"), py::arg("repeats") = 1,
           "Single-threaded tokenization throughput over `fens`, repeated `repeats` times. The "

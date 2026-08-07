@@ -239,3 +239,89 @@ They measure OS scheduling tails, so a loaded machine changes the answer. Close
 other work before generating numbers for `BENCH.md`. The `p99` figures are stable
 under resampling; the `max` figures are not, and `max` is not comparable across
 different iteration counts — always read it next to the `iters` column.
+
+---
+
+## Golden data
+
+`golden/` holds the reference answers every parity test is judged against. It is
+produced by the Python reference only, by scripts under `tools/`, and it is never
+regenerated to make a test pass (Global Rules 1 and 2).
+
+| file | generator | size |
+|---|---|---:|
+| `movegen.jsonl` | `tools/gen_movegen_golden.py` | 27 MB |
+| `tokens.npz` | `tools/gen_token_golden.py` | 3.2 MB |
+| `keys.jsonl`, `keys_adversarial.jsonl` | `tools/gen_key_golden.py` | 13 MB |
+| `gate1_dump.npz`, `gate1_trees.npz`, `gate1_manifest.json` | `tools/gen_gate1_golden.py` | 19 MB |
+| `gate1_terminal_dump.npz`, `gate1_terminal_trees.npz`, `gate1_terminal_manifest.json` | `tools/gen_gate1_golden.py --corpus terminal` | 9 MB |
+
+The Gate 1 files are the only ones whose generation needs a GPU and the v5
+checkpoint. The quiet corpus takes ~35 minutes, the terminal corpus ~25:
+
+```bat
+python tools/gen_gate1_golden.py --force
+python tools/gen_gate1_golden.py --corpus terminal --force
+```
+
+Both run the Python MCTS at the Gate 1 equivalence configuration (1 worker,
+`cache_size=1`, tablebase off, Dirichlet off, canonical-ordering patch on), and
+they differ in what they do with what they find.
+
+**Quiet (C5)** samples midgame positions from the benchmark PGNs and **rejects
+any position whose reference search touches a terminal, draw or depth-cap
+path** — that audit is what licensed C5's omission of terminal handling, so a run
+that rejects nothing is a run to be suspicious of.
+
+**Terminal (C6)** runs a hand-specified corpus that exists to touch exactly that
+machinery, and **records** rather than rejects: every terminal, draw-by-rule hit,
+depth-cap hit and early exit is counted into the manifest. It refuses to write
+anything if a class never fired, so `gate1_terminal_manifest.json`'s `coverage`
+block is a measurement rather than a claim. Useful flags while iterating on a
+spec: `--only <name>`, `--limit N`, `--max-sims N` (all of which produce data that
+is *not* acceptance-grade, and say so).
+
+Both manifests record the full provenance: interpreter, library versions,
+checkpoint SHA-256, the SHA-256 of `core/mctsv4.py`, seed, arguments, every
+position and — for the quiet corpus — every rejection with its reason.
+
+The terminal manifest additionally records, per position, the `base_fen` and the
+legal `moves` played onto it, plus the `history` those moves produce. The history
+is the pre-root game the repetition rule is evaluated against, and it is passed
+to the C++ side through `set_position(fen, history)`; without it a threefold is
+essentially unreachable inside search range.
+
+### The mutation drills
+
+Amendment B: drills never touch `golden/`. Each parity test reads an optional
+`GUOFISH_GOLDEN_*` override, so a corrupted copy goes in a scratch directory and
+the real file's SHA-256 is recorded unchanged before and after.
+
+```bat
+python tools/drill_c5_gate1.py
+python tools/drill_c6_gate1.py
+```
+
+The C5 drill corrupts the quiet Gate 1 data four ways; the C6 drill corrupts the
+terminal data seven ways, including the three fields C5 had no equivalent of (the
+terminal bit, the cached terminal value, and the per-run `max_tree_depth`) and the
+recorded repetition history. Both require the suite to fail each time **with the
+divergent node's path from the root** (a bare "trees differ" is not acceptable),
+and print the before/after hashes as proof `golden/` was not written to.
+
+---
+
+## Benchmarks
+
+One script per chunk, all of them read-only with respect to `golden/`:
+
+```bat
+python tools/bench_c2.py --markdown     REM tokenization throughput
+python tools/bench_c4.py --markdown     REM sibling scan, Q32 vs double
+python tools/bench_c5.py --markdown     REM search throughput on the replay evaluator
+python tools/bench_c6.py --markdown     REM what terminal handling costs, both corpora
+```
+
+Run them against a **Release** build. Each prints the compiler, sanitizer and
+assert status in its header; numbers from an ASan build are roughly 7x slower and
+do not belong in `BENCH.md`.

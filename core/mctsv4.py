@@ -188,6 +188,52 @@ FPU_TREE = 0.30
 # 1.0 is a no-op.
 POLICY_TEMPERATURE = 1.0
 
+# === Gate 1 canonical child ordering (C5 port equivalence only) ===
+# OFF by default, and the default path must stay bit-identical to the behaviour
+# every benchmark in this repository was measured on. tools/gen_gate1_golden.py
+# is the only thing that turns it on.
+#
+# WHY IT EXISTS. Python resolves exact PUCT ties by child insertion order, i.e.
+# by python-chess's move-generation order (`select_child` iterates
+# `self.children.values()`, and dicts preserve insertion order). ~1% of selection
+# steps are exact ties -- mostly unvisited siblings at identical
+# `fpu + c*P*sqrt(N)`, plus the four promotion moves that share one policy index
+# and therefore one prior. Reproducing another library's generation order in C++
+# is a fragile dependency on its internals, so scope 2.6 makes the C++ engine
+# order children canonically by (from, to, promotion) over the normalised UCI
+# string, and this flag makes the reference do the same for the Gate 1 run.
+#
+# WHY THE PERMUTE HAPPENS AFTER expand() AND NOT BY SORTING legal_moves FIRST.
+# `torch.softmax` is not permutation-invariant: recon measured 109/200 random
+# permutations bit-identical and a max delta of 3e-7 on the rest, and sorting
+# before the softmax changed 26,569 of 51,927 nodes end to end. So a sorted
+# `legal_moves` list would be a numerics change wearing an ordering change's
+# clothes, and Gate 1 would be comparing two different searches. The discipline
+# is therefore: gather and softmax in GENERATION order, then permute the
+# resulting children into canonical order. Reduction order is never canonical;
+# storage order always is.
+#
+# Sorting on `move.uci()` is the same key C1 established: python-chess's
+# generators already emit standard (non-Chess960) castling moves, so `uci()` is
+# the normalised destination -- e1g1, not e1h1 -- and byte order on that string
+# is exactly the (from_file, from_rank, to_file, to_rank, promotion) tuple order.
+GATE1_CANONICAL_ORDER = False
+
+
+def _canonicalize_children(node: 'MCTSNode') -> None:
+    """Permute `node.children` into canonical UCI order, in place.
+
+    A no-op unless GATE1_CANONICAL_ORDER is set. Idempotent, so calling it on an
+    already-expanded node (expand() returns early in that case) costs a sort and
+    changes nothing.
+    """
+    if not GATE1_CANONICAL_ORDER or not node.children:
+        return
+    with node.lock:
+        node.children = dict(sorted(node.children.items(),
+                                    key=lambda item: item[0].uci()))
+
+
 # === Mode 2: Syzygy tablebase leaf evaluation ===
 # When a leaf has <= TABLEBASE_MAX_PIECES pieces (both kings counted), the
 # tablebase knows the exact game-theoretic result, so we override the neural
@@ -1336,6 +1382,10 @@ class MCTSWorker:
             # is sharpened at the same temperature as a fresh evaluation.
             legal_moves = list(board.legal_moves)
             node.expand(policy, legal_moves, self.params.policy_temperature)
+            # Gate 1 only: permute the children just built into canonical order.
+            # AFTER expand(), never by sorting `legal_moves` above -- see
+            # _canonicalize_children for why that distinction is the whole point.
+            _canonicalize_children(node)
 
             repay()
 
@@ -1767,6 +1817,9 @@ class ParallelMCTS:
         # PUCT comparison, and Dirichlet noise (added afterwards, when enabled)
         # is defined as a mix with the final priors.
         root.expand(policy_logits[0], legal_moves, self.params.policy_temperature)
+        # Gate 1 only; see the interior-node call site in _run_simulation.
+        # Pondering inherits this through _expand_root.
+        _canonicalize_children(root)
         # If this node had been marked drawn-by-rule (fifty-move / threefold) it
         # was left unexpanded precisely so we could reach here. Now that it IS a
         # search root with real children, the mark is stale: the host declined to
