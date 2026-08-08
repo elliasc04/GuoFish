@@ -376,10 +376,13 @@ inline bool has_legal_en_passant(const ParsedFen &parsed) {
 // contain the clock, so two positions differing only in the clock must share an
 // evaluation. tests/test_c3_keys.py pins it so that a later reader cannot
 // "fix" it into a proof-caching bug.
-inline NNKey nn_key(const ParsedFen &parsed) {
-    std::int32_t tokens[kSeqLength];
-    tokenize_into(parsed, tokens);
-
+//
+// THIS TAKES THE TOKEN BUFFER, not a position. That is C7's requirement and it
+// is the reason `EvalRow` below exists: the key the cache is written under must
+// be a function of the exact bytes handed to the evaluator, never of a second
+// derivation from the board that happens to agree today. See EvalRow.
+inline NNKey nn_key_of_tokens(const std::int32_t *tokens) {
+    assert(tokens != nullptr);
     Fnv1a64 hash;
     hash.tag(kNNKeyTag);
     for (int i = 0; i < kSeqLength; ++i) {
@@ -387,6 +390,67 @@ inline NNKey nn_key(const ParsedFen &parsed) {
     }
     return NNKey(hash.value());
 }
+
+// ---------------------------------------------------------------------------
+// EvalRow — one evaluator input row and the key derived FROM IT
+//
+// Scope §2.5 and the C7 brief both make the same demand, and the brief states
+// the failure mode outright: "Do not fall into the trap of re-generating the
+// nn_key inside the cache insertion logic. It must be generated once during the
+// token buffer creation and passed along with the payload."
+//
+// The trap is worth spelling out, because the wrong version looks identical to
+// the right one and passes every test until it does not. Suppose the dispatcher
+// tokenizes a position into a batch row, and the cache separately calls
+// nn_key(parsed) on the position it believes that row stands for. Both compute
+// the same thing today. The moment anything makes them disagree — a batch row
+// written from a stale ParsedFen, an off-by-one row offset, a tokenizer change
+// applied to one call site and not the other — the cache is keyed by a
+// tokenization that is not the one the network saw, and it will serve position
+// A's evaluation for position B forever, silently, at whatever rate the two
+// derivations disagree.
+//
+// This class removes the second derivation. There is one array; the key is
+// computed from that array; both are handed on together. A caller CANNOT ask
+// for the key without also holding the bytes it was computed from, because they
+// are the same object.
+//
+// It is deliberately not a `struct { tokens; key; }` with public members: the
+// key is const after construction and there is no setter, so no code path can
+// leave a row whose key does not match its tokens.
+// ---------------------------------------------------------------------------
+
+class EvalRow {
+public:
+    explicit EvalRow(const ParsedFen &parsed) : key_(fill(parsed, tokens_)) {}
+
+    // The 68 int32s the evaluator is handed. This is the row a dispatcher
+    // copies into its batch buffer (C9), and in the replay build it is what
+    // `key()` was computed from.
+    const std::int32_t *tokens() const noexcept { return tokens_; }
+
+    // The cache key for exactly those tokens.
+    NNKey key() const noexcept { return key_; }
+
+private:
+    // Written as a static so the key can be initialised in the member
+    // initialiser list from a buffer that has just been filled — which is what
+    // makes "the key is a function of the tokens" a property of construction
+    // rather than a two-step the caller could get half-right.
+    static NNKey fill(const ParsedFen &parsed, std::int32_t (&out)[kSeqLength]) {
+        tokenize_into(parsed, out);
+        return nn_key_of_tokens(out);
+    }
+
+    std::int32_t tokens_[kSeqLength];
+    const NNKey key_;
+};
+
+// The position-level entry point, kept for every caller that wants a key and
+// nothing else (C3's tests, C5's self-audit, the repetition machinery). It goes
+// through EvalRow rather than repeating the tokenize-then-hash pair, so there is
+// exactly ONE implementation of "what an nn_key is" in the process.
+inline NNKey nn_key(const ParsedFen &parsed) { return EvalRow(parsed).key(); }
 
 // The repetition key: FNV-1a over the tag and the fields of python-chess's
 // `Board._transposition_key()`, in its order —

@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(guofish_core LANGUAGES CXX)
+# C is enabled for Fathom, which is one C translation unit (C7). Nothing of ours
+# is C.
+project(guofish_core LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,17 +34,28 @@ set(GUOFISH_MODULE_OUTPUT_DIR "${CMAKE_SOURCE_DIR}" CACHE PATH
 
 # ---------------------------------------------------------------------------
 # 1. Warnings — Global Rule 4: clean at /W4 and -Wall -Wextra, no suppressions.
+#
+# These are applied PER TARGET (see section 4), not with add_compile_options,
+# and that changed in C7 when Fathom arrived. Fathom is third-party C that we
+# compile rather than merely include, so a directory-wide /W4 would put its
+# warnings in our build with only two ways out: a -Wno-* or a pragma, both of
+# which Global Rule 4 forbids. Scoping the strictness to our own target instead
+# means our translation units stay exactly as strict as they were, and no
+# suppression exists anywhere. It is the same reasoning that made chess-library
+# a SYSTEM include in C0, applied to a target instead of an include path.
+#
+# GUOFISH_STRICT_WARNINGS is applied to guofish_core and to nothing else.
 # ---------------------------------------------------------------------------
 if (MSVC)
-    add_compile_options(/W4)
+    set(GUOFISH_STRICT_WARNINGS /W4)
     # MSVC reports __cplusplus as 199711L regardless of /std: unless this is
     # passed. Anything that feature-tests the language version — ours or a
     # dependency's headers — otherwise concludes it is compiling C++98 while
     # actually being fed C++17. This is a conformance switch, not a warning
-    # suppression (Global Rule 4).
+    # suppression (Global Rule 4), so it stays directory-wide.
     add_compile_options(/Zc:__cplusplus)
 else ()
-    add_compile_options(-Wall -Wextra)
+    set(GUOFISH_STRICT_WARNINGS -Wall -Wextra)
 endif ()
 
 # ---------------------------------------------------------------------------
@@ -77,8 +90,9 @@ if (GUOFISH_ASAN)
 endif ()
 
 # ---------------------------------------------------------------------------
-# 3. Third-party dependencies — Global Rule 7 allows exactly pybind11 and
-#    Disservin/chess-library. Both are pinned to an immutable revision: C1 is a
+# 3. Third-party dependencies — Global Rule 7 allows pybind11,
+#    Disservin/chess-library and (from C7, on explicit authorisation)
+#    jdart1/Fathom. All three are pinned to an immutable revision: C1 is a
 #    movegen *parity* chunk, and a floating `master` would let the reference
 #    behaviour change under a passing test suite without anything in the repo
 #    changing. See DECISIONS.md.
@@ -112,23 +126,111 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(chess_library)
 
+# --- Fathom (Syzygy tablebase probing) -------------------------------------
+#
+# Authorised explicitly for C7; before that the allowed set was pybind11 +
+# chess-library + the standard library, and Global Rule 7 required asking.
+#
+# Pinned for the same reason the other two are, and with one extra: a tablebase
+# probe is a lookup whose ANSWER is the thing under test. A floating revision
+# could change the WDL a position reports — through an ep convention, a
+# 50-move-rule adjustment, a DTZ sign — with nothing in this repository
+# changing, and the failure would surface as an engine playing a different
+# endgame move, not as a build error.
+set(GUOFISH_FATHOM_PIN "c9c6fef0dddc05d2e242c183acf5833149ab676d")
+
+FetchContent_Declare(
+        fathom
+        GIT_REPOSITORY https://github.com/jdart1/Fathom.git
+        GIT_TAG        ${GUOFISH_FATHOM_PIN}
+        # Fathom ships a plain Makefile, not a CMakeLists.txt, so there is
+        # nothing to add_subdirectory() — but naming a non-existent SOURCE_SUBDIR
+        # keeps the behaviour explicit and identical to the chess-library entry
+        # above rather than relying on the absence of a file.
+        SOURCE_SUBDIR  do-not-configure
+)
+FetchContent_MakeAvailable(fathom)
+
+# ONE translation unit: tbprobe.c `#include`s tbchess.c (Fathom's own Makefile
+# does the same). Built as a static library of its own so that
+# GUOFISH_STRICT_WARNINGS never reaches it — see section 1.
+add_library(fathom STATIC "${fathom_SOURCE_DIR}/src/tbprobe.c")
+target_include_directories(fathom PUBLIC "${fathom_SOURCE_DIR}/src")
+set_target_properties(fathom PROPERTIES
+        # C11 for <stdatomic.h>, which Fathom uses for its lock-free table
+        # initialisation unless TB_NO_THREADS is defined. We do NOT define it:
+        # C9 will probe from several search threads, and the atomics are what
+        # makes tb_probe_wdl thread-safe.
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        # The static library is linked into a shared module (the .pyd / .so), so
+        # its objects must be position-independent on Linux.
+        POSITION_INDEPENDENT_CODE ON)
+
+if (MSVC)
+    # MSVC ships <stdatomic.h> but refuses to compile it without this switch
+    # ("C atomic support is not enabled"). It is a language-conformance switch,
+    # not a warning suppression (Global Rule 4) and not an opt-in to unfinished
+    # behaviour — the name is historical; C11 atomics have been supported since
+    # VS 2022 17.5.
+    #
+    # The alternative is Fathom's TB_NO_THREADS, which compiles everywhere with
+    # no flag and is the wrong trade: it removes the synchronisation that makes
+    # tb_probe_wdl safe to call from several search threads, which is precisely
+    # what C9 will do. Clang and GCC need nothing here.
+    target_compile_options(fathom PRIVATE /experimental:c11atomics)
+
+    # Fathom defines its own `min` and `max` macros (tbprobe.c:196) after having
+    # included <stdlib.h> and <windows.h>, both of which define them on MSVC.
+    # That is two C4005 macro-redefinition warnings at MSVC's DEFAULT level, so
+    # they fire at any warning level — and they are not spurious: Fathom's
+    # `#define max(a,b) a > b ? a : b` has no parentheses, so which definition
+    # wins genuinely matters.
+    #
+    # Both are turned off AT THE POINT OF CONFLICT rather than by silencing the
+    # report, which is the difference between a fix and a suppression (Global
+    # Rule 4). Fathom's own definitions then stand unopposed and are the ones
+    # its code was written against:
+    #
+    #   NOMINMAX                    stops <windows.h>/minwindef.h defining them.
+    #   _CRT_DECLARE_NONSTDC_NAMES  stops <stdlib.h> defining them; they live in
+    #                               its "Non-ANSI Names for Compatibility"
+    #                               section, behind exactly this macro. It also
+    #                               withdraws the other non-standard names —
+    #                               `open`, `close`, `strdup` — and Fathom uses
+    #                               `open`/`close` only inside its `#ifndef
+    #                               _WIN32` branch, which this build does not
+    #                               compile. Checked, not assumed.
+    target_compile_definitions(fathom PRIVATE NOMINMAX _CRT_DECLARE_NONSTDC_NAMES=0)
+endif ()
+
 # ---------------------------------------------------------------------------
 # 4. The extension module
 # ---------------------------------------------------------------------------
 pybind11_add_module(guofish_core
         cpp/bindings.cpp
         cpp/arena.hpp
+        cpp/cache.hpp
+        cpp/fathom.hpp
         cpp/keys.hpp
         cpp/movegen.hpp
         cpp/search.hpp
+        cpp/tablebase.hpp
         cpp/terminal.hpp
         cpp/tokens.hpp
+        cpp/values.hpp
 )
 
 target_include_directories(guofish_core PRIVATE cpp/)
 
+# Global Rule 4, scoped to our own code — see section 1.
+target_compile_options(guofish_core PRIVATE ${GUOFISH_STRICT_WARNINGS})
+
+target_link_libraries(guofish_core PRIVATE fathom)
+
 target_compile_definitions(guofish_core PRIVATE
-        GUOFISH_CHESS_LIBRARY_PIN="${GUOFISH_CHESS_LIBRARY_PIN}")
+        GUOFISH_CHESS_LIBRARY_PIN="${GUOFISH_CHESS_LIBRARY_PIN}"
+        GUOFISH_FATHOM_PIN="${GUOFISH_FATHOM_PIN}")
 
 if (GUOFISH_VALUE_SUM STREQUAL "double")
     target_compile_definitions(guofish_core PRIVATE GUOFISH_VALUE_SUM_DOUBLE)
@@ -139,6 +241,11 @@ endif ()
 # no -Wno-* and no pragmas are involved, and our translation units stay strict.
 target_include_directories(guofish_core SYSTEM PRIVATE
         "${chess_library_SOURCE_DIR}/include")
+
+# Fathom's headers likewise. `target_link_libraries` already propagates its
+# include directory, but not as SYSTEM, and tbprobe.h is included from our own
+# strictly-compiled translation unit.
+target_include_directories(guofish_core SYSTEM PRIVATE "${fathom_SOURCE_DIR}/src")
 
 # ---------------------------------------------------------------------------
 # 5. Output location

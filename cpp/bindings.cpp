@@ -31,10 +31,14 @@
 #include <chess.hpp>
 
 #include "arena.hpp"
+#include "cache.hpp"
+#include "fathom.hpp"
 #include "keys.hpp"
 #include "movegen.hpp"
 #include "search.hpp"
+#include "tablebase.hpp"
 #include "tokens.hpp"
+#include "values.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -47,6 +51,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <optional>
 #include <ratio>
 #include <stdexcept>
 #include <string>
@@ -867,6 +872,44 @@ std::string move_to_uci(std::uint16_t packed) {
     return uci;
 }
 
+// The inverse of move_to_uci, for the C7 cache binding: a Python caller
+// supplying a move list speaks UCI, and the cache stores packed moves.
+//
+// It validates rather than trusting, because the cache's move list is the thing
+// that turns a key collision into a named failure — a silently mis-parsed move
+// would defeat exactly the check it feeds. No board is consulted: this is a
+// syntactic conversion, and the search's own path packs from a generated move.
+std::uint16_t packed_from_uci(const std::string &uci) {
+    const auto bad = [&uci](const char *why) {
+        throw py::value_error("guofish_core: '" + uci + "' is not a UCI move (" + why + ")");
+    };
+    if (uci.size() != 4 && uci.size() != 5) {
+        bad("expected 4 or 5 characters");
+    }
+    const auto square = [&](std::size_t i) {
+        const char file = uci[i];
+        const char rank = uci[i + 1];
+        if (file < 'a' || file > 'h' || rank < '1' || rank > '8') {
+            bad("square out of range");
+        }
+        return (rank - '1') * 8 + (file - 'a');
+    };
+    const int from = square(0);
+    const int to = square(2);
+
+    int promo = static_cast<int>(guofish::Promotion::None);
+    if (uci.size() == 5) {
+        switch (uci[4]) {
+            case 'b': promo = static_cast<int>(guofish::Promotion::Bishop); break;
+            case 'n': promo = static_cast<int>(guofish::Promotion::Knight); break;
+            case 'q': promo = static_cast<int>(guofish::Promotion::Queen); break;
+            case 'r': promo = static_cast<int>(guofish::Promotion::Rook); break;
+            default: bad("promotion piece must be one of bnqr"); break;
+        }
+    }
+    return guofish::pack_move(from, to, static_cast<guofish::Promotion>(promo));
+}
+
 std::uint16_t pack_move(int from, int to, int promo) {
     if (promo < 0 || promo >= static_cast<int>(guofish::kPromotionCount)) {
         throw py::value_error("guofish_core.pack_move: promotion code must be in [0, 5)");
@@ -1508,6 +1551,160 @@ py::dict move_rule_probe(std::string_view fen, std::string_view uci) {
     return d;
 }
 
+// ---------------------------------------------------------------------------
+// C7 — the transposition cache and the tablebase backend
+// ---------------------------------------------------------------------------
+
+// The compile-time facts of acceptance criterion 5, as data a test can assert
+// on. Same shape and same reasoning as C3's `key_type_separation`: a
+// `static_assert` that fires stops the build, which is the right behaviour but
+// gives the acceptance test nothing to point at, so the predicates are also
+// evaluated here and reported.
+//
+// Every value below is computed by the compiler from the REAL
+// `TranspositionCache::insert` through real overload resolution — see
+// guofish::detail::CacheInsertAccepts. Nothing here restates a signature.
+py::dict cache_type_separation() {
+    namespace gd = guofish::detail;
+    using guofish::NetworkValue;
+    using guofish::ProofValue;
+    using guofish::TablebaseValue;
+    using guofish::TerminalValue;
+
+    py::dict d;
+    // The one that must be true: the cache holds the network's output.
+    d["network_value_accepted"] = gd::CacheInsertAccepts<NetworkValue>::value;
+
+    // The ones that must be false. Each is a distinct way the historical defect
+    // gets in, and each fails to COMPILE rather than failing at runtime.
+    d["terminal_value_accepted"] = gd::CacheInsertAccepts<TerminalValue>::value;
+    d["tablebase_value_accepted"] = gd::CacheInsertAccepts<TablebaseValue>::value;
+    d["proof_value_accepted"] = gd::CacheInsertAccepts<ProofValue>::value;
+    d["bare_double_accepted"] = gd::CacheInsertAccepts<double>::value;
+    d["terminal_flag_accepted"] = gd::CacheInsertAccepts<bool>::value;
+    d["float_accepted"] = gd::CacheInsertAccepts<float>::value;
+    d["int_accepted"] = gd::CacheInsertAccepts<int>::value;
+
+    // The conversions that would route around the above if they existed.
+    d["terminal_converts_to_network"] = std::is_convertible_v<TerminalValue, NetworkValue>;
+    d["tablebase_converts_to_network"] = std::is_convertible_v<TablebaseValue, NetworkValue>;
+    d["proof_converts_to_network"] = std::is_convertible_v<ProofValue, NetworkValue>;
+    d["double_converts_to_network"] = std::is_convertible_v<double, NetworkValue>;
+    d["network_converts_to_double"] = std::is_convertible_v<guofish::NetworkValue, double>;
+    d["network_constructible_from_tablebase"] =
+        std::is_constructible_v<NetworkValue, TablebaseValue>;
+    d["network_constructible_from_terminal"] =
+        std::is_constructible_v<NetworkValue, TerminalValue>;
+
+    // The payload itself is closed too, so a caller who somehow held a Slot
+    // could not write a forbidden value into it either.
+    d["payload_value_assignable_from_tablebase"] =
+        std::is_assignable_v<decltype(guofish::CachedEval::value) &, TablebaseValue>;
+    d["payload_value_assignable_from_terminal"] =
+        std::is_assignable_v<decltype(guofish::CachedEval::value) &, TerminalValue>;
+    d["payload_value_assignable_from_double"] =
+        std::is_assignable_v<decltype(guofish::CachedEval::value) &, double>;
+    d["payload_value_is_network_value"] =
+        std::is_same_v<decltype(guofish::CachedEval::value), NetworkValue>;
+
+    // C3's design, which the empty-slot sentinel rests on.
+    d["nn_key_default_constructible"] = std::is_default_constructible_v<guofish::NNKey>;
+    d["network_value_default_constructible"] = std::is_default_constructible_v<NetworkValue>;
+    return d;
+}
+
+// The evaluator's input row and the key derived from it, as a pair a test can
+// compare. This is the surface for "the stored nn_key is computed from the EXACT
+// same token buffer row dispatched to the evaluator": the caller gets the tokens
+// and the key from ONE object, so it can check that the key really is a function
+// of those bytes and of nothing else.
+py::dict eval_row(std::string_view fen) {
+    const guofish::EvalRow row(guofish::parse_fen(fen));
+
+    py::array_t<std::int32_t> tokens(guofish::kSeqLength);
+    std::copy(row.tokens(), row.tokens() + guofish::kSeqLength, tokens.mutable_data());
+
+    py::dict d;
+    d["tokens"] = tokens;
+    d["nn_key"] = row.key().value;
+    return d;
+}
+
+// The key a token row hashes to, for a row the caller supplies. Exists so a test
+// can perturb ONE token and watch the key move — which is what makes "the key is
+// a function of the tokens" checkable rather than assertable.
+std::uint64_t nn_key_of_tokens(
+    py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> tokens) {
+    if (tokens.size() != guofish::kSeqLength) {
+        throw py::value_error("guofish_core.nn_key_of_tokens: expected " +
+                              std::to_string(guofish::kSeqLength) + " tokens, got " +
+                              std::to_string(tokens.size()));
+    }
+    return guofish::nn_key_of_tokens(tokens.data()).value;
+}
+
+// A TablebaseProber backed by a Python callable.
+//
+// THIS IS WHAT MAKES MODES 1 AND 2 TESTABLE WITHOUT VENDORING FATHOM. The
+// callable is handed a FEN and returns (wdl, dtz) or None; the reference's own
+// `chess.syzygy.Tablebase` over assets/syzygy is exactly such a callable, so the
+// C++ override values, the perspective conversion, the piece-count gate and —
+// the thing that matters — the fact that no probed value ever reaches the cache
+// are all exercised against the REAL 5-piece tables.
+//
+// The FEN it passes carries the search's own RAW en-passant square and its own
+// halfmove clock (guofish::fen_of), so the position python-chess reconstructs is
+// the position the search is standing on, not chess-library's filtered view of
+// it. That is the same discipline C5 established and the reason this takes a
+// ParsedFen rather than a chess::Board.
+//
+// It calls into Python, so it requires the GIL. Every caller today holds it (the
+// search bindings do not release it). C9 introduces threads that will not, and a
+// Fathom backend — which touches no Python — is the answer there rather than a
+// GIL acquisition in a leaf probe. Noted here because it is the one thing about
+// this class that does not generalise.
+class PythonProber final : public guofish::TablebaseProber {
+public:
+    explicit PythonProber(py::function probe) : probe_(std::move(probe)) {}
+
+    std::optional<int> probe_wdl(const guofish::ParsedFen &parsed,
+                                 int halfmove_clock) const override {
+        return field(parsed, halfmove_clock, 0);
+    }
+
+    std::optional<int> probe_dtz(const guofish::ParsedFen &parsed,
+                                 int halfmove_clock) const override {
+        return field(parsed, halfmove_clock, 1);
+    }
+
+    std::string backend() const override { return "python"; }
+
+    std::int64_t calls() const noexcept { return calls_; }
+
+private:
+    std::optional<int> field(const guofish::ParsedFen &parsed, int halfmove_clock,
+                             int index) const {
+        ++calls_;
+        // Fullmove 1: no rule this file implements reads it, and python-chess
+        // does not use it for a Syzygy probe. The halfmove clock is real and is
+        // passed through, because a fifty-move-aware backend needs it.
+        const std::string fen = guofish::fen_of(parsed, halfmove_clock, 1);
+        const py::object result = probe_(fen);
+        if (result.is_none()) {
+            return std::nullopt;
+        }
+        const py::sequence pair = result.cast<py::sequence>();
+        if (py::len(pair) != 2) {
+            throw py::value_error(
+                "guofish_core: a tablebase probe callback must return (wdl, dtz) or None");
+        }
+        return pair[static_cast<py::size_t>(index)].cast<int>();
+    }
+
+    py::function probe_;
+    mutable std::int64_t calls_ = 0;
+};
+
 // Bind one ReplaySearch instantiation, exactly as C4 binds one NodeArena: twice,
 // so neither accumulator can rot behind an #ifdef and a test can drive both
 // through one code path. Gate 1 runs the double build, which is the one that has
@@ -1589,6 +1786,14 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
                 d["fivefold_repetitions"] = stats.fivefold_repetitions;
                 d["terminal_fast_path_hits"] = stats.terminal_fast_path_hits;
                 d["mate_short_circuits"] = stats.mate_short_circuits;
+                // C7. Per-SEARCH, unlike `cache_stats`, which is per-cache
+                // lifetime — the cache survives set_position, as the
+                // reference's does.
+                d["cache_hits"] = stats.cache_hits;
+                d["cache_misses"] = stats.cache_misses;
+                d["cache_inserts"] = stats.cache_inserts;
+                d["tablebase_probes"] = stats.tablebase_probes;
+                d["tablebase_overrides"] = stats.tablebase_overrides;
                 d["mating_move"] = self.mating_move() == guofish::kNoMove
                                        ? py::none().cast<py::object>()
                                        : py::cast(move_to_uci(self.mating_move()));
@@ -1702,6 +1907,122 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
         .def("c_puct", &Search::c_puct_of, py::arg("parent_visits"),
              "This instance's c(N), including its c_factor. Exposed so a harness can use "
              "the C++ implementation on both sides of a comparison.")
+
+        // --- C7: the transposition cache -----------------------------------
+
+        .def(
+            "cache_stats",
+            [](const Search &self) {
+                const guofish::CacheStats stats = self.cache_stats();
+                py::dict d;
+                d["hits"] = stats.hits;
+                d["misses"] = stats.misses;
+                d["inserts"] = stats.inserts;
+                d["collisions"] = stats.collisions;
+                d["refreshes"] = stats.refreshes;
+                d["hit_rate"] = stats.hit_rate();
+                d["size"] = self.cache_size();
+                d["capacity"] = self.cache_capacity();
+                d["shards"] = self.cache_shard_count();
+                d["enabled"] = self.has_cache();
+                return d;
+            },
+            "The cache's LIFETIME counters, which span every set_position since the last "
+            "clear_cache() — the reference's cache lives on the engine, not on the search, "
+            "and this one does too. For one search's numbers, read cache_hits / "
+            "cache_misses out of search()'s return value instead.\n\n"
+            "The hit rate is an acceptance criterion in its own right: with tablebases off "
+            "the cache is result-invariant, so a cache that never hits produces a "
+            "bit-identical tree and cannot be distinguished by tree comparison.")
+
+        .def("clear_cache", &Search::clear_cache,
+             "Drop every entry and zero the cache's counters. Not called by set_position, "
+             "deliberately: a cache that reset per position would never see a transposition "
+             "across moves of a game, which is most of what it is for.")
+
+        .def(
+            "cache_entry_by_key",
+            [](Search &self, std::uint64_t key) -> py::object {
+                guofish::CachedEval entry;
+                if (!self.cache_probe(guofish::NNKey(key), entry)) {
+                    return py::none();
+                }
+                py::array_t<std::uint16_t> moves(
+                    static_cast<py::ssize_t>(entry.moves.size()));
+                std::copy(entry.moves.begin(), entry.moves.end(), moves.mutable_data());
+                py::array_t<float> priors(static_cast<py::ssize_t>(entry.priors.size()));
+                std::copy(entry.priors.begin(), entry.priors.end(), priors.mutable_data());
+
+                py::dict d;
+                d["value"] = entry.value.value;
+                d["moves"] = moves;   // PACKED, to compare against a dump slice directly
+                d["priors"] = priors;
+                return d;
+            },
+            py::arg("nn_key"),
+            "The entry for a raw nn_key, with PACKED moves — the layout "
+            "golden/gate1_dump.npz stores, so a round-trip check compares two arrays "
+            "rather than two lists of formatted strings.\n\n"
+            "Counts as a hit or a miss in cache_stats(), exactly as the search's own probe "
+            "does.")
+
+        .def(
+            "cache_entry",
+            [](Search &self, const std::string &fen) -> py::object {
+                guofish::CachedEval entry;
+                const guofish::EvalRow row(guofish::parse_fen(fen));
+                if (!self.cache_probe(row.key(), entry)) {
+                    return py::none();
+                }
+                py::list moves;
+                for (const std::uint16_t packed : entry.moves) {
+                    moves.append(move_to_uci(packed));
+                }
+                py::array_t<float> priors(static_cast<py::ssize_t>(entry.priors.size()));
+                std::copy(entry.priors.begin(), entry.priors.end(), priors.mutable_data());
+
+                py::dict d;
+                d["nn_key"] = row.key().value;
+                d["value"] = entry.value.value;
+                d["moves"] = moves;
+                d["priors"] = priors;
+                return d;
+            },
+            py::arg("fen"),
+            "The cache entry for `fen`, or None on a miss. THIS IS THE ROUND-TRIP SURFACE: "
+            "the brief requires entry contents — priors and move list — to be verified "
+            "directly and by assertion on mismatch, rather than inferred from the tree, "
+            "because the tree cannot see them.\n\n"
+            "NOTE that probing through this counts as a hit or a miss in cache_stats(), "
+            "exactly as the search's own probe does. Read the statistics before inspecting "
+            "entries, or clear and re-run.")
+
+        // --- C7: tablebases -------------------------------------------------
+
+        .def(
+            "set_tablebase",
+            [](Search &self, guofish::TablebaseProber *prober) { self.set_tablebase(prober); },
+            py::arg("prober").none(true),
+            // The search BORROWS the prober (the reference borrows its handle
+            // too — one open Tablebase serves the UCI layer and every search).
+            // keep_alive<1, 2> ties the backend's lifetime to this search's, so
+            // a caller who drops their only reference does not leave a dangling
+            // pointer in the leaf path.
+            py::keep_alive<1, 2>(),
+            "Attach a tablebase backend, or None to detach. Mode 2 then fires at every leaf "
+            "with <= 5 men.\n\n"
+            "THE SHIPPING DEFAULT IS None. cpp/tablebase.hpp explains why the Syzygy decoder "
+            "is a backend rather than part of this chunk (Global Rule 7 and the brief's "
+            "non-blocking clause), and what is implemented and tested without it.")
+
+        .def_property_readonly(
+            "tablebase_backend",
+            [](const Search &self) -> py::object {
+                const guofish::TablebaseProber *prober = self.tablebase();
+                return prober == nullptr ? py::none().cast<py::object>()
+                                         : py::cast(prober->backend());
+            },
+            "The attached backend's name, or None when tablebases are off.")
 
         .def_property_readonly(
             "dump_size", [](const Search &self) { return self.dump().size(); },
@@ -1896,6 +2217,12 @@ PYBIND11_MODULE(guofish_core, m) {
         "PUCT breaks ties by child order, getting it wrong makes C++ and Python explore "
         "different moves at equal priors rather than failing loudly.");
 
+    m.def("pack_uci", &packed_from_uci, py::arg("uci"),
+          "The inverse of move_to_uci: a UCI string to the arena's packed 16-bit move. "
+          "Syntactic — no board is consulted — so it is the right tool for building a "
+          "move list to hand to the cache, and the wrong one for asking whether a move is "
+          "legal.");
+
     m.def("move_to_uci", &move_to_uci, py::arg("packed_move"),
           "A packed move as its UCI string. No castling normalisation: that is a property of a "
           "generated move and belongs at the movegen boundary (C1), not in the packing.");
@@ -1936,6 +2263,10 @@ PYBIND11_MODULE(guofish_core, m) {
     // that pins it rather than restated here, so the pin test cannot pass
     // against a build of some other revision.
     m.attr("CHESS_LIBRARY_PIN") = std::string(GUOFISH_CHESS_LIBRARY_PIN);
+    // C7. Pinned for a sharper reason than the other two: a tablebase probe is
+    // a lookup whose ANSWER is under test, so a re-pin could change the WDL a
+    // position reports with nothing in this repo changing.
+    m.attr("FATHOM_PIN") = std::string(GUOFISH_FATHOM_PIN);
 
     py::class_<guofish::SearchConfig>(
         m, "SearchConfig",
@@ -1944,7 +2275,8 @@ PYBIND11_MODULE(guofish_core, m) {
         "applied only when it is not 1.0 so the default path is bit-identical.")
         .def(py::init([](double c_init, double c_base, double c_factor, double fpu_root,
                          double fpu_tree, double virtual_loss, int max_tree_depth,
-                         std::size_t arena_capacity) {
+                         std::size_t arena_capacity, std::size_t cache_slots,
+                         std::size_t cache_shards) {
                  guofish::SearchConfig config;
                  config.c_init = c_init;
                  config.c_base = c_base;
@@ -1954,12 +2286,16 @@ PYBIND11_MODULE(guofish_core, m) {
                  config.virtual_loss = virtual_loss;
                  config.max_tree_depth = max_tree_depth;
                  config.arena_capacity = arena_capacity;
+                 config.cache_slots = cache_slots;
+                 config.cache_shards = cache_shards;
                  return config;
              }),
              py::arg("c_init") = 1.43, py::arg("c_base") = 19652.0, py::arg("c_factor") = 1.0,
              py::arg("fpu_root") = 0.0, py::arg("fpu_tree") = 0.30,
              py::arg("virtual_loss") = 0.0, py::arg("max_tree_depth") = 80,
-             py::arg("arena_capacity") = static_cast<std::size_t>(1u << 21))
+             py::arg("arena_capacity") = static_cast<std::size_t>(1u << 21),
+             py::arg("cache_slots") = static_cast<std::size_t>(0),
+             py::arg("cache_shards") = guofish::kDefaultCacheShards)
         .def_readwrite("c_init", &guofish::SearchConfig::c_init)
         .def_readwrite("c_base", &guofish::SearchConfig::c_base)
         .def_readwrite("c_factor", &guofish::SearchConfig::c_factor)
@@ -1967,7 +2303,281 @@ PYBIND11_MODULE(guofish_core, m) {
         .def_readwrite("fpu_tree", &guofish::SearchConfig::fpu_tree)
         .def_readwrite("virtual_loss", &guofish::SearchConfig::virtual_loss)
         .def_readwrite("max_tree_depth", &guofish::SearchConfig::max_tree_depth)
-        .def_readwrite("arena_capacity", &guofish::SearchConfig::arena_capacity);
+        .def_readwrite("arena_capacity", &guofish::SearchConfig::arena_capacity)
+        .def_readwrite("cache_slots", &guofish::SearchConfig::cache_slots,
+                       "C7. Total transposition-cache entries. 0 is NO CACHE (the default, so "
+                       "C5/C6's certified code path is unchanged); a cache that can hold "
+                       "nothing is not constructible, because it would pass every "
+                       "tree-equivalence test while doing no work.")
+        .def_readwrite("cache_shards", &guofish::SearchConfig::cache_shards,
+                       "C7. Spinlock-protected shards; a power of two, at least 64.");
+
+    // -----------------------------------------------------------------------
+    // C7 — cache and tablebase
+    // -----------------------------------------------------------------------
+
+    m.attr("CACHE_MIN_SHARDS") = guofish::kMinCacheShards;
+    m.attr("CACHE_DEFAULT_SHARDS") = guofish::kDefaultCacheShards;
+    m.attr("MAX_LEGAL_MOVES") = guofish::kMaxLegalMoves;
+    m.attr("TABLEBASE_MAX_PIECES") = guofish::kTablebaseMaxPieces;
+
+    m.def("cache_type_separation", &cache_type_separation,
+          "The compile-time facts of C7's anti-poisoning requirement, as a dict.\n\n"
+          "Every entry is evaluated by the compiler against the REAL "
+          "TranspositionCache::insert through real overload resolution — not against a "
+          "restatement of its signature that could drift. `network_value_accepted` must be "
+          "True and every other `*_accepted` must be False; a False in the first or a True "
+          "in the rest means a terminal value, a proof or a tablebase result can be stored "
+          "in a position-keyed cache, which is the defect this chunk exists to prevent.\n\n"
+          "The same predicates are static_asserts in cpp/cache.hpp, so a violation stops the "
+          "build. This function exists because a build that stops gives an acceptance test "
+          "nothing to point at.");
+
+    m.def("eval_row", &eval_row, py::arg("fen"),
+          "The 68-token evaluator input row for `fen` AND the nn_key computed from exactly "
+          "those tokens, as one dict.\n\n"
+          "They come from one guofish::EvalRow, which is the whole point: the cache key must "
+          "be a function of the bytes handed to the network, never of a second derivation "
+          "from the board that happens to agree today (scope 2.5, and the C7 brief's "
+          "'Risks / NNKey Generation').");
+
+    m.def("nn_key_of_tokens", &nn_key_of_tokens, py::arg("tokens"),
+          "The nn_key for a caller-supplied 68-token row. Perturb one token and the key "
+          "moves; that is how 'the key is a function of the tokens' is checked rather than "
+          "asserted.");
+
+    py::class_<guofish::CacheStats>(m, "CacheStats", "Counters for one TranspositionCache.")
+        .def_readonly("hits", &guofish::CacheStats::hits)
+        .def_readonly("misses", &guofish::CacheStats::misses)
+        .def_readonly("inserts", &guofish::CacheStats::inserts)
+        .def_readonly("collisions", &guofish::CacheStats::collisions,
+                      "Inserts that displaced a DIFFERENT key — the direct-mapped table's "
+                      "eviction count. Distinguishes 'no transpositions in this workload' "
+                      "from 'the table is too small'.")
+        .def_readonly("refreshes", &guofish::CacheStats::refreshes,
+                      "Inserts that rewrote the SAME key with the same payload. Counted "
+                      "separately so it cannot inflate `collisions`.")
+        .def_property_readonly("hit_rate", &guofish::CacheStats::hit_rate);
+
+    py::class_<guofish::TranspositionCache>(
+        m, "TranspositionCache",
+        "The NN evaluation cache, standalone. Sharded (>= 64 shards, spinlock each), "
+        "direct-mapped within a shard, keyed by nn_key.\n\n"
+        "It holds a value, the gathered legal priors and the move list those priors are "
+        "aligned with. It CANNOT hold a terminal mark, a proof or a tablebase result: "
+        "insert() takes a network value and there is no conversion from the others. See "
+        "cache_type_separation().")
+        .def(py::init<std::size_t, std::size_t>(), py::arg("slots"),
+             py::arg("shards") = guofish::kDefaultCacheShards,
+             "`slots` is rounded up to a power of two per shard. `slots == 0` raises: "
+             "'cache off' is expressed by not having a cache, because a cache that can hold "
+             "nothing passes every tree-equivalence test while doing no work.")
+        .def_property_readonly("capacity", &guofish::TranspositionCache::capacity)
+        .def_property_readonly("shard_count", &guofish::TranspositionCache::shard_count)
+        .def_property_readonly("slots_per_shard", &guofish::TranspositionCache::slots_per_shard)
+        .def_property_readonly("size", &guofish::TranspositionCache::size,
+                               "Occupied slots. Walks the whole table under each shard's "
+                               "lock; a diagnostic, not a hot-path call.")
+        .def_property_readonly("stats", &guofish::TranspositionCache::stats)
+        .def("clear", &guofish::TranspositionCache::clear)
+        .def(
+            "insert",
+            [](guofish::TranspositionCache &self, std::uint64_t key, double value,
+               const std::vector<std::string> &moves, const std::vector<float> &priors) {
+                if (moves.size() != priors.size()) {
+                    throw py::value_error(
+                        "guofish_core: moves and priors must be the same length");
+                }
+                std::vector<std::uint16_t> packed;
+                packed.reserve(moves.size());
+                for (const std::string &uci : moves) {
+                    packed.push_back(packed_from_uci(uci));
+                }
+                // The bare double arrives from Python and is wrapped HERE, at
+                // the language boundary, which is the only place a wrap is
+                // legitimate — Python has no type system to carry the
+                // distinction across. Inside C++ the wrap is what `insert`
+                // demands and cannot be bypassed.
+                self.insert(guofish::NNKey(key), guofish::NetworkValue(value), packed.data(),
+                            priors.data(), static_cast<std::uint16_t>(packed.size()));
+            },
+            py::arg("nn_key"), py::arg("value"), py::arg("moves"), py::arg("priors"),
+            "Store one evaluation. `moves` are UCI strings in canonical order and `priors` "
+            "is aligned with them.")
+        .def(
+            "probe",
+            [](guofish::TranspositionCache &self, std::uint64_t key) -> py::object {
+                guofish::CachedEval entry;
+                if (!self.probe(guofish::NNKey(key), entry)) {
+                    return py::none();
+                }
+                py::list moves;
+                for (const std::uint16_t packed : entry.moves) {
+                    moves.append(move_to_uci(packed));
+                }
+                py::array_t<float> priors(static_cast<py::ssize_t>(entry.priors.size()));
+                std::copy(entry.priors.begin(), entry.priors.end(), priors.mutable_data());
+
+                py::dict d;
+                d["value"] = entry.value.value;
+                d["moves"] = moves;
+                d["priors"] = priors;
+                return d;
+            },
+            py::arg("nn_key"), "The entry for `nn_key`, or None. Counts as a hit or a miss.");
+
+    py::class_<guofish::TablebaseProber>(
+        m, "TablebaseProber",
+        "Base class for a Syzygy backend. Three exist: FathomProber (native, production), "
+        "PythonProber (a Python callable, for cross-checking against the reference) and "
+        "NullProber (misses on everything, which is what 'tablebases off' means "
+        "concretely).")
+        .def_property_readonly("backend", &guofish::TablebaseProber::backend);
+
+    py::class_<guofish::FathomProber, guofish::TablebaseProber>(
+        m, "FathomProber",
+        "The native Syzygy backend, on jdart1/Fathom (pinned; see FATHOM_PIN).\n\n"
+        "ONE PER PROCESS. Fathom keeps its state in file scope — tb_init and tb_free take "
+        "no handle — so constructing a second one while the first is alive raises rather "
+        "than silently sharing and double-freeing its tables. Hold one and hand it to "
+        "whoever needs it, exactly as the reference hands one chess.syzygy.Tablebase to the "
+        "UCI layer and to every search.\n\n"
+        "Five places Fathom and python-chess disagree — the WDL scale, the halfmove-clock "
+        "guard on tb_probe_wdl, castling rights, the DTZ sign, and which entry point DTZ "
+        "comes from — are reconciled in cpp/fathom.hpp and MEASURED against the reference "
+        "over the real tables by tests/test_c7_cache.py.\n\n"
+        "probe_dtz is NOT thread safe (tb_probe_root is not). It is used only by mode 1, "
+        "which runs once per move at the UCI layer. Mode 2, the one on the search path, "
+        "needs WDL alone, and tb_probe_wdl IS thread safe.")
+        .def(py::init<std::string>(), py::arg("path"),
+             "Open the tables under `path`. Raises if they cannot be opened, if the "
+             "directory holds no tables at all (which would otherwise give a prober that "
+             "reports itself open and misses on everything), or if another FathomProber is "
+             "already alive.")
+        .def_property_readonly("largest", &guofish::FathomProber::largest,
+                               "The most men any loaded table covers — Fathom's TB_LARGEST. "
+                               "assets/syzygy is a 5-man set.")
+        .def_property_readonly("path", &guofish::FathomProber::path)
+        .def(
+            "probe_wdl",
+            [](const guofish::FathomProber &self, std::string_view fen) -> py::object {
+                const guofish::ParsedFen parsed = guofish::parse_fen(fen);
+                chess::Board board;
+                guofish::set_fen_or_throw(board, fen);
+                const auto wdl =
+                    self.probe_wdl(parsed, static_cast<int>(board.halfMoveClock()));
+                return wdl.has_value() ? py::cast(*wdl) : py::none();
+            },
+            py::arg("fen"),
+            "Raw Syzygy WDL in [-2, +2] from the side to move's perspective, or None on a "
+            "miss. Clock-independent, matching python-chess's probe_wdl — see "
+            "cpp/fathom.hpp note 2 for why that is correct here and is not the "
+            "cache-poisoning defect returning.")
+        .def(
+            "probe_dtz",
+            [](const guofish::FathomProber &self, std::string_view fen) -> py::object {
+                const guofish::ParsedFen parsed = guofish::parse_fen(fen);
+                chess::Board board;
+                guofish::set_fen_or_throw(board, fen);
+                const auto dtz =
+                    self.probe_dtz(parsed, static_cast<int>(board.halfMoveClock()));
+                return dtz.has_value() ? py::cast(*dtz) : py::none();
+            },
+            py::arg("fen"),
+            "SIGNED distance to zero from the side to move's perspective, or None on a "
+            "miss — positive when winning, negative when losing, matching python-chess's "
+            "probe_dtz. Fathom reports a magnitude; the sign is restored from the WDL.");
+
+    py::class_<guofish::NullProber, guofish::TablebaseProber>(
+        m, "NullProber",
+        "A backend that misses on everything: what 'tablebases off' means concretely. Exists "
+        "so the probe path — piece-count gate, probe, miss, keep the neural value — can be "
+        "exercised in a build with no tables, which is the path production takes on every "
+        "position with six or more men.")
+        .def(py::init<>());
+
+    py::class_<PythonProber, guofish::TablebaseProber>(
+        m, "PythonProber",
+        "A backend backed by a Python callable: fen -> (wdl, dtz) or None.\n\n"
+        "`chess.syzygy.open_tablebase(...)` wrapped in three lines is exactly such a "
+        "callable, so this is what lets modes 1 and 2 be tested against the REAL 5-piece "
+        "tables — real WDL, real DTZ, real perspective — without vendoring a decoder. The "
+        "FEN it passes carries the search's own raw en-passant square and halfmove clock, so "
+        "the position Python reconstructs is the one the search is standing on.\n\n"
+        "It calls into Python and therefore needs the GIL. Every caller today holds it; C9's "
+        "threads will not, and a native backend rather than a GIL acquisition in a leaf "
+        "probe is the answer there.")
+        .def(py::init<py::function>(), py::arg("probe"))
+        .def_property_readonly("calls", &PythonProber::calls,
+                               "How many times the callable was invoked. A probe of one "
+                               "position costs two calls (WDL then DTZ) in mode 1 and one "
+                               "(WDL) in mode 2.");
+
+    m.def(
+        "wdl_to_value", &guofish::wdl_to_value, py::arg("wdl"),
+        "The reference's wdl_to_value: wdl / 2.0, so +-2 -> +-1.0 (decisive), +-1 -> +-0.5 "
+        "(cursed win / blessed loss, treated as half-decisive), 0 -> 0.0. The +-1 endpoints "
+        "match the bounded range the value head produces, so a tablebase result does not "
+        "read as out-of-distribution to PUCT.");
+
+    m.def(
+        "tablebase_probe_value",
+        [](std::string_view fen, const guofish::TablebaseProber &prober) -> py::object {
+            const guofish::ParsedFen parsed = guofish::parse_fen(fen);
+            chess::Board board;
+            guofish::set_fen_or_throw(board, fen);
+            const auto value = guofish::probe_tablebase_value(
+                prober, parsed, static_cast<int>(board.halfMoveClock()));
+            return value.has_value() ? py::cast(value->value) : py::none();
+        },
+        py::arg("fen"), py::arg("prober"),
+        "Mode 2's value for `fen` in ABSOLUTE (White) perspective, or None on a miss. The "
+        "perspective conversion happens here rather than at the backup site, which is the "
+        "reference's decision and its own docstring's reason: the backup site 'is exactly "
+        "where tablebase perspective bugs hide'.");
+
+    m.def(
+        "within_tablebase_range",
+        [](std::string_view fen) {
+            return guofish::within_tablebase_range(guofish::parse_fen(fen));
+        },
+        py::arg("fen"),
+        "The piece-count gate: <= TABLEBASE_MAX_PIECES men, both kings counted. A popcount "
+        "that filters out the overwhelming majority of leaves before any probe cost.");
+
+    m.def(
+        "piece_count",
+        [](std::string_view fen) { return guofish::piece_count(guofish::parse_fen(fen).placement); },
+        py::arg("fen"), "Men on the board, both kings included.");
+
+    m.def(
+        "tablebase_root_score",
+        [](bool mate, bool drawn_terminal, bool zeroing, int wdl_child, int dtz_child) {
+            const guofish::TablebaseRootScore score =
+                guofish::tablebase_root_score(mate, drawn_terminal, zeroing, wdl_child, dtz_child);
+            return py::make_tuple(score.outcome, score.distance);
+        },
+        py::arg("mate"), py::arg("drawn_terminal"), py::arg("zeroing"), py::arg("wdl_child"),
+        py::arg("dtz_child"),
+        "Mode 1's per-move ranking pair (outcome, distance), transcribed from "
+        "playing/uci_wrapper.py::_probe_tablebase. The engine maximises (outcome, -distance). "
+        "Exposed as a pure function so the ranking can be checked on numbers rather than only "
+        "through a board.");
+
+    m.def(
+        "tablebase_root_move",
+        [](std::string_view fen, const guofish::TablebaseProber &prober) -> py::object {
+            guofish::SearchBoard board;
+            board.set_fen(fen);
+            const std::optional<std::uint16_t> move = guofish::tablebase_root_move(board, prober);
+            return move.has_value() ? py::cast(move_to_uci(*move)) : py::none();
+        },
+        py::arg("fen"), py::arg("prober"),
+        "Mode 1: the tablebase-optimal move for a <= 5-man root, or None on any miss (out of "
+        "range, no tables, or a table the backend cannot answer from). None means 'fall "
+        "through to MCTS', which is the reference's behaviour and the only safe one.\n\n"
+        "Runs on a SearchBoard, so the position handed to the backend carries the RAW "
+        "en-passant square rather than chess-library's filtered one.");
 
     m.def("c_puct", &guofish::c_puct, py::arg("parent_visits"), py::arg("c_init") = 1.43,
           py::arg("c_base") = 19652.0,

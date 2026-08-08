@@ -5,9 +5,32 @@ toolchains are supported and both are exercised on every chunk: **Windows/MSVC**
 is production, **Linux/Clang** exists because ThreadSanitizer does not exist on
 MSVC and C9 will need it.
 
-Dependencies (`pybind11`, `Disservin/chess-library`) are fetched by CMake at
-configure time and pinned to immutable revisions. Nothing needs installing by
-hand; the first configure needs network access.
+Dependencies (`pybind11`, `Disservin/chess-library`, `jdart1/Fathom`) are fetched
+by CMake at configure time and pinned to immutable revisions. Nothing needs
+installing by hand; the first configure needs network access.
+
+Fathom (C7) is the Syzygy tablebase prober and is the only C in the build — one
+translation unit, compiled into a static `fathom` target and linked into the
+module. Two things about it are worth knowing before you touch the CMake:
+
+* **Warning flags are per-target, not directory-wide.** `/W4` and
+  `-Wall -Wextra` are applied with `target_compile_options(guofish_core …)`, so
+  our code stays exactly as strict while Fathom's warnings are not ours to
+  suppress (Global Rule 4 forbids `-Wno-*` and pragmas). If you add a target,
+  add `${GUOFISH_STRICT_WARNINGS}` to it deliberately.
+* **MSVC needs `/experimental:c11atomics`** to compile `<stdatomic.h>`, which
+  Fathom uses for the synchronisation that makes `tb_probe_wdl` thread-safe.
+  Defining `TB_NO_THREADS` instead would compile everywhere with no flag and
+  would remove exactly the property C9 needs. Clang needs nothing.
+
+The tablebase files themselves are **not** a build dependency. `assets/syzygy`
+holds a 5-man set; without it the tablebase tests skip and the engine runs with
+tablebases off, which is the default.
+
+The test suite additionally needs `numpy`, `pytest` and — for the C3b reference
+tests and C7's tablebase oracle — `python-chess` (pinned by the golden data at
+1.11.2). Install it in the Linux venv too, or C7's tablebase section silently
+skips there.
 
 ## CMake options
 

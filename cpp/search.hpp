@@ -114,10 +114,13 @@
 #include <chess.hpp>
 
 #include "arena.hpp"
+#include "cache.hpp"
 #include "keys.hpp"
 #include "movegen.hpp"
+#include "tablebase.hpp"
 #include "terminal.hpp"
 #include "tokens.hpp"
+#include "values.hpp"
 
 #include <algorithm>
 #include <array>
@@ -126,6 +129,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -153,6 +158,21 @@ struct SearchConfig {
     double virtual_loss = 0.0;    // VIRTUAL_LOSS; production is 2.5
     int max_tree_depth = 80;      // MAX_TREE_DEPTH
     std::size_t arena_capacity = 1u << 21;
+
+    // C7. `cache_slots == 0` means NO CACHE — the search holds an empty
+    // std::optional and never probes. That is the default, deliberately:
+    //
+    //  * C5 and C6 were certified against the reference at `cache_size=1`, and
+    //    a chunk that silently changed the code path under their tests would
+    //    make a C7 regression look like a C5 one;
+    //  * "cache off" and "a cache that can hold nothing" must not be the same
+    //    object, because the second passes every tree-equivalence test while
+    //    doing no work (see cpp/cache.hpp's constructor).
+    //
+    // tests/test_c7_cache.py turns it on explicitly and re-runs the whole Gate 1
+    // corpus with it on, which is the chunk's acceptance criterion.
+    std::size_t cache_slots = 0;
+    std::size_t cache_shards = kDefaultCacheShards;
 };
 
 // AlphaZero's visit-scaled exploration constant, exactly as SearchParams.c_puct
@@ -237,6 +257,44 @@ inline std::uint16_t packed_of(const chess::Board &board, chess::Move move) {
                                 ? promotion_code(move.promotionType())
                                 : Promotion::None;
     return pack_move(move.from().index(), uci_destination(board, move).index(), promo);
+}
+
+// Generate `board`'s legal moves, normalise them, and put them in canonical
+// `(from, to, promotion)` order.
+//
+// Free function rather than a ReplaySearch member because C7 gives it a second
+// caller — the tablebase root probe, which is a UCI-layer bypass and has no
+// search. One implementation matters here for the usual reason: PUCT resolves
+// ties by child order, so two orderings that agree "almost always" are the kind
+// of divergence Gate 1 exists to prevent.
+//
+// Sorting a small vector of triples rather than the Movelist itself keeps
+// chess-library's generation order out of the answer entirely.
+inline void generate_canonical_moves(const chess::Board &board, std::vector<std::uint16_t> &packed,
+                                     std::vector<std::uint16_t> &raw) {
+    chess::Movelist movelist;
+    chess::movegen::legalmoves(movelist, board);
+
+    // (canonical key, packed move, raw library move).
+    std::vector<std::array<std::uint16_t, 3>> entries;
+    entries.reserve(static_cast<std::size_t>(movelist.size()));
+    for (const auto &move : movelist) {
+        const std::uint16_t p = packed_of(board, move);
+        entries.push_back({canonical_move_key(p), p, move.move()});
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const std::array<std::uint16_t, 3> &a, const std::array<std::uint16_t, 3> &b) {
+                  return a[0] < b[0];
+              });
+
+    packed.clear();
+    raw.clear();
+    packed.reserve(entries.size());
+    raw.reserve(entries.size());
+    for (const auto &entry : entries) {
+        packed.push_back(entry[1]);
+        raw.push_back(entry[2]);
+    }
 }
 
 class SearchBoard {
@@ -432,75 +490,141 @@ private:
 // ---------------------------------------------------------------------------
 // Diagnostic FEN
 //
-// Written by hand rather than taken from Board::fen() for two reasons. The
-// prohibited round trip is the obvious one. The load-bearing one is that this
-// has to print the ep square THIS FILE derived, not the library's — when a dump
-// miss is being explained, "which ep square did the search think it was at" is
-// the first question, and a FEN that answered with the library's state would
-// hide exactly the bug the message exists to surface.
-//
-// C6 gives it a second job: the FEN of a terminal node is what a promotion probe
-// re-loads, and there the halfmove clock is not decoration — a fifty-move draw
-// node whose FEN said `0` would be a different position on the one axis that
-// made it a draw.
+// `fen_of` itself moved to cpp/tokens.hpp in C7, beside the parser it inverts,
+// because the tablebase prober needs to format a position without including the
+// search. Its two jobs here are unchanged: it prints the ep square THIS FILE
+// derived rather than chess-library's — when a dump miss is being explained,
+// "which ep square did the search think it was at" is the first question — and
+// it carries the halfmove clock, so the FEN of a fifty-move draw node is
+// re-loadable as the same position that made it a draw (C6's promotion probes).
 // ---------------------------------------------------------------------------
-
-inline std::string fen_of(const ParsedFen &parsed, int halfmove, int fullmove) {
-    static const char kSymbols[] = "PNBRQKpnbrqk";
-
-    std::string out;
-    out.reserve(90);
-
-    for (int rank = 7; rank >= 0; --rank) {
-        int empty = 0;
-        for (int file = 0; file < 8; ++file) {
-            const std::int32_t token = parsed.placement.square_token[rank * 8 + file];
-            if (token == kTokenEmpty) {
-                ++empty;
-                continue;
-            }
-            if (empty != 0) {
-                out += static_cast<char>('0' + empty);
-                empty = 0;
-            }
-            out += kSymbols[token - 1];
-        }
-        if (empty != 0) {
-            out += static_cast<char>('0' + empty);
-        }
-        if (rank != 0) {
-            out += '/';
-        }
-    }
-
-    out += parsed.white_to_move ? " w " : " b ";
-
-    const Placement &placement = parsed.placement;
-    std::string castling;
-    if (has_castling_right(parsed.castling, placement, true, true)) castling += 'K';
-    if (has_castling_right(parsed.castling, placement, true, false)) castling += 'Q';
-    if (has_castling_right(parsed.castling, placement, false, true)) castling += 'k';
-    if (has_castling_right(parsed.castling, placement, false, false)) castling += 'q';
-    out += castling.empty() ? "-" : castling;
-
-    out += ' ';
-    if (parsed.ep_square < 0) {
-        out += '-';
-    } else {
-        out += static_cast<char>('a' + (parsed.ep_square & 7));
-        out += static_cast<char>('1' + (parsed.ep_square >> 3));
-    }
-
-    out += ' ';
-    out += std::to_string(halfmove);
-    out += ' ';
-    out += std::to_string(fullmove);
-    return out;
-}
 
 inline std::string SearchBoard::diagnostic_fen() const {
     return fen_of(parsed_from_board(), halfmove_clock_,
                   static_cast<int>(board_.fullMoveNumber()));
+}
+
+// ---------------------------------------------------------------------------
+// C7, Mode 1 — the tablebase root bypass
+//
+// `playing/uci_wrapper.py::_probe_tablebase`, transcribed. For a root with <= 5
+// men the tables play perfectly, so the engine returns the tablebase move and
+// never starts a search. The ranking rule itself is in cpp/tablebase.hpp
+// (`tablebase_root_score`), where it can be tested on numbers; this is the board
+// walk that feeds it.
+//
+// Returns the packed, NORMALISED move (castling as e1g1, never e1h1), or nullopt
+// on any miss — out of range, no tables, or a table the backend cannot answer
+// from. Every one of those means "fall through to MCTS", which is the
+// reference's behaviour and the only safe one: a bypass that guessed would play
+// a losing move with total confidence.
+//
+// It runs on a SearchBoard rather than a chess::Board so the position handed to
+// the backend carries the RAW en-passant square. A Syzygy probe of a position
+// with a pawn structure that admits en passant is a different probe; going
+// through chess-library's filtered ep state would be the same class of quiet
+// error this port has been avoiding since C2.
+//
+// ONE KNOWN DIVERGENCE, and it is in tie-breaking only. The reference iterates
+// `board.legal_moves` — python-chess's generation order — and keeps the first
+// move achieving the maximum. This iterates canonical `(from, to, promotion)`
+// order and does the same. Where two moves have an identical (outcome,
+// -distance) key the two implementations can therefore pick differently. Both
+// are tablebase-optimal by construction, so the game-theoretic result is
+// unchanged; canonical order is chosen because it is the order this port uses
+// everywhere else and is reproducible from the move alone. Recorded in
+// DECISIONS.md.
+// ---------------------------------------------------------------------------
+
+inline std::optional<std::uint16_t> tablebase_root_move(SearchBoard &board,
+                                                        const TablebaseProber &prober) {
+    const ParsedFen before = board.parsed();
+    // The reference's gate, at the call site rather than inside the helper.
+    // Repeated here so the function is safe to call on any position.
+    if (!within_tablebase_range(before)) {
+        return std::nullopt;
+    }
+
+    std::vector<std::uint16_t> packed;
+    std::vector<std::uint16_t> raw;
+    generate_canonical_moves(board.board(), packed, raw);
+    if (packed.empty()) {
+        // Checkmate or stalemate at the root: there is no move to return, and
+        // the reference's loop would leave best_move as None.
+        return std::nullopt;
+    }
+
+    std::optional<std::uint16_t> best;
+    TablebaseRootScore best_score;
+
+    // Unmakes on ANY exit from the iteration, including a throw out of the
+    // backend. A prober is allowed to fail — PythonProber propagates whatever
+    // the callable raised — and without this the board would be left one move
+    // deep, which for a caller that owns their SearchBoard is silent corruption
+    // rather than a failed probe.
+    struct Unmake {
+        SearchBoard *board;
+        chess::Move move;
+        bool armed = true;
+        ~Unmake() {
+            if (armed) {
+                board->unmake_move(move);
+            }
+        }
+    };
+
+    for (std::size_t k = 0; k < raw.size(); ++k) {
+        const chess::Move move(raw[k]);
+        const int from = move.from().index();
+        const int to = uci_destination(board.board(), move).index();
+        const bool zeroing = guofish::is_zeroing(before, from, to);
+
+        board.make_move(move, zeroing);
+        Unmake unmake{&board, move};
+
+        chess::Movelist replies;
+        chess::movegen::legalmoves(replies, board.board());
+        const ParsedFen after = board.parsed();
+
+        const bool no_replies = replies.size() == 0;
+        const bool mate = no_replies && board.in_check();
+        const bool drawn_terminal =
+            (no_replies && !board.in_check()) || is_insufficient_material(after.placement);
+
+        int wdl_child = 0;
+        int dtz_child = 0;
+        bool probed = true;
+        if (!mate && !drawn_terminal) {
+            const std::optional<int> wdl = prober.probe_wdl(after, board.halfmove_clock());
+            const std::optional<int> dtz = prober.probe_dtz(after, board.halfmove_clock());
+            if (wdl.has_value() && dtz.has_value()) {
+                wdl_child = *wdl;
+                dtz_child = *dtz;
+            } else {
+                probed = false;
+            }
+        }
+
+        unmake.armed = false;
+        board.unmake_move(move);
+
+        // The reference wraps its WHOLE loop in one try/except, so a single
+        // missing table abandons the bypass rather than ranking the remaining
+        // moves against an incomplete picture. That is the conservative reading
+        // and it is the right one: a partial ranking can prefer a move only
+        // because its sibling could not be scored.
+        if (!probed) {
+            return std::nullopt;
+        }
+
+        const TablebaseRootScore score =
+            tablebase_root_score(mate, drawn_terminal, zeroing, wdl_child, dtz_child);
+        if (!best.has_value() || score.better_than(best_score)) {
+            best = packed[k];
+            best_score = score;
+        }
+    }
+    return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +744,26 @@ struct SearchStats {
     std::int64_t fivefold_repetitions = 0;
     std::int64_t terminal_fast_path_hits = 0;  // a later visit to a marked node
     std::int64_t mate_short_circuits = 0;      // the depth-1 hack fired
+
+    // C7. The cache counters are per-SEARCH; TranspositionCache::stats() is the
+    // per-CACHE lifetime total, and the two differ whenever a cache outlives a
+    // set_position — which it does, exactly as the reference's does.
+    //
+    // These exist because the brief points out that tree equivalence cannot see
+    // them: with tablebases off the cache is result-invariant, so a cache with a
+    // 0% hit rate produces a bit-identical tree and passes the gate. The hit
+    // rate is therefore asserted separately, and it is asserted on THIS number.
+    std::int64_t cache_hits = 0;
+    std::int64_t cache_misses = 0;
+    std::int64_t cache_inserts = 0;
+
+    // C7, mode 2. `tablebase_probes` counts positions that passed the
+    // piece-count gate and reached the backend; `tablebase_overrides` counts
+    // those the backend actually answered. The gap is the miss rate, which for a
+    // 5-piece table set on a 6-piece leaf is 100% — a distinction worth having
+    // when a run reports no overrides.
+    std::int64_t tablebase_probes = 0;
+    std::int64_t tablebase_overrides = 0;
 };
 
 // A serialized node, in canonical DFS preorder.
@@ -666,6 +810,9 @@ public:
         if (config.max_tree_depth < 1) {
             throw std::invalid_argument("guofish::ReplaySearch: max_tree_depth must be >= 1");
         }
+        if (config.cache_slots != 0) {
+            cache_.emplace(config.cache_slots, config.cache_shards);
+        }
     }
 
     ReplayDump &dump() noexcept { return dump_; }
@@ -674,6 +821,55 @@ public:
     const SearchStats &stats() const noexcept { return stats_; }
     const NodeArena<Accumulator> &arena() const noexcept { return arena_; }
     std::uint32_t root() const noexcept { return root_; }
+
+    // --- C7: the cache -----------------------------------------------------
+
+    bool has_cache() const noexcept { return cache_.has_value(); }
+
+    CacheStats cache_stats() const {
+        return cache_.has_value() ? cache_->stats() : CacheStats{};
+    }
+
+    std::size_t cache_size() const { return cache_.has_value() ? cache_->size() : 0u; }
+    std::size_t cache_capacity() const { return cache_.has_value() ? cache_->capacity() : 0u; }
+    std::size_t cache_shard_count() const {
+        return cache_.has_value() ? cache_->shard_count() : 0u;
+    }
+
+    // The cache is NOT cleared by set_position, matching the reference — one
+    // `TranspositionCache` lives on the `ParallelMCTS` instance and survives
+    // every `search()` call, which is what makes it worth having across moves of
+    // a game. A test that wants a hit rate attributable to one position calls
+    // this first.
+    void clear_cache() {
+        if (cache_.has_value()) {
+            cache_->clear();
+        }
+    }
+
+    // Read one entry back out, by key. The acceptance criteria ask for the entry
+    // CONTENTS to be checked directly — priors and move list round-tripping —
+    // rather than for correctness to be inferred from the tree, so the contents
+    // have to be reachable.
+    bool cache_probe(NNKey key, CachedEval &out) {
+        if (!cache_.has_value()) {
+            return false;
+        }
+        return cache_->probe(key, out);
+    }
+
+    // --- C7: tablebases ----------------------------------------------------
+
+    // Borrowed, not owned: the caller keeps the prober alive. That is the
+    // reference's arrangement too (`self.tablebase` is a handle the UCI layer
+    // opened and hands to both modes), and it is what lets one set of open
+    // tables serve several searches.
+    //
+    // `nullptr` is tablebases OFF, which is the default and what the build ships
+    // with — see cpp/tablebase.hpp on why the Syzygy decoder is a backend and
+    // not part of this chunk.
+    void set_tablebase(const TablebaseProber *prober) noexcept { tablebase_ = prober; }
+    const TablebaseProber *tablebase() const noexcept { return tablebase_; }
 
     // The move the depth-1 hack seized on, packed; kNoMove when it did not fire.
     std::uint16_t mating_move() const noexcept { return mating_move_; }
@@ -1021,32 +1217,11 @@ private:
     // --- expansion ---------------------------------------------------------
 
     // Generate, normalise and canonically order this position's legal moves.
+    // The body moved to the free `generate_canonical_moves` in C7 so the
+    // tablebase root probe shares it; behaviour is unchanged.
     void generate_canonical(std::vector<std::uint16_t> &packed,
                             std::vector<std::uint16_t> &raw) const {
-        chess::Movelist movelist;
-        chess::movegen::legalmoves(movelist, board_.board());
-
-        // (canonical key, packed move, raw library move). Sorting a small vector
-        // of triples rather than the Movelist itself keeps chess-library's
-        // generation order out of the answer entirely.
-        std::vector<std::array<std::uint16_t, 3>> entries;
-        entries.reserve(static_cast<std::size_t>(movelist.size()));
-        for (const auto &move : movelist) {
-            const std::uint16_t p = packed_of(board_.board(), move);
-            entries.push_back({canonical_move_key(p), p, move.move()});
-        }
-        std::sort(entries.begin(), entries.end(),
-                  [](const std::array<std::uint16_t, 3> &a,
-                     const std::array<std::uint16_t, 3> &b) { return a[0] < b[0]; });
-
-        packed.clear();
-        raw.clear();
-        packed.reserve(entries.size());
-        raw.reserve(entries.size());
-        for (const auto &entry : entries) {
-            packed.push_back(entry[1]);
-            raw.push_back(entry[2]);
-        }
+        generate_canonical_moves(board_.board(), packed, raw);
     }
 
     // Look the current position up in the dump, or fail by name.
@@ -1055,8 +1230,14 @@ private:
     // board-path tokenization that derives the wrong ep square produces a key
     // the Python-generated dump does not contain, and the FEN printed here shows
     // the ep square the search believed it was at.
-    const ReplayDump::Entry &lookup(const ParsedFen &parsed, bool at_root) {
-        const NNKey key = nn_key(parsed);
+    //
+    // C7 splits the key out into a parameter. The caller now builds an EvalRow —
+    // the 68 tokens plus the key computed FROM those tokens — and passes the key
+    // to the cache probe, to this lookup and to the cache insert, so all three
+    // are keyed by one derivation. Recomputing `nn_key(parsed)` here would put a
+    // second derivation back in, which is the trap the brief names under
+    // "Risks / NNKey Generation".
+    const ReplayDump::Entry &lookup(NNKey key, bool at_root) {
         const ReplayDump::Entry *entry = dump_.find(key, at_root);
         if (entry != nullptr) {
             return *entry;
@@ -1072,35 +1253,51 @@ private:
             "tokenized a position it did evaluate differently.");
     }
 
-    // Publish `node`'s children from a dump entry, given the move list the
-    // caller has already generated.
+    // Publish `node`'s children from a (moves, priors) pair, given the move list
+    // the caller has already generated.
     //
     // C5 generated the moves inside here. C6 hoists that out, because the
     // terminal test needs the same list first — `outcome_of` asks how many legal
     // moves there are, and generating them twice per leaf would be both slower
     // and a second place for the two answers to disagree.
-    void expand(std::uint32_t node, const ReplayDump::Entry &entry,
-                const std::vector<std::uint16_t> &packed, const std::vector<std::uint16_t> &raw) {
+    //
+    // C7 makes the payload a pair of pointers rather than a ReplayDump::Entry,
+    // because it now arrives from two places — the dump on a cache miss, the
+    // cache on a hit — and BOTH have to pass the move-list check below.
+    //
+    // `source_phrase` names which one in the first line and `source_label` is
+    // the column heading on the move list. Two strings rather than one because
+    // the label is padded to the width of "C++      " so the two lists line up
+    // under each other, and tests/test_c5_gate1_quiet.py pins that layout by
+    // asserting on the literal headings.
+    void expand(std::uint32_t node, const std::uint16_t *moves, const float *priors,
+                std::size_t count, const std::vector<std::uint16_t> &packed,
+                const std::vector<std::uint16_t> &raw, const char *source_phrase,
+                const char *source_label) {
         assert(!packed.empty());
+        assert(moves != nullptr && priors != nullptr);
 
-        // The dump's move list is Python's, generated by python-chess and
-        // written in canonical order. Comparing rather than trusting positional
-        // alignment is what makes a movegen divergence a named failure instead
-        // of 37 priors landing on the wrong 37 moves.
-        if (packed.size() != entry.count ||
-            !std::equal(packed.begin(), packed.end(), entry.moves)) {
+        // ASSERT ON MISMATCH RATHER THAN TRUSTING POSITIONAL ALIGNMENT — the
+        // brief's words, and it applies to the cache for a sharper reason than
+        // it applied to the dump. From the dump, a mismatch means movegen
+        // disagrees with python-chess. From the cache, it means two positions
+        // that are NOT the same position were given the same nn_key: a hash
+        // collision, or a key derived from something other than the tokens. The
+        // moves are stored precisely so that this is a named failure and not 37
+        // priors landing on the wrong 37 moves.
+        if (packed.size() != count || !std::equal(packed.begin(), packed.end(), moves)) {
             throw ReplayMiss(
-                "guofish: legal-move mismatch against the replay dump at " +
+                std::string("guofish: legal-move mismatch against ") + source_phrase + " at " +
                 board_.diagnostic_fen() + "\n  path     : " + path_from_root() +
                 "\n  C++      : " + uci_list(packed.data(), packed.size()) +
-                "\n  golden   : " + uci_list(entry.moves, entry.count));
+                "\n  " + source_label + ": " + uci_list(moves, count));
         }
 
         const std::uint32_t offset = arena_.allocate(packed.size());
         for (std::size_t k = 0; k < packed.size(); ++k) {
             const std::uint32_t child = offset + static_cast<std::uint32_t>(k);
             arena_.set_move(child, packed[k]);
-            arena_.set_prior(child, entry.priors[k]);
+            arena_.set_prior(child, priors[k]);
             parent_[child] = node;
             raw_move_[child] = raw[k];
         }
@@ -1113,6 +1310,23 @@ private:
     // The reference assigns rather than accumulates (`root.visit_count = 1`,
     // `root.value_sum = ...`), which is the same thing on a node the arena has
     // just cleared.
+    //
+    // THE ROOT NEITHER READS NOR WRITES THE CACHE, AND THAT IS NOT AN OVERSIGHT.
+    // `_expand_root` in the reference runs its own unbatched forward and never
+    // touches `self.cache` — verified by reading it, not assumed — and the
+    // consequence is load-bearing rather than incidental. The reference
+    // softmaxes root priors on the GPU and interior priors on the CPU, and the
+    // two disagree by up to ~2e-9 on the same position (see ReplayDump's header
+    // and DECISIONS.md, C5), which is why the dump has two tables keyed by
+    // (nn_key, is_root).
+    //
+    // A cache that served the root's entry to an interior visit of the same
+    // position would hand it the GPU priors where the reference used the CPU
+    // ones, and Gate 1 would fail at whatever depth the root position first
+    // recurs — four plies, in a middlegame. Mirroring the reference's omission
+    // keeps the two tables from ever meeting.
+    //
+    // It also costs nothing: a root is expanded once per set_position.
     void expand_root() {
         std::vector<std::uint16_t> packed;
         std::vector<std::uint16_t> raw;
@@ -1129,18 +1343,33 @@ private:
                 "\n  A finished game has no move to search for. The reference returns "
                 "None here, which the UCI layer reports as bestmove 0000.");
         }
-        const ReplayDump::Entry &entry = lookup(root_parsed_, /*at_root=*/true);
-        expand(root_, entry, packed, raw);
+        const ReplayDump::Entry &entry =
+            lookup(EvalRow(root_parsed_).key(), /*at_root=*/true);
+        expand(root_, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
+               "golden   ");
         arena_.add_visits(root_, 1);
-        arena_.add_value(root_, mover_value(entry.value, root_parsed_.white_to_move));
+        arena_.add_value(root_, mover_value(NetworkValue(entry.value), root_parsed_.white_to_move));
         root_expanded_ = true;
     }
 
     // The v5 value head is White-POV by construction, and every node's Q is from
     // the perspective of whoever moved TO it — the opponent of the side now to
     // move. So the value is negated exactly when White is to move.
-    static double mover_value(double absolute, bool white_to_move) noexcept {
-        return white_to_move ? -absolute : absolute;
+    //
+    // Two overloads rather than one taking a double, so the conversion from
+    // "absolute value of some kind" to "the number backed up" is the ONE place
+    // the taxonomy in cpp/values.hpp is unwrapped, and it is a place that names
+    // which kind it was handed. A `TerminalValue` has no overload here on
+    // purpose: terminal values are already mover-POV in the reference and are
+    // backed up without conversion, so an overload would invite a double
+    // negation that no test would catch (0.0 and 1.0 both survive it on the
+    // corpus).
+    static double mover_value(NetworkValue absolute, bool white_to_move) noexcept {
+        return white_to_move ? -absolute.value : absolute.value;
+    }
+
+    static double mover_value(TablebaseValue absolute, bool white_to_move) noexcept {
+        return white_to_move ? -absolute.value : absolute.value;
     }
 
     // --- C6: the claimable draws -------------------------------------------
@@ -1409,13 +1638,79 @@ private:
             return;
         }
 
-        const ReplayDump::Entry &entry = lookup(parsed, /*at_root=*/false);
-        expand(node, entry, packed, raw);
+        // === Expansion and evaluation ===
+        //
+        // ONE derivation of the key, from the exact token row an evaluator would
+        // be handed. The cache probe, the dump lookup and the cache insert all
+        // use `row.key()`; nothing below recomputes it. See EvalRow in
+        // cpp/keys.hpp for why that is a requirement and not a tidiness.
+        const EvalRow row(parsed);
+        NetworkValue nn_value{0.0};
+
+        if (cache_.has_value() && cache_->probe(row.key(), cache_hit_)) {
+            ++stats_.cache_hits;
+            expand(node, cache_hit_.moves.data(), cache_hit_.priors.data(),
+                   cache_hit_.moves.size(), packed, raw, "the transposition cache",
+                   "cache    ");
+            nn_value = cache_hit_.value;
+        } else {
+            if (cache_.has_value()) {
+                ++stats_.cache_misses;
+            }
+            const ReplayDump::Entry &entry = lookup(row.key(), /*at_root=*/false);
+            expand(node, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
+                   "golden   ");
+            nn_value = NetworkValue(entry.value);
+
+            // The insert takes the NETWORK's value, before any tablebase
+            // override — see below. This is the line the reference gets wrong.
+            if (cache_.has_value()) {
+                cache_->insert(row.key(), nn_value, entry.moves, entry.priors, entry.count);
+                ++stats_.cache_inserts;
+            }
+        }
+
+        // === Mode 2: the tablebase value override ===
+        //
+        // TREE-LOCAL, AND AFTER THE INSERT. The reference overrides first and
+        // caches the result, with the comment that this saves a re-probe on a
+        // later transposition. It does, and it is unsound: a Syzygy WDL ignores
+        // the fifty-move rule, so it is a function of the position AND the
+        // halfmove clock, while the cache key is a function of the position
+        // alone — deliberately, because the clock is not a token. The stored WDL
+        // is then served to the same position at a clock where the truth is a
+        // draw. cpp/tablebase.hpp has the full argument; the reference's own
+        // instrumentation counts the crossing.
+        //
+        // Here the override touches `backup_value` and nothing else, so it
+        // reaches exactly one node — the leaf that was probed — through exactly
+        // one backup. Nothing another position could read ever sees it, and the
+        // cache entry written above already holds the network's own value. This is
+        // not a discipline that has to be maintained: `probe_tablebase_value`
+        // returns a `TablebaseValue`, `insert` takes a `NetworkValue`, and there
+        // is no conversion, so moving the probe above the insert does not
+        // compile.
+        // `backup_value` is in the MOVER's perspective, which is what
+        // backpropagate consumes; both branches convert from their own absolute
+        // (White-POV) value through the overload named for its kind.
+        double backup_value = mover_value(nn_value, parsed.white_to_move);
+        if (tablebase_ != nullptr && within_tablebase_range(parsed)) {
+            ++stats_.tablebase_probes;
+            const std::optional<TablebaseValue> tb =
+                probe_tablebase_value(*tablebase_, parsed, board_.halfmove_clock());
+            if (tb.has_value()) {
+                ++stats_.tablebase_overrides;
+                backup_value = mover_value(*tb, parsed.white_to_move);
+            }
+            // On a miss the neural value stands, exactly as the reference does
+            // it: a position the loaded tables do not cover is not a position
+            // about which anything has been learned.
+        }
 
         // Repay BEFORE the backup, which is the reference's ordering: backprop
         // always runs with zero in-flight loss on the path it walks.
         repay();
-        backpropagate(node, mover_value(entry.value, parsed.white_to_move));
+        backpropagate(node, backup_value);
         ++stats_.simulations;
     }
 
@@ -1491,6 +1786,16 @@ private:
     ReplayDump dump_;
     SearchBoard board_;
     SearchStats stats_;
+
+    // C7. `std::optional` rather than a pointer or a zero-slot instance: the
+    // three states a reader could imagine — off, on, and "on but useless" — are
+    // reduced to two, because cpp/cache.hpp refuses to construct the third.
+    std::optional<TranspositionCache> cache_;
+    // Reused across leaves so a cache hit performs no allocation once the
+    // vectors have grown to the largest move list seen.
+    CachedEval cache_hit_;
+    // Borrowed. nullptr is tablebases off, which is the shipping default.
+    const TablebaseProber *tablebase_ = nullptr;
 
     std::uint32_t root_ = kNoNode;
     bool root_expanded_ = false;

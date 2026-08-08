@@ -642,6 +642,77 @@ inline void tokenize_into(const ParsedFen &parsed, std::int32_t *out) {
     out[kIdxCls] = kTokenCls;
 }
 
+// ---------------------------------------------------------------------------
+// The inverse: a ParsedFen back to FEN text
+//
+// Moved here from cpp/search.hpp in C7, unchanged. It was written for
+// SearchBoard::diagnostic_fen and it now has two more callers — the tablebase
+// prober interface, which hands a position to a backend that speaks FEN, and
+// C6's terminal promotion probes — none of which should have to include the
+// search to format a position. It belongs beside the parser it inverts.
+//
+// It is written by hand rather than taken from chess-library's `Board::fen()`
+// for two reasons. The prohibited round trip is the obvious one (see
+// cpp/search.hpp's header: `fen()` emits the library's filtered ep square and
+// `setFen` re-filters it, so the pair is lossy on 3,203 of the C1 corpus's
+// 3,610 ep positions). The load-bearing one is that this prints the ep square
+// the SEARCH derived, which is what makes the output re-loadable and what makes
+// it useful when a dump miss has to be explained.
+// ---------------------------------------------------------------------------
+
+inline std::string fen_of(const ParsedFen &parsed, int halfmove, int fullmove) {
+    static const char kSymbols[] = "PNBRQKpnbrqk";
+
+    std::string out;
+    out.reserve(90);
+
+    for (int rank = 7; rank >= 0; --rank) {
+        int empty = 0;
+        for (int file = 0; file < 8; ++file) {
+            const std::int32_t token = parsed.placement.square_token[rank * 8 + file];
+            if (token == kTokenEmpty) {
+                ++empty;
+                continue;
+            }
+            if (empty != 0) {
+                out += static_cast<char>('0' + empty);
+                empty = 0;
+            }
+            out += kSymbols[token - 1];
+        }
+        if (empty != 0) {
+            out += static_cast<char>('0' + empty);
+        }
+        if (rank != 0) {
+            out += '/';
+        }
+    }
+
+    out += parsed.white_to_move ? " w " : " b ";
+
+    const Placement &placement = parsed.placement;
+    std::string castling;
+    if (has_castling_right(parsed.castling, placement, true, true)) castling += 'K';
+    if (has_castling_right(parsed.castling, placement, true, false)) castling += 'Q';
+    if (has_castling_right(parsed.castling, placement, false, true)) castling += 'k';
+    if (has_castling_right(parsed.castling, placement, false, false)) castling += 'q';
+    out += castling.empty() ? "-" : castling;
+
+    out += ' ';
+    if (parsed.ep_square < 0) {
+        out += '-';
+    } else {
+        out += static_cast<char>('a' + (parsed.ep_square & 7));
+        out += static_cast<char>('1' + (parsed.ep_square >> 3));
+    }
+
+    out += ' ';
+    out += std::to_string(halfmove);
+    out += ' ';
+    out += std::to_string(fullmove);
+    return out;
+}
+
 // Write the 68 tokens for `fen` into `out`, which must have room for
 // `kSeqLength` int32s. Throws std::invalid_argument (ValueError in Python) on a
 // FEN python-chess would itself refuse.

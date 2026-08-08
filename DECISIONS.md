@@ -2845,3 +2845,759 @@ to `HEAD`'s blob:
 digest `golden/gate1_manifest.json` records as the reference that produced the
 Gate 1 data. The three reverts were applied and undone in the working tree only;
 none was committed, and each was followed by a digest check.
+
+---
+
+# C7 — Cache and tablebase (2026-08-07)
+
+Four new headers and one new dependency. `cpp/values.hpp` is the value taxonomy
+that makes the poisoning class unrepresentable; `cpp/cache.hpp` is the sharded
+transposition cache; `cpp/tablebase.hpp` is the engine's half of Syzygy and
+`cpp/fathom.hpp` is the native backend. Acceptance is `tests/test_c7_cache.py` —
+242 tests, including the whole Gate 1 corpus re-run with the cache on against a
+Python reference with its cache on.
+
+## The decision the chunk is really about: what a cache key means
+
+Everything below follows from one sentence. **The key is a function of the
+position and of nothing else** — two positions share an `nn_key` exactly when
+they tokenize to the same 68 integers (C3). So anything stored under it must
+also be a function of the tokenization, and the network's output is, by
+definition, because the tokenization is its input.
+
+Three things are not, and all three are in the reference's cache today or one
+line away from it:
+
+* **a terminal value** — repetition and the fifty-move rule are properties of
+  the PATH from the root and of the game before it;
+* **a tablebase WDL** — Syzygy reports the result *assuming the fifty-move rule
+  does not intervene*, so it is a function of the position AND the halfmove
+  clock, and the clock is deliberately not in the key;
+* **a proof** — a solved score is a statement about a subtree, not about the
+  leaf the key identifies.
+
+The two properties the brief asks for pull in opposite directions and both are
+consequences of that sentence. **EP-twins must not collide**: they tokenize
+differently at index 66, so they cannot share an entry — here for free, where
+the reference needs `make_cache_key` to append the raw ep square to a Polyglot
+Zobrist that would otherwise be coarser than the network's own input.
+**Clock-twins must share an entry, and that is correct**: the clock is not a
+token, so the network's output cannot depend on it.
+
+Those two together are why the type discipline is not decoration. Sharing an
+entry across clock-twins is correct *only* for values that ignore the clock. The
+moment a clock-dependent value is admitted, the same sharing that makes the
+cache right makes it wrong. `test_ep_twins_do_not_collide_in_the_cache` and
+`test_clock_twins_share_one_entry_and_that_is_correct` are the two halves of one
+argument, and the second's docstring says so.
+
+## Enforcement: four types, not a convention
+
+**Chosen: four distinct struct types (`NetworkValue`, `TerminalValue`,
+`TablebaseValue`, `ProofValue`) with explicit constructors and no conversion to
+`double` or to each other. `TranspositionCache::insert` takes a `NetworkValue`.**
+
+Alternatives considered:
+
+* *A comment, and code review.* This is what the reference has. Its comment is
+  `# We override BEFORE caching so the WDL value is what gets stored`, which is
+  a correct description of an incorrect decision — the reviewer would have had
+  to know the halfmove-clock argument to object.
+* *A runtime assertion in `insert`.* Cannot work: by the time the value is a
+  `double` there is nothing left to assert on. That is exactly the point.
+* *A tag parameter (`insert(key, value, Provenance::Network)`).* Enforces
+  nothing — the caller passes the tag, and the caller is the one making the
+  mistake.
+
+The cost is nil: each is one double, passed in a register, `static_assert`ed
+trivially copyable and the size of the double. The benefit is that the
+reference's two lines do not compile here.
+
+**Deliberately not default-constructible**, for the reason C3 gives for `NNKey`:
+a zero-initialised value looks valid — 0.0 is "drawn" — so a slot that was never
+written must be distinguishable by its TYPE, not by its contents.
+
+**Acceptance criterion 5** is `guofish::detail::CacheInsertAccepts<V>`, which
+asks the REAL `insert` through real overload resolution, and the eight
+`static_assert`s over it in `cpp/cache.hpp`. It is not a restatement of the
+signature that could drift from it: if somebody adds a `double`-taking overload,
+or gives `TablebaseValue` a conversion, the assert fires. C3 established that
+shelling out to a compiler proves nothing a `static_assert` does not, and has
+the extra defect of only running when someone remembers; these run in every
+build on both toolchains. `cache_type_separation()` reports the same predicates
+as data, because a build that stops gives an acceptance test nothing to point
+at.
+
+`ProofValue` has no producer today. It exists so that whoever adds
+mate-distance or proof-number backup in a later chunk finds the door locked
+rather than discovering it open.
+
+## `EvalRow` — one derivation of the key
+
+The brief flags this under Risks and it is worth restating, because the wrong
+version is indistinguishable from the right one until it is not: if the
+dispatcher tokenizes a position into a batch row while the cache separately
+calls `nn_key(parsed)` on the position it believes that row stands for, the two
+agree today — and the cache is keyed by a tokenization that is not the one the
+network saw the moment anything makes them disagree: a stale `ParsedFen`, an
+off-by-one row offset, a tokenizer change applied to one call site.
+
+`EvalRow` removes the second derivation rather than documenting it. One array;
+the key is computed from that array in the member initialiser list; both are
+handed on together. **A caller cannot ask for the key without holding the bytes
+it came from, because they are the same object.** `nn_key(parsed)` still exists
+for C3's tests and C5's self-audit and is now `EvalRow(parsed).key()`, so the
+process contains exactly one implementation of "what an nn_key is".
+
+`lookup()` takes the key as a parameter instead of recomputing it, which is the
+mechanical half of the same decision.
+
+`test_the_key_is_a_function_of_the_dispatched_token_row` perturbs each of the 68
+tokens in turn and requires the key to move. A key derived from the board
+independently would sit still.
+
+## The root neither reads nor writes the cache
+
+**This is the decision most likely to look like an oversight, so it is stated
+loudly in `expand_root` as well as here.**
+
+`ParallelMCTS._expand_root` does not touch `self.cache` — verified by reading
+it, not assumed. The consequence is load-bearing rather than incidental: the
+reference softmaxes root priors on the GPU (it runs its own forward and hands
+`expand` a CUDA tensor) and interior priors on the CPU, and the two disagree by
+up to ~1.9e-9 on the same position. That is why `golden/gate1_dump.npz` is keyed
+by `(nn_key, is_root)` and not by `nn_key` (DECISIONS C5).
+
+A cache that served the root's entry to an interior visit of the same position
+would hand it the GPU priors where the reference used the CPU ones, and Gate 1
+would fail at whatever depth the root position first recurs — four plies, in a
+middlegame — with no indication of why. Mirroring the reference's omission keeps
+the two tables from ever meeting, and costs nothing: a root is expanded once per
+`set_position`.
+
+`test_the_root_evaluation_never_enters_the_cache` checks that where the root
+position IS cached (because it recurred as an interior node) the payload is the
+interior table's, not the root table's.
+
+## Cache shape: sharded, direct-mapped, spinlock per shard
+
+**Chosen: 64 shards (the brief's floor) with a TTAS spinlock each; within a
+shard a direct-mapped table — one slot per bucket, an insert overwrites.**
+
+Alternatives:
+
+* *The reference's shape (hash map + ring buffer for eviction).* Two data
+  structures, an allocation per insert, and a write to a shared ring pointer on
+  every insert — which under C9 is a contention point the sharding was supposed
+  to remove. Rejected.
+* *Set-associative, N ways per bucket.* Would recover the ~0.02% of hits the
+  direct-mapped table loses to slot collisions (measured; see below). Rejected
+  as buying a rounding error for a comparison loop inside the critical section.
+
+**The replacement policy is free, and that is a measured fact rather than an
+assumption.** With tablebases off a cache miss costs an evaluation and changes
+nothing else, so eviction cannot affect the tree.
+`test_a_small_cache_evicts_without_changing_the_tree` runs the same position at
+128 slots — far below the ~4,500-position working set — asserts that eviction
+actually happened, and requires the tree to be bit-identical to both the
+large-cache run and the reference.
+
+**Shard and slot indices come from one SplitMix64 finalizer over the key**, the
+shard from the top bits and the slot from the bottom. FNV-1a's avalanche is
+weakest in the low bits and this table takes both indices from one word; the
+finalizer is three multiplies on a path that is about to take a lock.
+
+**TTAS over `std::atomic<bool>`, not `std::atomic_flag`.** `atomic_flag` has no
+non-modifying `test()` before C++20, so the read half of test-and-test-and-set
+cannot be written and every waiter's `test_and_set` bounces the cache line.
+
+**`std::unique_ptr<Shard[]>`, not `std::vector<Shard>`.** A `Shard` holds a
+`Spinlock`, a `Spinlock` is neither copyable nor movable (an atomic that could
+be moved out from under a waiter would not be a lock), and `vector::resize`
+requires MoveInsertable even when it will not reallocate.
+
+**A zero-slot cache is not constructible.** "Cache off" and "a cache that can
+hold nothing" must not be one keystroke apart, because the second passes every
+tree-equivalence test in the chunk while doing no work — which is the exact
+failure mode acceptance criterion 6 exists to catch. Off is an empty
+`std::optional` in the search.
+
+**`cache_slots` defaults to 0.** C5 and C6 were certified on the no-cache path,
+and a chunk that silently changed the code under their tests would make a C7
+regression look like a C5 one. `tests/test_c7_cache.py` turns it on explicitly.
+
+**The cache survives `set_position`,** matching the reference (one
+`TranspositionCache` lives on the `ParallelMCTS` instance and outlives every
+`search()` call), which is most of what it is for across moves of a game.
+`clear_cache()` exists so a test can attribute a hit rate to one position.
+
+### The empty-slot sentinel
+
+**Chosen: `std::optional<NNKey>`.** `NNKey` has no default constructor by C3
+design, so a slot cannot hold a "zero key" meaning empty — and should not want
+to: FNV-1a's output covers the whole 64-bit range, so *every* value including 0
+and including the offset basis is a key some payload really hashes to.
+Reserving one would make one position in 2^64 uncacheable and, worse, require
+every reader to remember which. `std::optional`'s disengaged state is distinct
+from every `NNKey` by construction rather than by convention, costs one byte
+plus padding beside a key we were storing anyway, and cannot be forged from a
+key value. A hand-rolled `bool occupied` is the same idea with the extra
+property that the key stays readable while meaningless.
+
+`test_the_empty_slot_sentinel_does_not_rest_on_a_reserved_key` stores and
+retrieves key 0.
+
+### `probe` returns a copy, and is not `const`
+
+The copy is deliberate: under C9 a pointer into a slot is valid only until
+another thread evicts it, which is a use-after-free with a stochastic
+reproduction rate. It is ~150 bytes out of a lock already held, into vectors the
+caller reuses, so a steady-state search allocates nothing.
+
+`probe` is non-`const` because it is not: it writes a hit or a miss into the
+shard's counters, and those counters are an acceptance criterion. Spelling it
+`const` and casting the constness away inside would be a lie to every caller and
+UB on a genuinely const cache. (The first draft did exactly that.)
+
+### `alignas(64)` and MSVC C4324
+
+Cache-line aligning `Shard` is what makes the sharding real — 64 spinlocks in
+512 bytes would false-share into roughly 8 locks. MSVC then warns C4324 that it
+padded the struct from 72 bytes to 128, which is a *correct* warning: silent
+growth is worth saying out loud. Global Rule 4 forbids the pragma.
+
+**Fixed structurally rather than suppressed:** the state is split into a
+`ShardState` base and the padding is declared —
+`char cache_line_padding[64 - (sizeof(ShardState) % 64)]`, with
+`static_assert(sizeof(Shard) % 64 == 0)`. The padding was always there; now it
+is in the source. The `64 - (size % 64)` form is never zero, so the array is
+never zero-length.
+
+## Golden data: a cache-on reference, and the invariance measured
+
+Criterion 2 asks for Gate 1 re-run "with cache ON against a Python reference
+with cache ON". The C5/C6 golden trees were generated at `cache_size=1`, so on
+their face they are not that. The brief's recon says the Python cache is
+result-invariant with tablebases off, which would make them that after all —
+**but that is an argument, and `tools/gen_c7_cache_golden.py` replaces it with a
+measurement.**
+
+It re-runs both Gate 1 corpora — all 106 recorded runs, both virtual-loss
+magnitudes, the per-run `MAX_TREE_DEPTH`, the terminal corpus's move-stack
+histories — through the reference at `cache_size=100_000`, and writes
+`golden/gate1_cache_trees.npz`, `golden/gate1_cache_terminal_trees.npz` and
+`golden/gate1_cache_manifest.json`. It imports the C5/C6 generator rather than
+reimplementing a Gate 1 run; this must not be a second opinion about what such a
+run is.
+
+**Result: the invariance holds exactly.**
+
+* the terminal corpus's cache-on file is **byte-identical** to
+  `golden/gate1_terminal_trees.npz` — same SHA-256,
+  `b45008fd142d0bbca9081360e0b6ebf27c3592ed349251da0f2ed40975da3f40`;
+* the quiet corpus's is bit-identical in every shared array; the file digest
+  differs only because `write_trees` emits C6's `terminal` / `terminal_value`
+  columns, which the C5 file predates and which are all-zero here.
+
+That is now a fact about this corpus and this checkpoint rather than a footnote,
+and `test_the_python_cache_is_result_invariant` fails loudly if a future change
+to the reference breaks it. It also matters *why* it is checked: the invariance
+is what makes tree equality a valid test of a cache-on run, and simultaneously
+what makes tree equality blind to whether the cache works at all.
+
+**No new replay dump.** The cache=1 dumps hold an entry for every position
+either corpus expands — a superset of what a cache-on run evaluates — so a C++
+miss where the reference hit still lands on a dump entry. Writing a cache-on
+dump would have removed exactly that safety margin.
+
+Provenance is unchanged: Python 3.13.7, python-chess 1.11.2, torch 2.8.0+cu129,
+CUDA on an RTX 5070, model `v5_10.9M_best.pt`, `core/mctsv4.py` at
+`c0dae236…e427fac` — the same reference digest `gate1_manifest.json` records.
+
+## Hit rate — acceptance criterion 6
+
+The brief is right that this needs its own criterion: with tablebases off, a C++
+cache with a 0% hit rate produces a bit-identical tree and passes the gate.
+
+**The floor is the reference's own measured rate, not a number picked to be
+cleared.** The generator records per-run hit and miss counts, and the test
+asserts against them:
+
+| corpus | C++ hits / probes | rate | reference | rate |
+|---|---|---|---|---|
+| quiet | 23,215 / 206,352 | 11.250% | 23,248 / 206,352 | 11.266% |
+| terminal | 51,751 / 97,337 | 53.167% | 51,770 / 97,337 | 53.186% |
+| **total** | **74,966 / 303,689** | **24.685%** | **75,018 / 303,689** | **24.702%** |
+
+Two things are asserted separately and the distinction matters:
+
+* **the probe count must match EXACTLY, per run.** Both sides probe once per
+  interior leaf and the trees are identical, so this is a structural fact. It is
+  what would catch a probe in the wrong place — at the root, most likely, which
+  is the mistake `expand_root` exists to avoid.
+* **the hit count is allowed to fall slightly short** (>= 95% of the
+  reference's, per run and overall). It does, by 52 hits in 303,689 probes —
+  0.017% — which is the direct-mapped table losing entries to slot collisions
+  where the reference's hash map keeps them. The gate runs at 2^20 slots against
+  a ~4,500-position working set, so this is the expected birthday-collision
+  count and not a defect.
+
+The terminal corpus's 53% is not a surprise: it is full of forced mates and
+shuffle lines, which transpose heavily.
+
+## Entry contents — acceptance criterion 7, and the mutation drill
+
+Every entry the search inserted is read back by key and compared against the
+golden dump payload it was built from: moves as integers, priors and value on
+their **bit patterns**. Nothing infers correctness from the tree, because the
+tree cannot see any of it.
+
+The move list is stored and compared rather than trusting positional alignment,
+per the brief, and it earns its place twice. From the dump, a mismatch means
+movegen disagrees with python-chess. From the cache, it means two positions that
+are not the same position were given the same key — a collision, or a key
+derived from something other than the tokens. `expand()` therefore performs the
+same check on the cache-hit path as on the dump path, with the source named in
+the message.
+
+**Mutation drill (Amendment B), run as a test rather than by hand.**
+`test_the_entry_contents_assertion_is_live` corrupts an in-memory copy of the
+expectation three ways and requires the comparison to name each:
+
+| mutation | what the report said |
+|---|---|
+| a gathered prior, **one ulp** | `prior[0] for <move> cached 0x… (…) != dump 0x… (…)` |
+| a move-list entry, +16 (same file, two ranks up) | `move[0] cached <uci> != dump <uci>` |
+| a value, +1e-15 | `value cached … != dump …` |
+| nothing | quiet — otherwise the three above prove only that it always complains |
+
+The one-ulp case is the one a tolerance-based comparison would let through, and
+one ulp is enough to flip a PUCT tie. The move case is the one positional
+alignment would absorb: the priors still line up, they just belong to a
+different move.
+
+Doing it in memory is **stricter than Amendment B requires**, not looser:
+`golden/` is not merely un-written but never opened for writing, and the drill
+runs on every CI pass instead of living in a commit message. The file-level
+drill was also performed against scratch copies; digests below.
+
+## Syzygy tablebases
+
+### Fathom, authorised and pinned
+
+Global Rule 7's allowed set was pybind11 + chess-library + the standard library,
+and the brief's "via Fathom" did not by itself satisfy "ask first". **Explicit
+authorisation was given during the chunk** — "You are explicitly granted
+permission to integrate Fathom (and accordingly update CMake) to enable native
+tablebasing in the production build" — so `cpp/fathom.hpp` is the production
+backend and tablebases are no longer conditional on a later chunk. The brief's
+non-blocking clause ("ship with TB off and land it separately") was therefore
+not invoked.
+
+Pinned to `c9c6fef0dddc05d2e242c183acf5833149ab676d`, exposed as
+`guofish_core.FATHOM_PIN`. The pin matters more here than for the other two: a
+tablebase probe is a lookup whose **answer** is what is under test, so a
+floating revision could change the WDL a position reports with nothing in this
+repository changing, and the symptom would be an engine playing a different
+endgame move rather than a build error.
+
+### Five places Fathom and python-chess do not speak the same language
+
+Each is handled in `cpp/fathom.hpp` with an argument and then **measured**
+against the reference over the real 5-man set in `assets/syzygy`.
+
+1. **The WDL scale.** Fathom returns `TB_LOSS=0 … TB_WIN=4`; Syzygy's own scale,
+   which python-chess returns and which `wdl_to_value` halves, is `-2..+2`. The
+   conversion is `syzygy = fathom - 2`, and getting it wrong maps a draw to a
+   cursed win rather than crashing.
+2. **`tb_probe_wdl` refuses a non-zero halfmove clock** — its public wrapper is
+   literally `if (_rule50 != 0) return TB_RESULT_FAILED;`. python-chess's
+   `probe_wdl` has no such guard, and the reference's mode 2 probes leaves at
+   whatever clock they carry, so a backend passing the real clock through would
+   miss on almost every leaf and **mode 2 would silently never fire**. This
+   passes `rule50 = 0` deliberately, which makes the public wrapper reproduce
+   python-chess's clock-independent probe exactly.
+
+   *This is not the poisoning defect reappearing*, and the distinction is worth
+   being precise about because the two look alike: a raw WDL being
+   clock-independent is the same fact in both places. Here it is the correct
+   input to a probe whose output is then applied tree-locally and typed
+   `TablebaseValue`; there it was the reason the output must not be stored under
+   a clock-independent key. The clock is *why* it must not be cached; it is not
+   an input to the probe on either side of the comparison.
+3. **Castling rights are a miss, not an error.** Fathom returns
+   `TB_RESULT_FAILED`, python-chess raises, the reference catches and keeps the
+   neural value. Checked before the call so both become `nullopt`.
+4. **DTZ sign.** `TB_GET_DTZ` is a magnitude; `probe_dtz` is signed. Mode 1's
+   ranking subtracts DTZ, so an unsigned value would make a losing side prefer
+   the fastest loss. The sign is restored from the WDL.
+5. **DTZ comes from a different entry point.** Fathom has no bare `probe_dtz`;
+   DTZ arrives inside `tb_probe_root`, which also generates moves and is
+   documented **not thread safe**. Acceptable because mode 1 is a root bypass
+   called once per move, and mode 2 — the one on the search path — needs WDL
+   alone, and `tb_probe_wdl` *is* thread safe. C9 must keep it that way.
+
+### The measurement
+
+`test_fathom_and_python_chess_agree_about_wdl` and
+`…_about_dtz_except_on_checkmate` sweep random legal <= 5-man positions,
+including positions reached by a double pawn push so a raw en-passant square is
+present. Beyond the suite, a one-off 20,000-position sweep was run during
+development:
+
+* **WDL: 20,000 non-terminal positions, 0 mismatches.** Also 0 over a separate
+  6,000-position sweep that included checkmates and stalemates, and 0 over the
+  en-passant subset.
+* **DTZ: 20,000 non-terminal positions, 0 mismatches.**
+* **DTZ on checkmate: 5 mismatches in 6,000, all the same shape** —
+  python-chess answers `-1` (a loss, zero plies away); Fathom's `tb_probe_root`
+  returns `TB_RESULT_CHECKMATE`, whose DTZ field is 0. Every one of the five was
+  confirmed to be checkmate.
+
+That divergence is **unreachable from mode 1**, which tests `is_checkmate()`
+before probing and never asks. It is pinned by a named test anyway
+(`assert fathom.probe_dtz(mate) == 0`), because "unreachable" is a claim about a
+caller and callers change; if a Fathom re-pin alters it, a test fails rather
+than an endgame.
+
+### One open tablebase per process
+
+`tb_init`/`tb_free` operate on file-scope state; there is no handle. Two
+`FathomProber`s would share one set of tables and the second's destructor would
+free the first's. The constructor refuses the second and says why, rather than
+documenting it and hoping. It also refuses a directory that opens but contains
+no tables (`TB_LARGEST == 0`), because that produces a prober which reports
+itself open and misses on everything — the "tablebases are on but never fire"
+state that is hardest to notice.
+
+The test suite cooperates via a session-scoped fixture. This is a property of
+the library, not a design choice.
+
+### The Python defect this port does not carry over
+
+`core/mctsv4.py`, `MCTSWorker._run_simulation`:
+
+```python
+if self.tablebase is not None and count_pieces(board) <= TABLEBASE_MAX_PIECES:
+    tb_value = probe_tablebase_value(self.tablebase, board)
+    if tb_value is not None:
+        nn_value = tb_value                          # the override
+        _was_tb = True
+if policy is not None:
+    self.cache.put(cache_key, policy, nn_value)      # the poisoning
+```
+
+with the comment "We override BEFORE caching so the WDL value is what gets
+stored — subsequent transpositions to this position reuse it without
+re-probing". The optimisation is real and it is unsound: `make_cache_key` is
+`(Zobrist, ep_square)`, a function of the position, while the WDL is a function
+of the position and the clock. **A KQvK win stored at clock 3 is served back at
+clock 99, where the truth is a draw.** The reference's own instrumentation
+counts exactly this — `cache_hit_tb_hmc_crossing` exists to measure hits where
+the stored and asked-about clocks straddle 100.
+
+**This port applies the override AFTER the insert, to the value being backed up
+and to nothing else.** It reaches one node, through one backup; nothing another
+position can read ever sees it. And it is not a discipline that must be
+maintained: `probe_tablebase_value` returns a `TablebaseValue`, `insert` takes a
+`NetworkValue`, there is no conversion, so **moving the probe above the insert
+does not compile**.
+
+Three tests carry this:
+
+* `test_a_tablebase_value_never_enters_the_cache` — a stub evaluator whose
+  values are confined to (-0.09, 0.09) and offset off the 1e-4 grid, so no stub
+  value can equal any value `wdl_to_value` produces. A cache entry holding
+  +-1.0, +-0.5 or 0.0 could then only have come from a probe. (The first version
+  of that generator produced values on a 1e-3 grid spanning +-0.9; the test
+  failed for the right reason with the wrong cause, and the invariant is now
+  asserted inside the generator.)
+* `test_a_tablebase_never_changes_what_a_cached_entry_says` — over every key
+  both a tablebase-on and a tablebase-off run cached, the value, moves and
+  priors are identical bit for bit.
+* `test_the_reference_would_have_poisoned_this_cache` — the mechanism on the
+  reference itself: clock-twins share a key, and `chess.syzygy` returns the same
+  WDL for both.
+
+**A false statement worth recording, because believing it would have been a bug
+in the test rather than the engine:** the first draft asserted that attaching a
+tablebase cannot change the cache *at all*. It can, and must — the override
+changes the value backed up, which changes PUCT, which changes which leaves are
+reached, which changes which positions get cached. The two runs legitimately
+cache different *sets*. What cannot change is what an entry *says*.
+
+### Mode 1 — one known divergence, in tie-breaking only
+
+`playing/uci_wrapper.py::_probe_tablebase` iterates `board.legal_moves` —
+python-chess's generation order — and keeps the first move achieving the maximum
+`(outcome, -distance)`. `tablebase_root_move` iterates canonical
+`(from, to, promotion)` order and does the same. Where two moves have an
+identical key the two can therefore pick differently.
+
+Both are tablebase-optimal by construction, so the game-theoretic result is
+unchanged. Canonical order is chosen because it is the order this port uses
+everywhere else and is reproducible from the move alone.
+`test_mode_one_agrees_with_the_reference_bypass` makes the distinction rather
+than papering over it: on a disagreement it re-scores the C++ move with the
+*reference's own rule* and requires the keys to be equal — so a genuine
+regression (one move actually worse) still fails.
+
+**A missing table abandons the whole bypass** rather than ranking the remaining
+moves, which is the reference's behaviour (one `try` around the whole loop) and
+the conservative reading: a partial ranking can prefer a move only because its
+sibling could not be scored.
+
+### Mode 1/2 are exercised with no golden data, deliberately
+
+There is none and there should be none. The reference's tablebase behaviour
+*contains* the defect this chunk removes, so golden trees generated with
+tablebases on would bake it into the acceptance criteria — Global Rule 10's
+failure mode, arrived at from the other direction.
+`test_the_reference_ran_with_its_cache_on` asserts `tablebase is False` in the
+manifest for exactly this reason.
+
+The stub evaluator in `_stub_dump` is **not golden data and is not compared
+against anything**; it is a stand-in evaluator so the mode 2 code path can be
+reached at all, since Gate 1's corpus is middlegames where the piece-count gate
+means mode 2 can never fire. Its docstring says so.
+
+## Build changes
+
+**Warning flags moved from `add_compile_options` to
+`target_compile_options(guofish_core …)`.** Fathom is third-party C that we
+*compile* rather than merely include, so a directory-wide `/W4` would put its
+warnings in our build with only two ways out, both forbidden by Global Rule 4.
+Scoping the strictness to our own target leaves our translation units exactly as
+strict and creates no suppression anywhere. It is the C0 SYSTEM-include
+reasoning applied to a target instead of an include path.
+
+**`/experimental:c11atomics` on the fathom target (MSVC only).** MSVC ships
+`<stdatomic.h>` and refuses to compile it without the switch. It is a
+conformance switch, not an opt-in to unfinished behaviour — the name is
+historical; C11 atomics have been supported since VS 2022 17.5. The alternative,
+Fathom's `TB_NO_THREADS`, compiles everywhere with no flag and is the wrong
+trade: it removes the synchronisation that makes `tb_probe_wdl` safe to call
+from several search threads, which is what C9 will do. Clang and GCC need
+nothing.
+
+**`NOMINMAX` and `_CRT_DECLARE_NONSTDC_NAMES=0` on the fathom target.** Fathom
+defines its own `min`/`max` after including `<stdlib.h>` and `<windows.h>`, both
+of which define them on MSVC — two C4005 warnings at the *default* level, so
+they fire at any warning level, and not spurious: Fathom's
+`#define max(a,b) a > b ? a : b` has no parentheses, so which definition wins
+genuinely matters. Both are turned off **at the point of conflict** rather than
+by silencing the report. `_CRT_DECLARE_NONSTDC_NAMES=0` also withdraws `open`,
+`close` and `strdup`; Fathom uses `open`/`close` only inside its
+`#ifndef _WIN32` branch, which this build does not compile. Checked, not
+assumed.
+
+**`project(… LANGUAGES CXX C)`** — Fathom is one C translation unit
+(`tbprobe.c` `#include`s `tbchess.c`, as its own Makefile does). Built as a
+static library with `POSITION_INDEPENDENT_CODE ON`, because it is linked into a
+shared module.
+
+## Refactors, none behavioural
+
+* **`fen_of` moved from `cpp/search.hpp` to `cpp/tokens.hpp`**, unchanged,
+  beside the parser it inverts. The tablebase prober needs to format a position
+  and should not have to include the search.
+* **`generate_canonical_moves` extracted** to a free function; the mode 1 root
+  probe needs the same canonical ordering, and PUCT resolves ties by child
+  order, so two orderings that agree "almost always" are the divergence class
+  Gate 1 exists to prevent.
+* **`expand()` takes `(moves, priors, count)` instead of a `ReplayDump::Entry`**,
+  because the payload now arrives from two places and both must pass the
+  move-list check.
+* **The mismatch message keeps its exact layout.** The first attempt replaced
+  the `golden   :` column heading with the source name and broke
+  `tests/test_c5_gate1_quiet.py::test_a_corrupted_dump_move_list_is_caught_rather_than_misaligned`,
+  which pins the literals. Global Rule 1 says the test wins; the label is now a
+  padded parameter (`golden   ` / `cache    `) so the two lists still line up
+  under `C++      `. Caught by the suite, which is the system working.
+
+## Mutation drill (Amendment B) — file level
+
+The in-memory drill above is the acceptance-grade one. The file-level drill was
+run in addition, against corrupted **copies in a scratch directory**, driven by
+`GUOFISH_GOLDEN_C7_TREES` and `GUOFISH_GOLDEN_GATE1_DUMP`. `golden/` was never
+opened for writing; digests are recorded below and were verified identical
+before and after.
+
+| mutation (scratch copy) | what failed, and how |
+|---|---|
+| `gate1_cache_trees.npz`: one `visits` entry +1 | `test_gate1_with_the_cache_on_is_bit_exact[quiet-pos00-vl0.0-n5000-visited]` — `first divergence at DFS index 1320 of 5000 nodes`, `path from root : g2f1 f8h8 a1c1 a8c8`, `visit_count : golden 9  c++ 8  <-- DIFFERS`, plus the cache-counter line |
+| `gate1_cache_trees.npz`: one `value_sum` at one ulp | same test and node, `value_sum : golden 0xc003680000000001 (-2.4257812500000004)  c++ 0xc003680000000000 (-2.42578125)  <-- DIFFERS` |
+| `gate1_dump.npz`: one interior `moves` entry altered | `RuntimeError: guofish: legal-move mismatch against the replay dump`, printing the FEN, the path, and both move lists (`a5a1` where the dump says `a5b1`) |
+| `gate1_dump.npz`: one ROOT `prior` at one ulp | the gate fails on the `prior` column |
+| `gate1_dump.npz`: one ROOT `prior` at +0.01 | `RuntimeError: guofish: replay dump miss (interior table)` — the search explores far enough off the recorded region to leave it, naming the key, the FEN and the path |
+| `gate1_dump.npz`: one INTERIOR `prior` at one ulp | **the visited-only runs do not catch it; the full-tree runs catch it every time.** See below. |
+
+**The last row is the one worth reading, and the first draft of this entry got it
+wrong.** It claimed a corrupted interior prior "propagates into visit counts, so
+it fails as a tree divergence". Run, it did not: the drill passed all 106 gate
+cases. Investigating rather than adjusting the claim gave the actual rule, which
+is more useful:
+
+* a 5,000-simulation run is recorded at `min_visits=1`, so a child with zero
+  visits is not in the tree at all. A one-ulp change to its prior is therefore
+  invisible unless it flips a PUCT comparison, and at one ulp it usually does
+  not — measured over 12 distinct used interior entries, **0 of 12** were caught
+  by the visited-only view;
+* the **full-tree control runs** (`min_visits=0`, 4 positions x 2 magnitudes at
+  800 sims) record every node including unvisited children, and caught **12 of
+  12**.
+
+That is exactly the hole C5 added those runs to close — its entry says "without
+these the whole-tree path would be argued rather than measured" — and this is
+the first time anything has measured that they do close it. The corollary for
+future chunks: **a golden dump's priors are only pinned by the full-tree runs**,
+so a change that drops or shrinks them silently weakens the whole gate.
+
+The dump-corrupting rows feed both the C++ side and the test's expectation, so
+they are the weaker form of drill — which is precisely why the in-memory drill
+(corrupting only the expectation) exists and is the one the brief's validation
+clause is satisfied by.
+
+`golden/` was verified byte-identical before and after the whole drill.
+
+## Not done
+
+* **No set-associative cache.** The direct-mapped table loses 0.017% of hits to
+  slot collisions at the gate's sizing. Recovering that would add a comparison
+  loop inside the critical section for a rounding error.
+* **No cache prefetch, and no packing of the payload into one allocation.** The
+  slot holds two `std::vector`s, reused across inserts, so a steady-state search
+  does not allocate; a single-buffer layout would save a pointer chase on a path
+  that has just taken a lock and is about to touch ~150 bytes anyway. Revisit if
+  C9's profile says otherwise.
+* **The cache is not shared between search instances.** C9's threads will share
+  one `ReplaySearch`; several *engines* sharing a cache is a C10+ question.
+* **`FathomProber::probe_dtz` is not thread safe** and is not made so.
+  `tb_probe_root` is not, by design. Mode 1 is a root bypass; nothing on the
+  search path calls it. C9 must not change that without revisiting this line.
+* **Mode 1 is not wired into a UCI layer.** There is no UCI layer in the port
+  yet; `tablebase_root_move` is the function that layer will call.
+
+## A skip that hid 242 tests
+
+Worth its own heading because the suite reported green throughout and the
+defect was in what "green" covered.
+
+`tests/test_c7_cache.py` needs `python-chess` for its tablebase section, as an
+oracle — something that already knows what the tables say, so "Fathom agrees
+with the reference" is a comparison rather than a restatement. The first version
+obtained it with a module-scope `pytest.importorskip("chess")`.
+
+**`importorskip` at module scope skips the whole module.** The Linux venv had no
+`python-chess`, so on Linux the entire file was skipped — including the ~200
+cache tests that import neither `chess` nor `torch` and that ARE this chunk's
+acceptance criteria. Windows reported `1068 passed`, Linux reported
+`821 passed, 50 skipped`, and the second number is what a passing Rule 3 run
+looked like.
+
+It was caught by comparing the two totals rather than by any assertion, which is
+the uncomfortable part: nothing in the suite would have said so.
+
+Fixed two ways, both needed:
+
+* the import is now a guarded `try/except ImportError` and only the tablebase
+  tests carry `@tablebase_required`, so a machine without python-chess loses 14
+  tests instead of 242, and the skip reason says which;
+* `python-chess 1.11.2` was installed in the Linux venv, so the tablebase
+  section actually runs on both platforms rather than being permanently skipped
+  on one.
+
+The general lesson for later chunks: **`pytest.importorskip` is only safe at
+module scope in a file where EVERY test needs the import.** In a mixed file it is
+a mask over the acceptance criteria.
+
+## Rule compliance
+
+**Rule 1 — no existing test file was modified.** `tests/test_c7_cache.py` is
+new; `git status` over `tests/` shows one untracked file and nothing else. The
+one place C7 pressed against an existing test —
+`test_a_corrupted_dump_move_list_is_caught_rather_than_misaligned`, which pins
+the literal column headings in the move-mismatch message — was resolved by
+changing the C++ to keep the format, not the test. See "Refactors".
+
+**Rule 2 — golden data from the Python reference only.**
+`tools/gen_c7_cache_golden.py` runs `core/mctsv4.py`; it imports the C5/C6
+generator and never imports `guofish_core`. The three new files under `golden/`
+were written by it. No existing golden file was modified — verified by digest
+before and after the mutation drill.
+
+**Rule 3 — the full suite passes on all four builds.**
+
+| build | result |
+|---|---|
+| Windows / MSVC Release | 1068 passed, 48 skipped (106 s) |
+| Windows / MSVC ASan (`asan: True`, `asserts: True`) | 1068 passed, 48 skipped (841 s), zero ASan errors |
+| Linux / clang Release | 1063 passed, 49 skipped (34 s) |
+| Linux / clang ASan+UBSan | 1063 passed, 49 skipped (219 s), zero UBSan runtime errors, zero memory errors, no leaked allocation whose stack mentions `guofish_core` |
+
+All four were re-run against the final sources after the last C++ change. The
+Windows/Linux gap is the five Windows-only C0b gate assertions plus the module
+skip that replaces them, exactly as C6 recorded.
+
+**One flaky failure seen during the chunk, and it is not this chunk's.**
+`test_c0b_contention.py::test_the_dispatch_gap_is_never_less_adversarial` failed
+once on an intermediate Linux Release run (1062 passed). Re-run three times in
+isolation on the same build it gave pass / fail / pass, and it passed on every
+final run. It is a wall-clock scheduling assertion under WSL2, of exactly the
+class C0b's own entry documents ("`max` grows with sample count … the WSL2
+failure and its pass are the same underlying distribution"), and C7 changed no
+code it exercises — the only build change touching it is which target carries
+the warning flags, which emits identical code. Recorded rather than quietly
+re-run until green.
+
+**Rule 4 — warning-clean, no suppressions.** `/W4` and `-Wall -Wextra` now apply
+to `guofish_core` specifically rather than to the whole directory, so our
+strictness is unchanged and Fathom's warnings are not ours to suppress. Both are
+zero anyway: the one MSVC warning C7 introduced in our code (C4324) was fixed
+structurally, and Fathom's two (C4005) were fixed at the point of conflict with
+`NOMINMAX` / `_CRT_DECLARE_NONSTDC_NAMES=0`. No `-Wno-*`, no pragma, anywhere.
+
+**Rule 5 — ASan on both platforms, asserts live.** `build_info()` reports
+`asan: True, asserts: True` on the Windows sanitizer build; Linux adds UBSan and
+LSan.
+
+**Rule 6 — no `#pragma pack`, no new `reinterpret_cast`.** `cpp/cache.hpp`'s
+alignment is `alignas` plus declared padding; nothing in this chunk type-puns.
+
+**Rule 7 — one new dependency, explicitly authorised.** Fathom, pinned. See the
+Syzygy section.
+
+**Rule 8 — both toolchains.** MSVC 19.51 and clang 18.1.3, Release and
+sanitized, all four green. Fathom needed one platform branch
+(`/experimental:c11atomics`) and clang needed nothing.
+
+**Rule 9 — this entry.**
+
+**Rule 10 — reported plainly.** Two things in this entry are corrections to
+claims an earlier draft made and testing disproved: the interior-prior mutation
+drill (documented as caught by the gate; it is not, except by the full-tree
+runs) and "attaching a tablebase cannot change the cache at all" (it can, and
+must). Both were rewritten to say what actually happens rather than adjusted to
+fit.
+
+**`golden/` digests, verified after the drill:**
+
+```
+202a92dba58ced156ec5d8d24c773e3cecb861eee58944763d09c568abaf8f1a  gate1_cache_manifest.json
+b45008fd142d0bbca9081360e0b6ebf27c3592ed349251da0f2ed40975da3f40  gate1_cache_terminal_trees.npz
+3524dc56e1746dc401b86ca8ca399f4f450271560247ec822a157f8a4ea4c4e3  gate1_cache_trees.npz
+b0332e8f0adfd7b4f9112210342e004610d7d6215920fe5e9eb7cf609426256e  gate1_dump.npz
+e0b9c342555a1e280ab80efbb339467aaf88a8e9051fef01e23f28caf3ac6748  gate1_manifest.json
+8e2e1d34e7752e7116730017d8ee5a38c11f2fd39a08f85d397dc3c14532b9ac  gate1_terminal_dump.npz
+c08d8eb173bd2008c8a0c78b54b18575d870ec55c59ab6463514c049a6809f48  gate1_terminal_manifest.json
+b45008fd142d0bbca9081360e0b6ebf27c3592ed349251da0f2ed40975da3f40  gate1_terminal_trees.npz
+aec5135e0a82f0f5baa1ef4cf39a5372090946bc40b940c83fe255371e357440  gate1_trees.npz
+a901750f28aa37490ac96c2d1a321e80ad50a175f1eaa5010820b519642ca504  keys.jsonl
+b0a91bc7e4e1a0f598a2577ad8b331bd6d9e46dac610d51e46f267e55c3e96fc  keys_adversarial.jsonl
+1754e3aab46825f6c0289a9a7b26dd0ca6ead4a58bc0d287a886e1b0de6151a2  movegen.jsonl
+ea9bf8dfe40196460b6c2d4a0c47217d64998193eb1b4a9f7bb2697b413ce562  tokens.npz
+```
+
+`gate1_cache_terminal_trees.npz` and `gate1_terminal_trees.npz` sharing a digest
+is not a copy — it is the invariance result: the reference produced a
+byte-identical file with its cache on.
