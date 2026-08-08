@@ -122,8 +122,34 @@ class ChessTransformerV2(nn.Module):
 
 # --- Loading utilities ---
 
+def _kwargs_from_state_dict(state_dict: dict) -> dict:
+    """Infer the constructor args for V1/V2 from the checkpoint's own weights.
+
+    Everything but `nhead` is recoverable. Attention packs Q/K/V into a single
+    (3*d_model, d_model) in_proj_weight regardless of the head count, so the
+    split leaves no trace in the weights; fall back to the 64-dim-per-head
+    convention every GuoFish generation has used (d_model=512 -> 8 heads).
+    """
+    d_model = state_dict["pos_encoder"].shape[2]
+    return dict(
+        vocab_size=state_dict["embedding.weight"].shape[0],
+        d_model=d_model,
+        nhead=max(1, d_model // 64),
+        num_layers=1 + max(int(k.split(".")[2]) for k in state_dict
+                           if k.startswith("transformer.layers.")),
+        head_dim=state_dict["from_proj.weight"].shape[0],
+    )
+
+
 def load_model(checkpoint_path: Path, device: torch.device) -> nn.Module:
-    """Load model from checkpoint, auto-detecting architecture version."""
+    """Load model from checkpoint, auto-detecting architecture version.
+
+    This loader covers the v1/v2 generations only -- guofish0 .. guofish4, the
+    ones core.mctsv2 can drive. It has no ChessTransformerV5 to build, so a v5
+    checkpoint is refused here by name rather than left to fail as a wall of
+    missing-key errors; playing/v5/playv5.py is the loader that takes both
+    generations interchangeably.
+    """
     print(f"Loading {checkpoint_path} on {device}")
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -135,6 +161,14 @@ def load_model(checkpoint_path: Path, device: torch.device) -> nn.Module:
             print(f"Model accuracy: {ckpt['val_acc']:.1f}%")
     else:
         state_dict = ckpt
+
+    # A final LayerNorm exists only in v5 (see training/v5_multiPV/model_v5.py);
+    # its FFN activation and final norm are unrepresentable in the classes here.
+    if any(k.startswith("final_norm.") for k in state_dict):
+        raise ValueError(
+            f"{checkpoint_path.name} is a v5 checkpoint (it carries final_norm.*), "
+            "which this loader cannot build. Use playing/v5/playv5.py, which "
+            "dispatches on the checkpoint's own metadata and loads both generations.")
 
     # Auto-detect architecture from pos_encoder shape
     pos_encoder_shape = state_dict["pos_encoder"].shape
@@ -149,12 +183,18 @@ def load_model(checkpoint_path: Path, device: torch.device) -> nn.Module:
     else:
         raise ValueError(f"Unknown architecture: pos_encoder has {seq_length} positions")
 
+    # Width, depth and head_dim come off the weights rather than the class
+    # defaults: every guofish0..4 checkpoint happens to be 512x8, so a default-
+    # constructed model loads them, but a narrower or shallower one would fail
+    # on a shape mismatch that the checkpoint plainly describes.
+    kwargs = _kwargs_from_state_dict(state_dict)
+
     # Convert FP16 weights back to FP32 for CPU, keep FP16 for CUDA
     if device.type == "cuda":
-        model = ModelClass().half().to(device)
+        model = ModelClass(**kwargs).half().to(device)
         state_dict = {k: v.half() if v.is_floating_point() else v for k, v in state_dict.items()}
     else:
-        model = ModelClass().to(device)
+        model = ModelClass(**kwargs).to(device)
         state_dict = {k: v.float() if v.is_floating_point() else v for k, v in state_dict.items()}
 
     model.load_state_dict(state_dict)
