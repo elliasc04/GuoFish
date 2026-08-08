@@ -6,7 +6,8 @@ Machine for all numbers below: **Intel Core i5-12600K** (10 cores / 16 threads),
 Windows 11 Pro 26200. Linux figures are from WSL2 Ubuntu 24.04 on the same host.
 
 Reproduce with `python tools/bench_c0.py`, `python tools/bench_c0b.py`,
-`python tools/bench_c2.py` and `python tools/bench_c4.py` (see `README_BUILD.md`).
+`python tools/bench_c2.py`, `python tools/bench_c4.py` and `python tools/bench_c8.py`
+(see `README_BUILD.md`).
 
 ---
 
@@ -694,3 +695,108 @@ additions:
 * `set_position` is passed each position's recorded repetition history, as the
   test suite does. Building it is outside the timed region; consulting it is
   inside, and it is one `unordered_map` lookup per descent step.
+
+---
+
+## C8 — Tree reuse: arena high-water, and what a compaction costs
+
+Two questions. The acceptance criterion asks only the first.
+
+Reproduce with `python tools/bench_c8.py` against a **Release** build.
+
+### Windows / MSVC 19.51, Release, Python 3.13.7 (i5-12600K)
+
+Arena capacity 524,288 nodes **per arena**, ping-pong pair, cache on (2^20
+slots). "apply" is one `apply_move`: the compacting copy, the structural diff,
+the swap and the repetition-history rebuild.
+
+| game | plies | sims/move | peak nodes | nodes/sim | kept % | reuse x | apply p50 | apply max | p50 no diff | max no diff |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| gate1-20 | 20 | 5000 | 189,236 | 37.8 | 76.5 | 3.71 | 12.700 | 20.202 | 4.587 | 10.380 |
+| quiet-80 | 80 | 2000 | 71,845 | 35.9 | 69.7 | 3.38 | 2.879 | 6.821 | 1.068 | 4.221 |
+| quiet-vl | 40 | 2000 | 89,353 | 44.7 | 69.4 | 3.17 | 5.352 | 12.060 | 1.800 | 6.188 |
+| threefold-walk | 30 | 2000 | 34,857 | 17.4 | 50.9 | 1.98 | 0.875 | 4.442 | 0.420 | 4.599 |
+| fifty-walk | 20 | 2000 | 23,022 | 11.5 | 11.9 | 1.26 | 0.207 | 4.507 | 0.183 | 5.066 |
+
+`nodes/sim` divides the peak by the **move budget**, not by the simulations
+actually delivered. With reuse most of a move's budget is already in the tree —
+the `reuse x` column is scope §3's tree-reuse factor, and at 3.2–3.7x it is
+above the 2.3–2.9x Python measured — so dividing by the ~600 new simulations
+would report a rate three times too high for a tree of the same size.
+
+`kept %` is the fraction of the arena the compaction copies. It is a property of
+the position, not of the code: at ply 0 of `gate1-20` the best move already holds
+97% of the tree, while in `fifty-walk` almost every simulation ends in a
+fifty-move draw at ply one or two, so 88% of the arena is discarded every move.
+
+### Criterion 3: the arena high-water over an 80-ply game
+
+**71,845 nodes — 3.6% of the 2M budget floor.** The reserved footprint is
+**39.0 MiB** for the ping-pong pair at capacity 524,288, and the standby arena is
+allocated lazily, so a search that never applies a move reserves half of that.
+
+`arena_high_water` is the peak of **either** arena. That matters: during a
+compaction the source subtree and its copy are alive at the same instant, so the
+moment of greatest occupancy is the moment the two overlap, and a counter that
+tracked only the active arena would miss its own worst case.
+
+The peak equals the largest single post-search tree in every game, which is the
+shape the ping-pong is supposed to produce: the arena does not accumulate across
+plies. `test_apply_move_actually_frees_the_dead_branches` asserts the same thing
+from the other direction — over 80 plies the arena's occupancy is not monotone.
+
+**MEASURED at 2,000 and 5,000 simulations per move. DERIVED at 15,000.** The
+worst rate in the corpus is 44.7 peak nodes per simulation of move budget
+(`quiet-vl`); at 15,000 sims/move that implies **~670,000 peak nodes**, inside
+scope §2.3's 2–3M budget with 3x margin. That figure is an extrapolation and is
+not asserted anywhere — the reference corpus this replays was generated at 2,000
+and 5,000 sims because 15,000 x 80 plies is most of a day of Python. Scope
+§2.3's own budget was derived the same way (~40 nodes/sim x 15k sims), and the
+measured 35.9–44.7 nodes/sim brackets that 40 rather than contradicting it.
+
+The one thing an extrapolation cannot see is whether the reuse factor holds at a
+larger budget. It should get *better*, not worse — a bigger search concentrates
+more of its visits under the eventual best move — but that is an argument, and
+Phase 5 runs at the real budget and can replace it with a number.
+
+### What the ping-pong costs, and where scope §2.3's estimate lands
+
+Scope §2.3 prices the compaction at "~19 MB memcpy with pointer fixup at 600k
+nodes — a few ms". **Measured, at 184,272 nodes copied (the largest compaction
+in the corpus, `gate1-20`): 4.6 ms p50 for the copy alone, 12.7 ms with the
+structural diff.**
+
+Scaled linearly to the 600k nodes the estimate was written for, that is ~15 ms
+for the copy and ~41 ms with the diff — so **the "few ms" estimate is optimistic
+by roughly 3–5x**. It does not change the conclusion it was supporting: at
+15,000 sims a move takes on the order of a second, and 15–41 ms is 1.5–4% of it,
+paid once per move. But the estimate should not be quoted as measured, and the
+number to plan Phase 5 around is this one.
+
+**The structural diff costs more than the copy it checks** — +8.1 ms against
+4.6 ms at 184k nodes. That is not surprising: the copy is nine sequential
+streams into fresh memory, while the diff walks two arenas in DFS order
+comparing ten fields per node, plus a visited bitmap. It is enabled here in
+every acceptance run (`SearchConfig.verify_compaction`) and unconditionally in
+any build with asserts. Whether to keep it on in production is a real choice and
+this is the number to make it with; scope §7 lists it as the mitigation for the
+fixup-bug risk, so the default for the shipped engine should be "on until Phase
+5 says the move budget cannot afford it".
+
+The `max` columns are dominated by the first compaction of each game, which pays
+for the lazy allocation of the standby arena (~20 MB of value-initialised
+storage at this capacity). `fifty-walk` shows it most clearly: p50 0.2 ms,
+max 4.5 ms, on a game whose largest compaction is 2,600 nodes.
+
+### Measurement notes
+
+* Every row is one replay of the C8 corpus against `golden/c8_reuse_dump.npz`,
+  i.e. the same deterministic work the acceptance suite does. The "no diff"
+  columns are a second replay of the identical game with
+  `verify_compaction=False`, so the diff's cost is a difference between two runs
+  rather than an estimate.
+* `apply_move` timing is measured from Python with `time.perf_counter()`, so it
+  includes one pybind11 crossing (~1 µs, C0) — irrelevant at these magnitudes
+  but not zero.
+* The ASan build is roughly 8x slower here (the full suite runs in 15 min
+  against 110 s) and its numbers do not belong in this table.

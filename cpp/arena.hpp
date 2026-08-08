@@ -73,6 +73,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 namespace guofish {
 
@@ -506,6 +507,21 @@ public:
         return static_cast<std::size_t>(next_.load(std::memory_order_acquire));
     }
 
+    // C8. The largest `size()` this arena has ever held, across every reset.
+    //
+    // The bump pointer only ever rises between resets, so the peak is `next_`
+    // just before each reset plus wherever it stands now — no per-allocation
+    // bookkeeping and nothing to keep in step on the hot path. It is here rather
+    // than in the search because the ping-pong pair is two arenas and the
+    // interesting figure is the peak of EITHER: a compaction's high-water is the
+    // moment both the source subtree and its copy exist, and reporting only the
+    // active one would under-report exactly the instant the budget is about.
+    std::size_t high_water() const noexcept {
+        const std::size_t now = size();
+        const std::size_t peak = high_water_.load(std::memory_order_relaxed);
+        return now > peak ? now : peak;
+    }
+
     static constexpr const char *accumulator_name() noexcept { return Accumulator::name(); }
 
     // ---- allocation -------------------------------------------------------
@@ -557,7 +573,62 @@ public:
     // Drop every allocation. The storage is not touched — try_allocate() clears
     // each block on the way out — so this is O(1) and a 2M-node arena can be
     // recycled between searches without a 19 MB memset nobody asked for.
-    void reset() noexcept { next_.store(0, std::memory_order_release); }
+    void reset() noexcept {
+        const std::uint32_t used = next_.load(std::memory_order_relaxed);
+        if (static_cast<std::size_t>(used) > high_water_.load(std::memory_order_relaxed)) {
+            high_water_.store(static_cast<std::size_t>(used), std::memory_order_relaxed);
+        }
+        next_.store(0, std::memory_order_release);
+    }
+
+    // C8, ping-pong. Exchange this arena's STORAGE with another arena's.
+    //
+    // Nine pointer swaps and one integer exchange — no node is touched and
+    // nothing is copied. That is the whole point: `apply_move` compacts the
+    // surviving subtree into the standby arena and then makes it the active one,
+    // and if the "swap" were a copy the compaction would have been pointless.
+    //
+    // Written as a member rather than as a `std::swap` of two NodeArenas because
+    // NodeArena is deliberately not movable: it holds a `std::atomic<uint32_t>`
+    // bump pointer, and a type whose move constructor silently loaded and stored
+    // an atomic would be a type C9 could accidentally move while threads were
+    // running in it. Swapping the arrays under an explicit call has no such
+    // reading.
+    //
+    // The capacities must match. They do by construction — the standby arena is
+    // allocated at the active one's capacity — and a mismatch would mean one of
+    // the two could not hold what the other was sized for, which is a bug rather
+    // than a case to handle.
+    void swap_storage(NodeArena &other) {
+        if (capacity_ != other.capacity_) {
+            throw std::invalid_argument(
+                "guofish::NodeArena::swap_storage: capacities differ (" +
+                std::to_string(capacity_) + " vs " + std::to_string(other.capacity_) + ")");
+        }
+        using std::swap;
+        swap(visit_count_, other.visit_count_);
+        swap(value_sum_, other.value_sum_);
+        swap(vloss_count_, other.vloss_count_);
+        swap(prior_, other.prior_);
+        swap(move_, other.move_);
+        swap(children_offset_, other.children_offset_);
+        swap(children_count_, other.children_count_);
+        swap(state_, other.state_);
+        swap(terminal_value_, other.terminal_value_);
+
+        const std::uint32_t mine = next_.load(std::memory_order_relaxed);
+        next_.store(other.next_.load(std::memory_order_relaxed), std::memory_order_release);
+        other.next_.store(mine, std::memory_order_release);
+
+        // The high-water marks travel with the STORAGE, not with the object, so
+        // that "the peak this arena ever held" keeps meaning the peak of the
+        // memory rather than the peak of whichever role the memory is currently
+        // playing.
+        const std::size_t peak = high_water_.load(std::memory_order_relaxed);
+        high_water_.store(other.high_water_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        other.high_water_.store(peak, std::memory_order_relaxed);
+    }
 
     // ---- reads ------------------------------------------------------------
 
@@ -675,6 +746,41 @@ public:
         vloss_count_[i].fetch_add(n, std::memory_order_relaxed);
     }
 
+    // ---- C8: assignment, not accumulation ---------------------------------
+    //
+    // Two callers need to OVERWRITE these fields rather than add to them, and
+    // both are on the tree-reuse path where the node in question already carries
+    // a previous search's numbers:
+    //
+    //   the compaction  copies a node's exact totals into a fresh slot;
+    //   expand_root     re-seeds a PROMOTED root, and the reference assigns
+    //                   there (`root.visit_count = 1`, `root.value_sum = ...`)
+    //                   rather than incrementing. On a fresh node the two are
+    //                   the same and C5 could use add_*; on a promoted node that
+    //                   arrived with 400 visits from the fifty-move fast path
+    //                   they are not, and add_* would leave 401.
+    //
+    // Not `store`-named because the arena's vocabulary is add_/set_, and not
+    // folded into add_* with a flag because "assign" and "accumulate" are the
+    // distinction the bug above is made of.
+    void set_visits(std::uint32_t i, std::int32_t n) {
+        check(i);
+        visit_count_[i].store(n, std::memory_order_relaxed);
+    }
+
+    void set_value(std::uint32_t i, double v) {
+        check(i);
+        value_sum_[i].store(Accumulator::encode(v), std::memory_order_relaxed);
+    }
+
+    // The accumulator's own representation, unconverted. The compaction uses
+    // this: a Q32 total copied through `double` would round twice, and the whole
+    // claim being made about a compacted tree is that it is bit-identical.
+    void set_value_raw(std::uint32_t i, accum_value_type raw) {
+        check(i);
+        value_sum_[i].store(raw, std::memory_order_relaxed);
+    }
+
     // ---- state transitions ------------------------------------------------
 
     // Claim an unexpanded leaf for evaluation. Returns false if someone else
@@ -774,6 +880,37 @@ public:
                         std::memory_order_release);
     }
 
+    // C8. Withdraw a terminal mark. THE ONLY LEGITIMATE CALLER IS ROOT
+    // PROMOTION, and the reason is a rule of chess rather than a convenience.
+    //
+    // The fifty-move rule and threefold repetition are CLAIMABLE: the game ends
+    // only if someone claims it. C6 marks such a node terminal and leaves it
+    // Unexpanded precisely so that a host which declines the claim can hand the
+    // position back as the one to move from. When that happens the mark is
+    // stale — we are playing on — and it has to come off before the node can be
+    // expanded, because `set_children` refuses a terminal node by design.
+    //
+    // The reference does exactly this, in `_expand_root`:
+    //
+    //     if root.children:
+    //         root.is_terminal = False
+    //
+    // gated on children existing, so a genuine checkmate or stalemate (where
+    // expansion produced nothing) keeps its mark and its value. The gate lives
+    // at the call site here too, for the same reason.
+    //
+    // `terminal_value_` is deliberately LEFT ALONE. The reference leaves it too,
+    // and the tree serialisation writes it whether or not the bit is set — so
+    // clearing it here would put C++ one field away from the reference on every
+    // promoted draw. The value is dead state on an unmarked node; the tests read
+    // it anyway, which is why it has to be dead in the same way on both sides.
+    void clear_terminal(std::uint32_t i) {
+        check(i);
+        const std::uint8_t current = state_[i].load(std::memory_order_acquire);
+        state_[i].store(static_cast<std::uint8_t>(current & ~kTerminalBit),
+                        std::memory_order_release);
+    }
+
     // ---- diagnostics ------------------------------------------------------
 
     struct ArrayInfo {
@@ -865,6 +1002,8 @@ private:
 
     std::size_t capacity_;
     std::atomic<std::uint32_t> next_{0};
+    // C8. Peak `next_` over this storage's whole life; see high_water().
+    std::atomic<std::size_t> high_water_{0};
 
     // One array per field. Declaration order is initialisation order; it is
     // also the order for_each_array() reports, so the two cannot drift.

@@ -39,6 +39,7 @@ skips there.
 | `GUOFISH_ASAN` | `OFF` | AddressSanitizer; also UndefinedBehaviorSanitizer on Clang. Strips `/RTC1` and disables incremental linking on MSVC. Keeps `assert()` live even in release configs. |
 | `GUOFISH_MODULE_OUTPUT_DIR` | repo root | Where the built `.pyd`/`.so` is written. |
 | `GUOFISH_VALUE_SUM` | `q32` | Which accumulator `guofish::DefaultArena` and `guofish_core.NodeArena` name: `q32` (production) or `double` (Gate 1 equivalence). Both `NodeArena` types are compiled and bound in *every* build; this only selects the default. |
+| `GUOFISH_DEBUG_VL` | `ON` for `Debug`, else `OFF` | Compile `ReplaySearch.debug_total_vloss()`, C8's read-only full-tree virtual-loss audit. Its absence from a Release build is the point — C8 forbids a production equivalent of the reference's defensive `_reset_virtual_loss` walk — so the flag is reported as `guofish_core.DEBUG_VL` and `tests/test_c8_reuse.py` asserts both halves: the invariant where the audit exists, the absence where it should not. |
 
 Windows and Linux artifacts have different suffixes
 (`guofish_core.cp313-win_amd64.pyd` vs `guofish_core.cpython-312-x86_64-linux-gnu.so`)
@@ -323,6 +324,7 @@ the real file's SHA-256 is recorded unchanged before and after.
 ```bat
 python tools/drill_c5_gate1.py
 python tools/drill_c6_gate1.py
+python tools/drill_c8_reuse.py
 ```
 
 The C5 drill corrupts the quiet Gate 1 data four ways; the C6 drill corrupts the
@@ -331,6 +333,19 @@ terminal bit, the cached terminal value, and the per-run `max_tree_depth`) and t
 recorded repetition history. Both require the suite to fail each time **with the
 divergent node's path from the root** (a bare "trees differ" is not acceptable),
 and print the before/after hashes as proof `golden/` was not written to.
+
+**The C8 drill is a different shape, and it needs a working MSVC toolchain.** Its
+subject is the C++ compaction rather than a comparison, so five of its eight
+mutations are applied to a **copy of the source**: it duplicates `cpp/` and
+`CMakeLists.txt` into a scratch directory, changes one line (a `children_offset`
+one slot low, a dropped terminal bit, an un-advanced repetition history, an
+`_expand_root` that accumulates instead of assigning), builds a separate module
+into `<scratch>/module`, and runs the acceptance suite's own comparison helpers
+against it. Configure re-uses the already-fetched dependency sources under
+`build/msvc-release/_deps`, so it needs no network — but it does need
+`build/msvc-release` to exist first. The remaining three mutations are the
+classic golden-copy form and need no rebuild. Run it against a Release build;
+each source mutation costs one ~40 s compile.
 
 ---
 
@@ -343,6 +358,7 @@ python tools/bench_c2.py --markdown     REM tokenization throughput
 python tools/bench_c4.py --markdown     REM sibling scan, Q32 vs double
 python tools/bench_c5.py --markdown     REM search throughput on the replay evaluator
 python tools/bench_c6.py --markdown     REM what terminal handling costs, both corpora
+python tools/bench_c8.py                REM arena high-water over whole games, compaction cost
 ```
 
 Run them against a **Release** build. Each prints the compiler, sanitizer and

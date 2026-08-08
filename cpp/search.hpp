@@ -128,6 +128,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -173,6 +174,37 @@ struct SearchConfig {
     // corpus with it on, which is the chunk's acceptance criterion.
     std::size_t cache_slots = 0;
     std::size_t cache_shards = kDefaultCacheShards;
+
+    // C8. What fraction of a PONDERED root's inherited visits survives its
+    // promotion. 1.0 is no decay and is the default, because the reference has
+    // no such mechanism and Gate 1 across `apply_move` has to reproduce the
+    // reference exactly — a decay that fired by default would fail the gate on
+    // the first ply, which is the correct outcome for a knob that changed
+    // behaviour without being asked.
+    //
+    // The knob exists because the brief requires it and because scope §8 says
+    // why: 30k fresh simulations cannot redistribute against 64k+ inherited
+    // ones, so a wrong ponder prediction leaves the next search dominated by
+    // evaluations of a line nobody played. Whether it should be below 1.0, and
+    // by how much, is deferred to post-port measurement by that same section —
+    // this chunk provides the lever, not the setting.
+    //
+    // It is applied only when the caller says the promotion is a ponder
+    // promotion (`apply_move(move, from_ponder=true)`). The search cannot know
+    // that by itself: pondering lives above this layer.
+    double ponder_decay = 1.0;
+
+    // C8. Run the full-tree structural diff after every compaction, even in a
+    // build with asserts off.
+    //
+    // Scope §7 names "ping-pong arena pointer fixup bugs" as a standing risk and
+    // "validate by full-tree structural diff against the pre-copy tree" as the
+    // mitigation, so the diff is not a test fixture — it is the mitigation, and
+    // it lives in the engine. Builds with asserts on run it unconditionally
+    // (see compact_and_promote); this flag is how a Release build opts in. It
+    // costs one extra O(nodes) pass over two arenas, i.e. roughly what the
+    // compaction itself costs.
+    bool verify_compaction = false;
 };
 
 // AlphaZero's visit-scaled exploration constant, exactly as SearchParams.c_puct
@@ -217,6 +249,20 @@ public:
 class TerminalReached : public std::runtime_error {
 public:
     explicit TerminalReached(const std::string &what) : std::runtime_error(what) {}
+};
+
+// C8. The compacting copy produced a tree that is not the tree it copied.
+//
+// Separate from every other failure here because it means something different
+// from all of them: not "the reference and this disagree" but "this arena no
+// longer describes a tree". An off-by-one in a remapped `children_offset` does
+// not crash and does not produce a wrong move — it produces a subtree stitched
+// out of the wrong siblings, which the next search then explores confidently.
+// Scope §7 lists exactly this as the ping-pong risk and a full-tree structural
+// diff as the mitigation; this is what that diff throws.
+class TreeCorruption : public std::runtime_error {
+public:
+    explicit TreeCorruption(const std::string &what) : std::runtime_error(what) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -397,6 +443,23 @@ public:
         ep_stack_.pop_back();
         halfmove_clock_ = clock_stack_.back();
         clock_stack_.pop_back();
+    }
+
+    // C8. Make the position we now stand on the FLOOR of the undo stacks.
+    //
+    // `apply_move` plays a move that is never taken back: the game has moved on.
+    // Dropping the two stacks says so structurally — a descent that tried to
+    // unmake past the new root would now trip `unmake_move`'s assert instead of
+    // quietly restoring a pre-root en-passant square and halfmove clock, which
+    // is a state no simulation should ever be able to reach. It also keeps the
+    // stacks from growing one entry per ply for the length of a game.
+    //
+    // chess-library's own `prev_states_` is not cleared: it is the library's
+    // business, `unmakeMove` is never called past the floor anyway, and reaching
+    // into it would be exactly the coupling this class exists to avoid.
+    void commit() {
+        ep_stack_.clear();
+        clock_stack_.clear();
     }
 
     // The position in the terms C2's tokenizer and C3's keys are defined in.
@@ -766,6 +829,24 @@ struct SearchStats {
     std::int64_t tablebase_overrides = 0;
 };
 
+// C8. Counters for the tree-reuse seam. Not part of SearchStats because they do
+// not belong to a search: they span every `apply_move` since the last
+// `set_position`, which is the span of a game.
+struct ReuseStats {
+    std::int64_t applies = 0;          // apply_move() calls that reused a subtree
+    std::int64_t discards = 0;         // ...that could not, and rebuilt from scratch
+    std::int64_t nodes_copied = 0;     // total nodes moved by every compaction
+    std::int64_t nodes_dropped = 0;    // total nodes the compactions left behind
+    std::int64_t verifications = 0;    // structural diffs actually run
+    std::int64_t decays = 0;           // promotions that applied a ponder decay
+    std::int64_t terminal_promotions = 0;   // promoted roots that arrived marked
+    std::int64_t terminal_marks_cleared = 0;  // ...and were then expanded anyway
+    // The largest single compaction, in nodes. This is the figure the memory
+    // budget is really about: a compaction holds the source subtree and its copy
+    // at the same time.
+    std::int64_t largest_copy = 0;
+};
+
 // A serialized node, in canonical DFS preorder.
 struct TreeRecord {
     std::uint16_t depth;
@@ -911,16 +992,35 @@ public:
         raw_move_[root_] = 0;
         root_expanded_ = false;
         stats_ = SearchStats{};
+        reuse_ = ReuseStats{};
         mating_move_ = kNoMove;
 
         root_parsed_ = board_.parsed();
         root_rep_key_ = rep_key(root_parsed_).value;
         root_occupied_ = root_parsed_.placement.occupied();
 
+        // C8. The history is kept, not merely consumed. `apply_move` has to
+        // rebuild `rep_history_` for the NEW root — the same position counted
+        // once as the root plus its predecessors inside the halfmove-clock
+        // horizon — and it can only do that if the predecessors are still around
+        // as keys. Most recent first, which is the order the caller supplies and
+        // the order `build_repetition_history` walks.
+        history_keys_.clear();
+        history_keys_.reserve(history.size());
+        for (const std::string &position : history) {
+            history_keys_.push_back(rep_key(parse_fen(position)).value);
+        }
+
+        // Counted verbatim rather than through apply_move's windowing rule, and
+        // that is deliberate: this is C5/C6/C7's certified behaviour and the two
+        // agree for every conforming caller anyway. The contract is that
+        // `history` already IS the window — the FENs of the last
+        // min(halfmove_clock, plies) positions — so windowing here would be a
+        // second application of a filter the caller has applied.
         rep_history_.clear();
         rep_history_[root_rep_key_] = 1;
-        for (const std::string &position : history) {
-            rep_history_[rep_key(parse_fen(position)).value] += 1;
+        for (const std::uint64_t key : history_keys_) {
+            rep_history_[key] += 1;
         }
     }
 
@@ -958,6 +1058,207 @@ public:
         }
         return stats_;
     }
+
+    // ---- C8: the seam between moves ---------------------------------------
+
+    // Play `packed` and keep the subtree under it.
+    //
+    // `ParallelMCTS.apply_move` transcribed — with the one structural difference
+    // this chunk exists for. The reference promotes a child by reassigning a
+    // pointer and detaching the parent, and Python's garbage collector reclaims
+    // the discarded branches whenever it gets round to it. There are no pointers
+    // here and there is no collector: the tree is a bump-allocated index space,
+    // and the surviving subtree is scattered through it among the ~70% of nodes
+    // that are about to become garbage. So the promotion is a COMPACTING COPY
+    // into the standby arena, followed by a swap (scope §2.3).
+    //
+    // What that buys, beyond not leaking:
+    //
+    //   * the arena is contiguous again, so the next search's sibling scans are
+    //     sequential rather than strided across the holes the dead branches left;
+    //   * the bump pointer goes back to (nodes that survived), which is what
+    //     keeps a game-long tree inside the 2-3M budget instead of growing by a
+    //     search's worth of nodes every ply;
+    //   * every index in the new arena is derived, in one pass, from one
+    //     traversal — so a fixup bug is a *structural* difference against the
+    //     source tree, and `verify_compaction` is a diff rather than a guess.
+    //
+    // Returns true if a subtree was reused. False means the tree was thrown
+    // away and rebuilt around the new position, which is the reference's
+    // "nothing to reuse" branch (`move not in self.root.children`) — reachable
+    // when the root is an unexpanded promoted leaf, or terminal, or when the
+    // caller plays a move this search never generated.
+    //
+    // `from_ponder` is the caller's assertion that the subtree being promoted
+    // was built by a ponder search rather than by a search of this position.
+    // Only then is `config_.ponder_decay` applied. The search cannot work this
+    // out for itself; pondering is a layer above.
+    bool apply_move(std::uint16_t packed, bool from_ponder = false) {
+        require_position();
+        if (packed == kNoMove) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch::apply_move: kNoMove is not a move");
+        }
+        const double decay = from_ponder ? config_.ponder_decay : 1.0;
+        if (!(decay > 0.0 && decay <= 1.0)) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch::apply_move: ponder_decay must be in (0, 1], got " +
+                std::to_string(decay));
+        }
+
+        const std::uint32_t child = find_root_child(packed);
+
+        // The library move for the promotion, and the two classifiers, read
+        // BEFORE anything moves. `is_zeroing` is evaluated on the position the
+        // move is played from — the current root — which is python-chess's own
+        // evaluation point and the reason `make_move` takes it as an argument.
+        std::uint16_t raw = 0;
+        if (child != kNoNode) {
+            raw = raw_move_[child];
+        } else {
+            // No subtree to keep. The move still has to be played, and it still
+            // has to be a legal one — a caller that hands us an illegal move has
+            // desynchronised from the game, and continuing would search a
+            // position nobody is in.
+            std::vector<std::uint16_t> packed_moves;
+            std::vector<std::uint16_t> raw_moves;
+            generate_canonical(packed_moves, raw_moves);
+            std::size_t k = 0;
+            for (; k < packed_moves.size(); ++k) {
+                if (packed_moves[k] == packed) {
+                    break;
+                }
+            }
+            if (k == packed_moves.size()) {
+                throw std::invalid_argument(
+                    "guofish::ReplaySearch::apply_move: " + uci_of(packed) +
+                    " is not legal at " + board_.diagnostic_fen());
+            }
+            raw = raw_moves[k];
+        }
+        const chess::Move move(raw);
+        const bool zeroing = guofish::is_zeroing(root_parsed_, move.from().index(),
+                                                 uci_destination(board_.board(), move).index());
+
+        // === advance the position =========================================
+        //
+        // The old root joins the history BEFORE the board moves, because from
+        // the new root's point of view the position we are leaving is the most
+        // recent previous position — the first thing
+        // `build_repetition_history`'s walk-back would meet.
+        history_keys_.insert(history_keys_.begin(), root_rep_key_);
+        board_.make_move(move, zeroing);
+        board_.commit();
+
+        root_parsed_ = board_.parsed();
+        root_rep_key_ = rep_key(root_parsed_).value;
+        root_occupied_ = root_parsed_.placement.occupied();
+        rebuild_rep_history();
+        mating_move_ = kNoMove;
+
+        // === move the tree ================================================
+        if (child == kNoNode) {
+            ++reuse_.discards;
+            arena_.reset();
+            root_ = arena_.allocate(1);
+            parent_[root_] = kNoNode;
+            raw_move_[root_] = 0;
+            root_expanded_ = false;
+            return false;
+        }
+
+        compact_and_promote(child, decay);
+        ++reuse_.applies;
+        return true;
+    }
+
+    // The reuse counters since the last set_position. See ReuseStats.
+    const ReuseStats &reuse_stats() const noexcept { return reuse_; }
+
+    // `build_repetition_history(board)`'s answer for the CURRENT root, read out.
+    //
+    // Exposed because C8's second implementation requirement — that the
+    // path-dependent draw counts partition differently across an applied move
+    // but sum identically — is otherwise only observable through its
+    // consequences. It would show up as a threefold that appears or disappears
+    // somewhere in a tree, which is a bit-exactness failure a hundred nodes away
+    // from its cause. This is the cause, in one map.
+    //
+    // Read-only. The map is rebuilt by set_position and apply_move and is
+    // treated as immutable by every simulation, which is what will let C9 share
+    // it across threads without a lock.
+    const std::unordered_map<std::uint64_t, int> &rep_history() const noexcept {
+        return rep_history_;
+    }
+
+    // The position the tree is rooted at, in the FEN dialect this file owns —
+    // OUR raw en-passant square, OUR halfmove clock. After `apply_move` this is
+    // the cheapest possible check that the engine and the game agree, and it is
+    // a check worth having: every rule C6 implements reads one of those two
+    // fields, and a seam that advanced the board while losing the clock would
+    // produce a tree that is internally consistent and about the wrong position.
+    std::string root_fen() const {
+        require_position();
+        return board_.diagnostic_fen();
+    }
+
+    // The most nodes either arena has ever held. The peak of BOTH is the honest
+    // figure: during a compaction the source subtree and its copy are alive at
+    // the same time, so the moment of greatest occupancy is the moment the two
+    // arenas overlap, and reporting only the active one would miss it by
+    // construction. See NodeArena::high_water.
+    std::size_t arena_high_water() const noexcept {
+        const std::size_t active = arena_.high_water();
+        const std::size_t standby = standby_ ? standby_->high_water() : 0u;
+        return active > standby ? active : standby;
+    }
+
+    // Bytes of node payload the ping-pong pair has reserved. The standby arena
+    // does not exist until the first apply_move, so this answers "what has been
+    // committed", not "what could be".
+    std::size_t arena_bytes_reserved() const noexcept {
+        const std::size_t per_node = NodeArena<Accumulator>::bytes_per_node() +
+                                     sizeof(std::uint32_t) + sizeof(std::uint16_t);
+        return per_node * config_.arena_capacity * (standby_ ? 2u : 1u);
+    }
+
+    bool has_standby_arena() const noexcept { return standby_ != nullptr; }
+
+#if defined(GUOFISH_DEBUG_VL)
+    // THE DEFENSIVE FULL-TREE VIRTUAL-LOSS WALK, AND IT EXISTS ONLY HERE.
+    //
+    // The reference calls `_reset_virtual_loss(root)` at the top of every search
+    // and every get_policy: a recursive walk of the whole tree writing
+    // `vloss_count = 0` on every node, defensively, because nothing guaranteed
+    // that a previous search had repaid what it applied. Scope §2.3 prices it at
+    // 3.4 ms at 2k sims, 36 ms at 8k and 937 ms over a game — a full-tree write
+    // pass per move, buying a property that should be a property.
+    //
+    // C8's brief is explicit: do NOT implement a production equivalent. Here
+    // repayment is scope-guaranteed by RAII — `run_simulation`'s Unwind
+    // destructor repays every applied loss on every exit, including an exception
+    // mid-descent — so there is nothing to reset, and a walk that reset anything
+    // would be hiding a bug rather than fixing one.
+    //
+    // So this READS rather than writes, and it is compiled only when
+    // GUOFISH_DEBUG_VL is defined (CMake turns it on for Debug builds, which is
+    // where the sanitized test run lives). It returns the sum, so a test can
+    // assert the invariant the reference merely hoped for: a quiescent tree
+    // holds exactly zero in-flight losses, at any virtual-loss magnitude,
+    // because the counts are integers.
+    std::int64_t debug_total_vloss() const {
+        require_position();
+        std::int64_t total = 0;
+        // Flat scan, not a traversal: after a compaction the arena holds exactly
+        // the reachable tree in [0, size()), and before one it holds the tree
+        // plus nothing else. A stranded loss on an UNREACHABLE node is precisely
+        // the kind this is looking for, and a traversal would not see it.
+        for (std::size_t i = 0; i < arena_.size(); ++i) {
+            total += arena_.vloss_count(static_cast<std::uint32_t>(i));
+        }
+        return total;
+    }
+#endif
 
     // `ParallelMCTS.search`'s return value: the mating move if the hack fired,
     // otherwise the most-visited root child. kNoMove if the root has no
@@ -1345,10 +1646,38 @@ private:
         }
         const ReplayDump::Entry &entry =
             lookup(EvalRow(root_parsed_).key(), /*at_root=*/true);
+
+        // C8. A PROMOTED root can arrive already marked terminal — that is what
+        // C6's claimable draws are for: `draw_by_rule` marks the node and leaves
+        // it unexpanded precisely so a host that declines the claim can hand the
+        // position back as the one to move from. We are here, with legal moves
+        // in `packed`, so the host has declined and we are playing on. The mark
+        // is stale and has to come off before `set_children` will accept the
+        // node.
+        //
+        // The reference does the same thing, in the same place and with the same
+        // guard (`if root.children: root.is_terminal = False`); its guard is
+        // after expansion because Python's expand() can produce no children,
+        // while here the empty case has already thrown above. `terminal_value`
+        // is deliberately left in place on both sides — see
+        // NodeArena::clear_terminal.
+        if (arena_.is_terminal(root_)) {
+            arena_.clear_terminal(root_);
+            ++reuse_.terminal_marks_cleared;
+        }
+
         expand(root_, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
                "golden   ");
-        arena_.add_visits(root_, 1);
-        arena_.add_value(root_, mover_value(NetworkValue(entry.value), root_parsed_.white_to_move));
+        // ASSIGNED, not accumulated. `_expand_root` writes `root.visit_count = 1`
+        // and `root.value_sum = ...`, and until C8 the distinction could not be
+        // observed: a fresh root came out of the arena cleared, so += and = were
+        // the same operation. A promoted root does not. One that spent the last
+        // search as a fifty-move draw arrives carrying several hundred visits
+        // from the terminal fast path, and `add_visits(1)` would leave the tree
+        // claiming the root had been searched 400 times when the reference says
+        // once.
+        arena_.set_visits(root_, 1);
+        arena_.set_value(root_, mover_value(NetworkValue(entry.value), root_parsed_.white_to_move));
         root_expanded_ = true;
     }
 
@@ -1714,6 +2043,409 @@ private:
         ++stats_.simulations;
     }
 
+    // --- C8: the compacting copy -------------------------------------------
+
+    // The root child holding `packed`, or kNoNode.
+    //
+    // A linear scan over a contiguous range of at most a few dozen uint16s. A
+    // binary search over the canonical key would also work — the children ARE
+    // sorted — but this runs once per move, and a scan cannot be wrong about the
+    // ordering invariant while a binary search can.
+    std::uint32_t find_root_child(std::uint16_t packed) const {
+        const std::uint16_t count = arena_.children_count(root_);
+        const std::uint32_t first = arena_.children_offset(root_);
+        for (std::uint16_t k = 0; k < count; ++k) {
+            const std::uint32_t child = first + static_cast<std::uint32_t>(k);
+            if (arena_.move(child) == packed) {
+                return child;
+            }
+        }
+        return kNoNode;
+    }
+
+    // `build_repetition_history(board)` for the new root, from the keys we kept.
+    //
+    // The reference recomputes this from the board's move stack at the top of
+    // every search: seed the root at 1, then pop
+    // `min(halfmove_clock, len(move_stack))` moves and count each position on
+    // the way back. `history_keys_` IS that walk-back, most recent first, so the
+    // rule reduces to taking a prefix.
+    //
+    // THE WINDOW IS WHY THIS IS NOT JUST AN INCREMENT. The two partitions the
+    // brief asks about — what a simulation counts on its PATH and what the root
+    // counts as HISTORY — only sum identically if the horizon moves correctly
+    // when the move is applied. A non-zeroing move raises the clock by one and
+    // adds one position, so the window grows by exactly one and the position
+    // that enters it is exactly the old root. A zeroing move drops the clock to
+    // zero and the window with it, which is right: nothing before a capture or a
+    // pawn move can ever repeat again, so those occurrences must leave the count
+    // rather than linger in it.
+    void rebuild_rep_history() {
+        rep_history_.clear();
+        rep_history_[root_rep_key_] = 1;
+        const std::size_t clock = board_.halfmove_clock() > 0
+                                      ? static_cast<std::size_t>(board_.halfmove_clock())
+                                      : 0u;
+        const std::size_t window = clock < history_keys_.size() ? clock : history_keys_.size();
+        for (std::size_t i = 0; i < window; ++i) {
+            rep_history_[history_keys_[i]] += 1;
+        }
+    }
+
+    // Copy the subtree at `src` into the standby arena, verify it, swap, promote.
+    void compact_and_promote(std::uint32_t src, double decay) {
+        ensure_standby();
+        standby_->reset();
+        standby_parent_.assign(config_.arena_capacity, kNoNode);
+        standby_raw_move_.assign(config_.arena_capacity, 0);
+
+        const std::size_t before = arena_.size();
+        const std::uint32_t dst_root = copy_subtree(src);
+        assert(dst_root == 0);
+        const std::size_t copied = standby_->size();
+
+        // THE STRUCTURAL DIFF, against the tree that is still sitting in the
+        // other arena. Scope §7's mitigation for the fixup-bug risk. Under
+        // asserts it always runs; in a Release build it runs when the config
+        // asks. Either way it happens BEFORE the swap and before the promotion
+        // edits below, so what it compares is a faithful copy against its
+        // original, with nothing yet done to either.
+#if defined(NDEBUG)
+        const bool verify = config_.verify_compaction;
+#else
+        const bool verify = true;
+#endif
+        if (verify) {
+            verify_copy(src, dst_root);
+            ++reuse_.verifications;
+        }
+
+        arena_.swap_storage(*standby_);
+        parent_.swap(standby_parent_);
+        raw_move_.swap(standby_raw_move_);
+        // The old arena's storage is now the standby's. Dropping the bump
+        // pointer is the whole of "free the dead branches": nothing is written,
+        // and try_allocate() clears each block as it hands it out next time.
+        standby_->reset();
+
+        root_ = dst_root;
+        parent_[root_] = kNoNode;
+        // The root has no move. The reference's promoted node keeps its `move`
+        // field, but nothing reads it there (only the depth-1 mate hack does,
+        // and that inspects children) and the tree serialisation writes 0 at
+        // depth 0 regardless. Clearing it makes the arena say the same thing the
+        // serialisation does instead of relying on the reader to know.
+        arena_.set_move(root_, kNoMove);
+        raw_move_[root_] = 0;
+        root_expanded_ = arena_.children_count(root_) > 0;
+
+        if (arena_.is_terminal(root_)) {
+            // Kept, not cleared. At this instant the mark is still true: the
+            // node was a game result and nobody has yet declined to claim it.
+            // `expand_root` clears it if and only if the position turns out to
+            // have legal moves, which is the reference's rule and the C6
+            // promotion property. Counted here because a promoted terminal root
+            // is the case the whole promotion invariant is about, and a corpus
+            // that never produced one should say so out loud.
+            ++reuse_.terminal_promotions;
+        }
+
+        if (decay != 1.0) {
+            apply_decay(decay);
+            ++reuse_.decays;
+        }
+
+        reuse_.nodes_copied += static_cast<std::int64_t>(copied);
+        reuse_.nodes_dropped += static_cast<std::int64_t>(before - copied);
+        if (static_cast<std::int64_t>(copied) > reuse_.largest_copy) {
+            reuse_.largest_copy = static_cast<std::int64_t>(copied);
+        }
+    }
+
+    void ensure_standby() {
+        if (standby_) {
+            return;
+        }
+        // Allocated on FIRST USE rather than in the constructor. A ping-pong
+        // pair at the 2M default is ~140 MB of node payload, and a search that
+        // never applies a move — every test before this chunk, and the tablebase
+        // root bypass — has no use for the second half of it. The allocation is
+        // a few tens of milliseconds once per game, against a move that takes a
+        // second.
+        standby_ = std::make_unique<NodeArena<Accumulator>>(config_.arena_capacity);
+    }
+
+    // Breadth-first copy. Returns the new index of the subtree root, which is 0.
+    //
+    // BREADTH-FIRST, NOT DEPTH-FIRST, and the choice is about the next search
+    // rather than about this one. A node's children are one contiguous block
+    // either way — that is forced by the (offset, count) representation — but
+    // BFS additionally lays whole DEPTH LEVELS out contiguously, so a descent
+    // walks forward through memory instead of jumping to wherever a DFS happened
+    // to have finished the previous branch. Selection reads a whole sibling
+    // range per step; BFS is the order that keeps those ranges near the ranges
+    // read just before and just after them.
+    //
+    // Nothing about correctness depends on it: `dump_tree` and the golden
+    // comparison both traverse by (offset, count), so any allocation order that
+    // keeps siblings contiguous and in canonical order produces the same tree.
+    std::uint32_t copy_subtree(std::uint32_t src_root) {
+        NodeArena<Accumulator> &dst = *standby_;
+        const std::uint32_t dst_root = dst.allocate(1);
+        copy_node(src_root, dst_root);
+        standby_parent_[dst_root] = kNoNode;
+        standby_raw_move_[dst_root] = raw_move_[src_root];
+
+        // (source index, destination index). A vector used as a queue with a
+        // read cursor: the pairs are never removed, so the storage is one
+        // allocation for the whole subtree rather than a deque's chain of blocks.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> queue;
+        queue.reserve(64);
+        queue.emplace_back(src_root, dst_root);
+
+        for (std::size_t head = 0; head < queue.size(); ++head) {
+            const std::uint32_t s = queue[head].first;
+            const std::uint32_t d = queue[head].second;
+            const std::uint16_t count = arena_.children_count(s);
+            if (count == 0) {
+                continue;
+            }
+            // Allocated as one block, which is what makes the fixup a single
+            // number: every child's new index is `offset + k` for the same k it
+            // had in the source. There is no per-child remap table and therefore
+            // no per-child remap bug.
+            const std::uint32_t offset = dst.allocate(count);
+            const std::uint32_t src_first = arena_.children_offset(s);
+            for (std::uint16_t k = 0; k < count; ++k) {
+                const std::uint32_t sc = src_first + static_cast<std::uint32_t>(k);
+                const std::uint32_t dc = offset + static_cast<std::uint32_t>(k);
+                copy_node(sc, dc);
+                standby_parent_[dc] = d;
+                standby_raw_move_[dc] = raw_move_[sc];
+                queue.emplace_back(sc, dc);
+            }
+            // Published only after every child is written, so the release inside
+            // set_children covers the whole block.
+            dst.set_children(d, offset, count);
+        }
+        return dst_root;
+    }
+
+    // One node's payload, source arena to standby arena.
+    //
+    // `value_sum` moves in the ACCUMULATOR'S OWN REPRESENTATION. Reading it as a
+    // double and writing it back would round twice under Q32 — and the claim
+    // being made about a compacted tree is that it is bit-identical, which a
+    // round trip through a lossy intermediate cannot support even when it
+    // happens to hold.
+    void copy_node(std::uint32_t src, std::uint32_t dst) {
+        NodeArena<Accumulator> &out = *standby_;
+        out.set_move(dst, arena_.move(src));
+        out.set_prior(dst, arena_.prior(src));
+        out.set_visits(dst, arena_.visit_count(src));
+        out.set_value_raw(dst, arena_.value_sum_raw(src));
+
+        // A quiescent tree holds zero in-flight losses — that is the RAII
+        // property that lets C8 delete the reference's defensive walk — so this
+        // should always be zero. It is COPIED rather than assumed, because a
+        // compaction that silently zeroed a non-zero count would erase the
+        // evidence of the very bug the invariant is about, and asserted so that
+        // a sanitized build says so at the seam instead of at some later
+        // selection step.
+        const std::int32_t vloss = arena_.vloss_count(src);
+        assert(vloss == 0 && "apply_move on a tree with simulations in flight");
+        if (vloss != 0) {
+            out.add_vloss(dst, vloss);
+        }
+
+        if (arena_.is_terminal(src)) {
+            // Before the children block exists, because mark_terminal refuses a
+            // node that has children — the same invariant, read from the other
+            // side. A source node that was somehow both would fail here rather
+            // than propagate.
+            out.mark_terminal(dst, arena_.terminal_value(src));
+        }
+    }
+
+    // The full-tree structural diff (scope §7). Throws TreeCorruption naming the
+    // DFS path and the field.
+    //
+    // Every field is compared, not a summary: a hash would say "different" and
+    // this says "the fourth child of e2e4 g8f6 has prior 0.031 where the source
+    // had 0.017", which is the difference between a five-minute diagnosis and a
+    // day's. The float fields are compared as BIT PATTERNS via memcmp-free
+    // integer punning avoidance — `==` on floats would pass two values that
+    // Gate 1 would then fail on.
+    void verify_copy(std::uint32_t src_root, std::uint32_t dst_root) const {
+        const NodeArena<Accumulator> &dst = *standby_;
+        // Every destination slot must be reached exactly once. A remapped offset
+        // that points at a plausible-looking but wrong block leaves some slots
+        // unvisited and visits others twice, and neither shows up in a
+        // field-by-field comparison that only follows the corrupted links.
+        std::vector<std::uint8_t> seen(dst.size(), 0);
+        std::vector<std::uint16_t> path;
+        std::size_t visited = 0;
+
+        struct Frame {
+            std::uint32_t src;
+            std::uint32_t dst;
+            std::uint16_t next_child;
+        };
+        std::vector<Frame> stack;
+
+        const auto fail = [&](const std::string &what) {
+            throw TreeCorruption(
+                "guofish: the compacted tree does not match the tree it was copied from\n"
+                "  path   : " + (path.empty() ? std::string("(root)")
+                                              : uci_list(path.data(), path.size())) +
+                "\n  detail : " + what +
+                "\n  This is a ping-pong arena fixup bug: the surviving subtree was copied "
+                "into the standby arena and the copy is not the original. Nothing above this "
+                "point can be trusted.");
+        };
+
+        const auto compare = [&](std::uint32_t s, std::uint32_t d) {
+            if (static_cast<std::size_t>(d) >= dst.size()) {
+                fail("destination index " + std::to_string(d) + " is outside the copied region [0, " +
+                     std::to_string(dst.size()) + ")");
+            }
+            if (seen[d] != 0) {
+                fail("destination node " + std::to_string(d) + " is reachable twice");
+            }
+            seen[d] = 1;
+            ++visited;
+            if (arena_.move(s) != dst.move(d)) {
+                fail("move " + uci_of(dst.move(d)) + " where the source has " +
+                     uci_of(arena_.move(s)));
+            }
+            if (!bitwise_equal(arena_.prior(s), dst.prior(d))) {
+                fail("prior differs bitwise on move " + uci_of(arena_.move(s)));
+            }
+            if (arena_.visit_count(s) != dst.visit_count(d)) {
+                fail("visits " + std::to_string(dst.visit_count(d)) + " where the source has " +
+                     std::to_string(arena_.visit_count(s)));
+            }
+            if (arena_.value_sum_raw(s) != dst.value_sum_raw(d)) {
+                fail("value_sum differs in the accumulator's own representation");
+            }
+            if (arena_.vloss_count(s) != dst.vloss_count(d)) {
+                fail("vloss_count differs");
+            }
+            if (arena_.children_count(s) != dst.children_count(d)) {
+                fail("children_count " + std::to_string(dst.children_count(d)) +
+                     " where the source has " + std::to_string(arena_.children_count(s)));
+            }
+            if (arena_.is_terminal(s) != dst.is_terminal(d)) {
+                fail("terminal bit differs");
+            }
+            if (arena_.lifecycle(s) != dst.lifecycle(d)) {
+                fail("lifecycle differs");
+            }
+            if (!bitwise_equal(arena_.terminal_value(s), dst.terminal_value(d))) {
+                fail("terminal_value differs bitwise");
+            }
+            const std::uint16_t count = dst.children_count(d);
+            if (count != 0) {
+                const std::size_t first = dst.children_offset(d);
+                if (first + count > dst.size()) {
+                    fail("child range [" + std::to_string(first) + ", " +
+                         std::to_string(first + count) + ") is outside the copied region [0, " +
+                         std::to_string(dst.size()) + ")");
+                }
+            }
+        };
+
+        compare(src_root, dst_root);
+        stack.push_back(Frame{src_root, dst_root, 0});
+
+        while (!stack.empty()) {
+            Frame &frame = stack.back();
+            if (frame.next_child >= dst.children_count(frame.dst)) {
+                stack.pop_back();
+                if (!path.empty()) {
+                    path.pop_back();
+                }
+                continue;
+            }
+            const std::uint16_t k = frame.next_child++;
+            const std::uint32_t s = arena_.children_offset(frame.src) + k;
+            const std::uint32_t d = dst.children_offset(frame.dst) + k;
+            path.push_back(dst.move(d));
+            compare(s, d);
+            stack.push_back(Frame{s, d, 0});
+        }
+
+        if (visited != dst.size()) {
+            path.clear();
+            throw TreeCorruption(
+                "guofish: the compacted tree reaches " + std::to_string(visited) + " of the " +
+                std::to_string(dst.size()) +
+                " nodes the compaction allocated\n"
+                "  Unreachable slots mean a children_offset points somewhere other than the "
+                "block that was allocated for it — the classic ping-pong fixup bug. The tree "
+                "would still traverse; it would traverse the wrong nodes.");
+        }
+    }
+
+    // Bit-pattern equality for a float, without type punning.
+    //
+    // `==` is the wrong operator here twice over: it calls +0.0 and -0.0 equal,
+    // and it calls no NaN equal to itself. A prior that arrived as -0.0 on one
+    // side and +0.0 on the other would pass, and Gate 1's golden comparison —
+    // which packs the bytes — would then fail on a tree this function had
+    // certified. Comparing through `std::memcmp` on the objects avoids both a
+    // `reinterpret_cast` (Global Rule 6) and any aliasing question.
+    static bool bitwise_equal(float a, float b) noexcept {
+        return std::memcmp(&a, &b, sizeof(float)) == 0;
+    }
+
+    // Scale every node's inherited visits, and its value with them.
+    //
+    // A FLAT SCAN, not a traversal: after `copy_subtree` the arena holds exactly
+    // the promoted tree in [0, size()) and nothing else, which is one of the
+    // things compaction buys.
+    //
+    // BOTH fields move, by the same ratio, so Q is unchanged. That is the whole
+    // intent — decay is a statement about CONFIDENCE, not about evaluation. A
+    // node the ponder search visited 8,000 times and scored at +0.4 should come
+    // out of the promotion still scoring +0.4, but with the weight of 8,000·d
+    // visits rather than 8,000, so a few thousand fresh simulations can move it.
+    // Scaling visits alone would divide the value by d instead and turn every
+    // inherited node into a wild evaluation.
+    //
+    // A node with visits is floored at 1 rather than allowed to reach 0. A node
+    // with children and zero visits is a state the search never otherwise builds
+    // — selection treats it as FPU-eligible while it already has an expanded
+    // subtree underneath — and manufacturing it here would be a decay that
+    // changed the tree's kind, not its weight.
+    void apply_decay(double decay) {
+        for (std::size_t i = 0; i < arena_.size(); ++i) {
+            const auto node = static_cast<std::uint32_t>(i);
+            const std::int32_t visits = arena_.visit_count(node);
+            if (visits <= 0) {
+                continue;
+            }
+            std::int64_t scaled = std::llround(static_cast<double>(visits) * decay);
+            if (scaled < 1) {
+                scaled = 1;
+            }
+            if (scaled == visits) {
+                continue;
+            }
+            const double ratio = static_cast<double>(scaled) / static_cast<double>(visits);
+            const auto raw = arena_.value_sum_raw(node);
+            arena_.set_visits(node, static_cast<std::int32_t>(scaled));
+            if constexpr (Accumulator::is_fixed_point()) {
+                arena_.set_value_raw(
+                    node, static_cast<typename Accumulator::value_type>(
+                              std::llround(static_cast<double>(raw) * ratio)));
+            } else {
+                arena_.set_value_raw(
+                    node, static_cast<typename Accumulator::value_type>(raw * ratio));
+            }
+        }
+    }
+
     // --- diagnostics -------------------------------------------------------
 
     static std::string hex64(std::uint64_t value) {
@@ -1776,16 +2508,32 @@ private:
 
     SearchConfig config_;
     NodeArena<Accumulator> arena_;
+    // C8. The other half of the ping-pong pair. Null until the first
+    // `apply_move`; see ensure_standby for why it is not allocated up front.
+    // A unique_ptr rather than a value member because NodeArena is deliberately
+    // immovable (it holds an atomic bump pointer) and because "the standby arena
+    // does not exist yet" is a state worth being able to spell.
+    std::unique_ptr<NodeArena<Accumulator>> standby_;
+
     // Parallel to the arena. Kept outside it because neither is node payload the
     // hot sibling scan reads: `parent_` is walked once per backup and
     // `raw_move_` once per descent step, so putting them in the SoA arena would
     // cost cache lines in the loop that matters without helping either.
     std::vector<std::uint32_t> parent_;
     std::vector<std::uint16_t> raw_move_;
+    // C8. And their ping-pong partners. These have to be double-buffered for the
+    // same reason the arena does, and it is not symmetry for its own sake: the
+    // compaction READS `raw_move_[source]` while WRITING the destination's, and
+    // the two index spaces overlap. Writing in place would corrupt source
+    // entries that later siblings still need — a fixup bug in the one array the
+    // structural diff could not see, because it is not node payload.
+    std::vector<std::uint32_t> standby_parent_;
+    std::vector<std::uint16_t> standby_raw_move_;
 
     ReplayDump dump_;
     SearchBoard board_;
     SearchStats stats_;
+    ReuseStats reuse_;
 
     // C7. `std::optional` rather than a pointer or a zero-slot instance: the
     // three states a reader could imagine — off, on, and "on but useless" — are
@@ -1811,6 +2559,12 @@ private:
     // BEFORE this search, including the root position itself. Read-only once
     // set_position has built it, which is what lets C9 share it across threads.
     std::unordered_map<std::uint64_t, int> rep_history_;
+
+    // C8. The same history as a LIST, most recent first, so `apply_move` can
+    // rebuild the map for a root one ply further on. The map alone cannot do it:
+    // it has lost the order, and the halfmove-clock horizon is a rule about
+    // order. Grows by one key per applied move — 80 keys over a game.
+    std::vector<std::uint64_t> history_keys_;
 
     // One step of the current descent. The raw library move is what unwinds the
     // board; the arena index is what names the move in a diagnostic; the key,

@@ -250,6 +250,10 @@ py::dict build_info() {
 #else
     d["asserts"] = true;
 #endif
+    // C8's GUOFISH_DEBUG_VL flag is deliberately NOT reported here. It belongs
+    // in this dict by subject matter, and tests/test_c0b_contention.py pins the
+    // exact key set — Global Rule 1 makes that pin the specification, not a
+    // detail to be updated. It is `guofish_core.DEBUG_VL` instead.
 #if defined(_MSC_VER)
     d["compiler"] = "MSVC " + std::to_string(_MSC_FULL_VER);
 #elif defined(__clang__)
@@ -1809,6 +1813,91 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
             "completion_event does. Raises RuntimeError on a replay-dump miss (naming the "
             "FEN, the move path and the key) or if the ROOT itself has no legal moves.")
 
+        // --- C8: tree reuse -------------------------------------------------
+
+        .def(
+            "apply_move",
+            [](Search &self, const std::string &uci, bool from_ponder) {
+                return self.apply_move(packed_from_uci(uci), from_ponder);
+            },
+            py::arg("uci"), py::arg("from_ponder") = false,
+            "Play `uci` and keep the subtree under it, compacting-copying the survivors into "
+            "the standby arena and swapping (scope §2.3's ping-pong).\n\n"
+            "Returns True if a subtree was reused, False if the tree had to be thrown away — "
+            "the reference's `move not in self.root.children` branch, reachable when the root "
+            "is an unexpanded promoted leaf or terminal. Either way the position advances, and "
+            "an illegal move raises ValueError rather than desynchronising the engine from the "
+            "game.\n\n"
+            "The move must be in NORMALISED UCI: castling is e1g1, never chess-library's "
+            "king-takes-rook e1h1. That is the form best_move returns and the form the arena "
+            "stores.\n\n"
+            "`from_ponder=True` is the caller's assertion that the promoted subtree was built "
+            "by a ponder search rather than by a search of this position; only then is "
+            "SearchConfig.ponder_decay applied. Raises RuntimeError (TreeCorruption) if the "
+            "post-compaction structural diff finds the copy is not the tree it copied.")
+
+        .def(
+            "reuse_stats",
+            [](const Search &self) {
+                const guofish::ReuseStats stats = self.reuse_stats();
+                py::dict d;
+                d["applies"] = stats.applies;
+                d["discards"] = stats.discards;
+                d["nodes_copied"] = stats.nodes_copied;
+                d["nodes_dropped"] = stats.nodes_dropped;
+                d["verifications"] = stats.verifications;
+                d["decays"] = stats.decays;
+                d["terminal_promotions"] = stats.terminal_promotions;
+                d["terminal_marks_cleared"] = stats.terminal_marks_cleared;
+                d["largest_copy"] = stats.largest_copy;
+                d["arena_high_water"] = self.arena_high_water();
+                d["arena_bytes_reserved"] = self.arena_bytes_reserved();
+                d["standby_allocated"] = self.has_standby_arena();
+                return d;
+            },
+            "The tree-reuse counters since the last set_position — the span of a game, not of "
+            "a search.\n\n"
+            "`arena_high_water` is the peak occupancy of EITHER arena. That is the honest "
+            "figure for the memory budget: during a compaction the source subtree and its copy "
+            "are alive at the same moment, and reporting only the active arena would miss "
+            "exactly the instant the budget is about.")
+
+        .def(
+            "rep_history",
+            [](const Search &self) {
+                py::dict d;
+                for (const auto &entry : self.rep_history()) {
+                    d[py::cast(entry.first)] = entry.second;
+                }
+                return d;
+            },
+            "rep_key -> occurrences in the game BEFORE this search, the root included: "
+            "`build_repetition_history(board)`'s answer for the current root.\n\n"
+            "C8's requirement that the path and history partitions sum identically across an "
+            "applied move is otherwise only visible as a threefold appearing or disappearing "
+            "somewhere deep in a tree. This is where it comes from, so a divergence can be "
+            "attributed instead of hunted.")
+
+        .def_property_readonly(
+            "root_fen", [](const Search &self) { return self.root_fen(); },
+            "The FEN of the position the tree is rooted at, carrying THIS search's raw "
+            "en-passant square and its own halfmove clock. After apply_move this is how a "
+            "harness checks that the engine and the game are still on the same position.")
+
+#if defined(GUOFISH_DEBUG_VL)
+        .def("debug_total_vloss", &Search::debug_total_vloss,
+             "DEBUG BUILDS ONLY. The sum of every node's in-flight virtual-loss count over the "
+             "whole arena — a READ of what the reference's `_reset_virtual_loss` used to "
+             "overwrite.\n\n"
+             "C8's brief forbids a production equivalent of that defensive walk: repayment "
+             "here is scope-guaranteed by RAII (run_simulation's Unwind destructor), so a "
+             "reset would hide a bug rather than fix one. This exists so a test can assert the "
+             "invariant instead of trusting it, and it is compiled only under "
+             "-DGUOFISH_DEBUG_VL (on by default in Debug builds, which is where the sanitized "
+             "run lives). A quiescent tree returns exactly 0 at any virtual-loss magnitude, "
+             "because the counts are integers.")
+#endif
+
         .def(
             "terminal_nodes",
             [](Search &self) {
@@ -2068,6 +2157,22 @@ PYBIND11_MODULE(guofish_core, m) {
 
     m.attr("SEQ_LENGTH") = guofish::kSeqLength;
 
+    // C8. Whether this module carries the debug-only full-tree virtual-loss
+    // audit (`ReplaySearch.debug_total_vloss`). A module attribute rather than a
+    // `build_info()` key: it belongs in that dict by subject, but
+    // tests/test_c0b_contention.py pins build_info()'s exact key set and Global
+    // Rule 1 makes that pin the specification.
+    //
+    // Reported at all so that "the Release module does not contain a defensive
+    // virtual-loss walk" is a statement the acceptance test can assert
+    // positively, rather than an inference from a missing attribute — which
+    // would also be satisfied by a typo.
+#if defined(GUOFISH_DEBUG_VL)
+    m.attr("DEBUG_VL") = true;
+#else
+    m.attr("DEBUG_VL") = false;
+#endif
+
     // C1. std::invalid_argument is translated to ValueError by pybind11's stock
     // exception translator, so a bad FEN surfaces in Python as ValueError
     // without a custom registration.
@@ -2276,7 +2381,8 @@ PYBIND11_MODULE(guofish_core, m) {
         .def(py::init([](double c_init, double c_base, double c_factor, double fpu_root,
                          double fpu_tree, double virtual_loss, int max_tree_depth,
                          std::size_t arena_capacity, std::size_t cache_slots,
-                         std::size_t cache_shards) {
+                         std::size_t cache_shards, double ponder_decay,
+                         bool verify_compaction) {
                  guofish::SearchConfig config;
                  config.c_init = c_init;
                  config.c_base = c_base;
@@ -2288,6 +2394,8 @@ PYBIND11_MODULE(guofish_core, m) {
                  config.arena_capacity = arena_capacity;
                  config.cache_slots = cache_slots;
                  config.cache_shards = cache_shards;
+                 config.ponder_decay = ponder_decay;
+                 config.verify_compaction = verify_compaction;
                  return config;
              }),
              py::arg("c_init") = 1.43, py::arg("c_base") = 19652.0, py::arg("c_factor") = 1.0,
@@ -2295,7 +2403,8 @@ PYBIND11_MODULE(guofish_core, m) {
              py::arg("virtual_loss") = 0.0, py::arg("max_tree_depth") = 80,
              py::arg("arena_capacity") = static_cast<std::size_t>(1u << 21),
              py::arg("cache_slots") = static_cast<std::size_t>(0),
-             py::arg("cache_shards") = guofish::kDefaultCacheShards)
+             py::arg("cache_shards") = guofish::kDefaultCacheShards,
+             py::arg("ponder_decay") = 1.0, py::arg("verify_compaction") = false)
         .def_readwrite("c_init", &guofish::SearchConfig::c_init)
         .def_readwrite("c_base", &guofish::SearchConfig::c_base)
         .def_readwrite("c_factor", &guofish::SearchConfig::c_factor)
@@ -2310,7 +2419,21 @@ PYBIND11_MODULE(guofish_core, m) {
                        "nothing is not constructible, because it would pass every "
                        "tree-equivalence test while doing no work.")
         .def_readwrite("cache_shards", &guofish::SearchConfig::cache_shards,
-                       "C7. Spinlock-protected shards; a power of two, at least 64.");
+                       "C7. Spinlock-protected shards; a power of two, at least 64.")
+        .def_readwrite("ponder_decay", &guofish::SearchConfig::ponder_decay,
+                       "C8. The fraction of a PONDERED root's inherited visits that survives "
+                       "promotion, in (0, 1]. 1.0 — the default — is no decay, which is what "
+                       "the reference does and what Gate 1 across apply_move requires. Applied "
+                       "only when apply_move is told the promotion is a ponder promotion; the "
+                       "search cannot know that by itself. Visits AND value_sum are scaled by "
+                       "the same ratio, so Q is unchanged and only the confidence behind it "
+                       "falls.")
+        .def_readwrite("verify_compaction", &guofish::SearchConfig::verify_compaction,
+                       "C8. Run the full-tree structural diff after every compaction even with "
+                       "asserts off. Builds with asserts on run it unconditionally. Scope §7 "
+                       "names this as the mitigation for ping-pong fixup bugs, so it is engine "
+                       "behaviour rather than a test fixture; the flag is how a Release build "
+                       "opts in. Costs one extra O(nodes) pass per apply_move.");
 
     // -----------------------------------------------------------------------
     // C7 — cache and tablebase

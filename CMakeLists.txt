@@ -12,6 +12,29 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 option(GUOFISH_ASAN "Build with AddressSanitizer (plus UBSan on Clang/GCC)" OFF)
 
+# C8. Compile the full-tree virtual-loss AUDIT (`ReplaySearch::debug_total_vloss`).
+#
+# The reference walks the whole tree writing `vloss_count = 0` before every
+# search, defensively — 3.4 ms at 2k sims, 937 ms over a game (scope §2.3). C8's
+# brief forbids a production equivalent: repayment here is scope-guaranteed by
+# RAII, so a reset would hide a bug rather than fix one. What is allowed, and
+# only "strictly behind a debug flag", is a READ of the same quantity so a test
+# can assert the invariant. This is that flag.
+#
+# Default ON for Debug, OFF otherwise, so the sanitized run — the one Global
+# Rule 5 requires the suite to pass under — carries the audit while the Release
+# module does not contain the symbol at all. tests/test_c8_reuse.py checks both
+# halves of that: the invariant where the function exists, and its ABSENCE where
+# it should not.
+if (NOT DEFINED GUOFISH_DEBUG_VL)
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(GUOFISH_DEBUG_VL ON)
+    else ()
+        set(GUOFISH_DEBUG_VL OFF)
+    endif ()
+endif ()
+option(GUOFISH_DEBUG_VL "Compile the debug-only full-tree virtual-loss audit" ${GUOFISH_DEBUG_VL})
+
 # Which accumulator `guofish::DefaultArena` names — the one the engine will use.
 #
 # Both NodeArena<Q32Accumulator> and NodeArena<DoubleAccumulator> are compiled
@@ -234,6 +257,10 @@ target_compile_definitions(guofish_core PRIVATE
 
 if (GUOFISH_VALUE_SUM STREQUAL "double")
     target_compile_definitions(guofish_core PRIVATE GUOFISH_VALUE_SUM_DOUBLE)
+endif ()
+
+if (GUOFISH_DEBUG_VL)
+    target_compile_definitions(guofish_core PRIVATE GUOFISH_DEBUG_VL)
 endif ()
 
 # chess-library is third-party: SYSTEM keeps its headers from tripping /W4 and

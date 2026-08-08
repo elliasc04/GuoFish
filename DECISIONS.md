@@ -3601,3 +3601,436 @@ ea9bf8dfe40196460b6c2d4a0c47217d64998193eb1b4a9f7bb2697b413ce562  tokens.npz
 `gate1_cache_terminal_trees.npz` and `gate1_terminal_trees.npz` sharing a digest
 is not a copy — it is the invariance result: the reference produced a
 byte-identical file with its cache on.
+
+---
+
+# C8 — Tree reuse and the ping-pong arenas (2026-08-07)
+
+One new public operation, `apply_move`, and everything below is about what has
+to be true for it. Acceptance is `tests/test_c8_reuse.py` — 19 tests over five
+games, 190 applied moves, every one of them compared against the reference.
+
+The new golden corpus is `golden/c8_reuse_{trees,dump,manifest}` from
+`tools/gen_c8_reuse_golden.py`, and the mutation drill is
+`tools/drill_c8_reuse.py`.
+
+## The shape of the problem
+
+The reference's `apply_move` is four lines: detach the chosen child, make it the
+root, push the move onto the root board, recompute the hash. Everything hard
+about it is done by Python's garbage collector, which reclaims the unselected
+branches whenever it gets round to it.
+
+There is no collector here and there are no pointers. The tree is a
+bump-allocated index space, and after a 5,000-simulation search the surviving
+subtree is scattered through ~190,000 slots among the ones that are about to
+become garbage. Three things follow, and they are the chunk:
+
+* nothing can be "freed" individually — the arena has one bump pointer;
+* the survivors have to be brought together, or the next search's sibling scans
+  stride across the holes the dead branches left;
+* every `children_offset` in the surviving subtree is an index into the OLD
+  address space and has to be rewritten.
+
+Scope 2.3's answer, adopted verbatim: compacting-copy into a second arena and
+swap. Scope 7's mitigation for getting the rewrite wrong, also adopted: a
+full-tree structural diff against the pre-copy tree.
+
+## Ping-pong: two arenas, swapped by their storage
+
+**Chosen: `NodeArena::swap_storage`, nine `AlignedArray` moves and one atomic
+exchange, with the standby arena allocated lazily on the first `apply_move`.**
+
+Alternatives considered:
+
+* **`std::unique_ptr<NodeArena>` for both, swap the pointers.** Equivalent in
+  effect, and it was the first draft. Rejected because every one of the ~120
+  `arena_.` call sites in `search.hpp` becomes `arena_->`, which is a large diff
+  across code C5/C6/C7 certified, for no behavioural gain.
+* **Make `NodeArena` movable and `std::swap` it.** Rejected on a C9 argument
+  rather than a C8 one. `NodeArena` holds an `atomic<uint32_t>` bump pointer;
+  giving it a move constructor would make it a type that can be silently moved
+  while worker threads are running inside it. An explicitly named
+  `swap_storage()` cannot be called by accident.
+* **One arena, compact in place.** Rejected: the destination ranges overlap the
+  source ranges in general, so an in-place compaction needs either a full remap
+  table or an ordering argument that is fragile under any future change to the
+  traversal.
+
+**Lazy allocation of the standby arena.** At the 2M default a ping-pong pair is
+~140 MB of node payload, and a search that never applies a move — every test
+before this chunk, and the tablebase root bypass — has no use for the second
+half. `ensure_standby()` allocates on first use;
+`reuse_stats()["standby_allocated"]` reports whether it happened, so "what is
+reserved" is a measurement rather than a calculation from the config.
+
+**The high-water counter lives on the arena, and it travels with the storage
+across a swap.** It is reported as the max over BOTH arenas, because during a
+compaction the source subtree and its copy are alive simultaneously and that is
+the moment the memory budget is actually about. A counter that reported only the
+active arena would miss its own worst case by construction.
+
+## Breadth-first, and why the choice is free
+
+**Chosen: BFS. Each node's children are allocated as one contiguous block, so a
+child's new index is `offset + k` for the same `k` it had in the source.**
+
+There is no per-child remap table and therefore no per-child remap bug: the
+fixup is one number per parent. DFS would give the same guarantee, and
+correctness does not distinguish them — `dump_tree` and the golden comparison
+both traverse by `(offset, count)`.
+
+BFS was chosen for the next search rather than for this one. It lays whole depth
+levels out contiguously, so a descent walks forward through memory instead of
+jumping to wherever a DFS had finished the previous branch. Selection reads a
+whole sibling range per step, and BFS keeps consecutive steps' ranges near each
+other. This is an unmeasured locality argument; it is not load-bearing, and it is
+recorded as a preference rather than as a result.
+
+## `value_sum` is copied in the accumulator's own representation
+
+`set_value_raw`, not `set_value(value_sum(...))`. Under Q32 a round trip through
+`double` rounds twice, and the claim being made about a compacted tree is that it
+is bit-identical — a claim a lossy intermediate cannot support even on the runs
+where it happens to hold. The equivalence build uses the double accumulator,
+where the round trip *is* exact, which is precisely why this had to be decided on
+the argument rather than on the test result.
+
+## Assignment versus accumulation, and the bug that was already there
+
+`_expand_root` writes `root.visit_count = 1` and `root.value_sum = ...`. Until
+tree reuse existed, C5's `add_visits(root_, 1)` was indistinguishable from that:
+a fresh root came out of the arena cleared, so `+= 1` and `= 1` agreed.
+
+A PROMOTED root does not arrive cleared. In the `fifty-walk` game a node marked
+drawn by the fifty-move rule accumulates hundreds of visits through the terminal
+fast path and is then promoted; `+= 1` leaves the tree claiming the root had been
+searched that many times, and every Q above it is wrong from there on.
+
+**Chosen: `NodeArena::set_visits` / `set_value` as explicit assigning setters,
+used by `expand_root` and by the compaction.** Named for the distinction rather
+than folded into `add_*` with a flag, because the distinction is what the bug is
+made of. `tools/drill_c8_reuse.py`'s `expand-root-accumulates` drill is this
+mutation, and it is caught.
+
+## Withdrawing a terminal mark, and why the value stays behind
+
+`set_children` refuses a terminal node — that is C6's structural guarantee that
+"terminal and expanded" cannot be spelled. But a claimable draw *promoted to
+root* has to be expandable: the host declined the claim and we are playing on.
+
+**Chosen: `NodeArena::clear_terminal`, called from `expand_root` and only when
+the position has legal moves.** The reference does exactly this
+(`if root.children: root.is_terminal = False`), with the same guard, so a genuine
+checkmate or stalemate keeps its mark and its cached value.
+
+`terminal_value_` is deliberately NOT reset. The reference leaves it, and the
+tree serialisation writes the field whether or not the bit is set, so clearing it
+would put C++ one field away from the reference on every promoted draw. It is
+dead state on an unmarked node — but it has to be dead in the same way on both
+sides.
+
+**The state right after `apply_move` keeps the mark.** At that instant the mark
+is still true: the node is a game result and nobody has yet declined to claim it.
+The corpus contains 17 of these (all in `fifty-walk`), and the gate compares both
+halves of the sequence — marked and childless after the promotion, unmarked with
+children after the search that follows.
+
+## The promoted root's `move` field is cleared
+
+The reference's promoted node keeps `node.move`, and nothing reads it there: the
+depth-1 mate hack inspects children, and `walk_tree` writes 0 at depth 0
+regardless. C++ sets it to `kNoMove` so the arena says what every reader of it
+already believes, rather than relying on the reader to know. This is a divergence
+from the reference in an unobserved field, and it is recorded here because
+"unobserved" is a claim that could stop being true.
+
+## The repetition history had to become a list as well as a map
+
+`build_repetition_history(board)` is defined by a WALK: seed the root at 1, then
+pop `min(halfmove_clock, len(move_stack))` moves and count each position on the
+way back. The map C5 built from it has lost the order, and the halfmove-clock
+horizon is a rule about order — so `apply_move` cannot update the map, it has to
+rebuild it.
+
+**Chosen: keep `history_keys_`, the same walk-back as a vector, most recent
+first. `apply_move` pushes the old root onto the front and takes the prefix
+`min(halfmove_clock, size)`.**
+
+This is implementation-scope item 2 stated as an algorithm. The two partitions
+sum identically because:
+
+* a reversible move raises the clock by one and adds exactly one position, so the
+  window grows by one and the position entering it is exactly the old root;
+* a zeroing move drops the clock to zero and the window with it, which is correct
+  rather than lossy — nothing before a capture or a pawn push can ever repeat
+  again, so those occurrences must LEAVE the count rather than linger.
+
+**`set_position` was left counting its history verbatim rather than windowing
+it.** The two rules agree for every conforming caller (the contract is that the
+supplied history already IS the window), and C5/C6/C7 were certified against the
+verbatim form. Changing certified behaviour to gain nothing is not a trade.
+
+`rep_history()` is exposed to Python. Without it, item 2 is only observable as a
+threefold appearing or disappearing a hundred nodes deep in some tree — a
+bit-exactness failure with no attribution. The acceptance test re-derives the
+expected counter from the reference's own recorded position trail and compares it
+at all 190 seams.
+
+## The structural diff is engine behaviour, not a test fixture
+
+Scope 7 lists "ping-pong arena pointer fixup bugs" as a standing risk and
+"validate by full-tree structural diff against the pre-copy tree" as the
+mitigation. A mitigation that lives in the test suite is not a mitigation for
+anything that happens in production.
+
+**Chosen: `verify_copy` runs inside `apply_move`, before the swap, comparing the
+copy field-by-field against the source that is still sitting in the other arena.
+It is unconditional where asserts are on, and `SearchConfig.verify_compaction`
+turns it on in a Release build. It throws a named `TreeCorruption`.**
+
+Two things it checks that a field-by-field walk alone would not:
+
+* every destination slot is reached EXACTLY ONCE (a visited bitmap), and
+* the number of slots reached equals the number allocated.
+
+A `children_offset` that points at a plausible-looking but wrong block still
+traverses; it just traverses the wrong nodes, leaving some slots unreachable and
+others reachable twice. Neither shows up in a comparison that only follows the
+corrupted links.
+
+Cost is one extra O(nodes) pass, i.e. roughly what the compaction itself costs.
+BENCH.md prices it separately for exactly that reason.
+
+**`bitwise_equal` uses `std::memcmp`, not `==`.** `==` calls +0.0 and -0.0 equal
+and calls no NaN equal to itself, so a copy this function certified could still
+fail the golden comparison, which packs the bytes. `memcmp` on the objects also
+avoids a `reinterpret_cast` (Global Rule 6).
+
+## Ponder decay: the lever, not the setting
+
+**Chosen: `SearchConfig.ponder_decay`, default 1.0, applied only when the caller
+passes `apply_move(uci, from_ponder=True)`. Visits AND `value_sum` are scaled by
+the same ratio, so Q is unchanged.**
+
+The default has to be inert or Gate 1 across `apply_move` fails on ply 1 — which
+would be the correct outcome for a knob that changed the engine without being
+asked. `test_ponder_decay_defaults_to_a_no_op` checks it directly anyway, because
+"the gate would have caught it" is an argument and that is a measurement.
+
+**Why both fields move.** Decay is a statement about CONFIDENCE. Scope 8's reason
+for wanting it — 30k fresh simulations cannot redistribute against 64k+ inherited
+ones — is about weight, so a node the ponder search scored at +0.4 should still
+score +0.4, with less of the tree's attention nailed to it. Scaling visits alone
+divides every inherited Q by the decay factor and turns a quiet +0.4 into a
+winning +0.8 at d = 0.5. That is the opposite of the intent, and no test that
+only counted visits would see it.
+
+**A node with visits is floored at 1.** Letting it reach 0 would manufacture a
+node with children and no visits — FPU-eligible with an expanded subtree
+underneath it, a state the search never otherwise builds. Decay should change the
+tree's weight, not its kind.
+
+The parent-equals-one-plus-children-visits relation is NOT preserved by rounding.
+Nothing reads it, and preserving it exactly under a non-integer factor is not
+possible; recorded here so a future reader does not discover it as a surprise.
+
+**Scope 8 defers the ponder-decay QUESTION to post-port measurement.** This chunk
+provides the lever because the brief asks for it. No value below 1.0 is
+recommended, tested for quality, or shipped.
+
+## `_reset_virtual_loss` is deleted, and its absence is asserted
+
+The reference walks the whole tree writing `vloss_count = 0` before every search
+and every `get_policy` — 3.4 ms at 2k sims, 36 ms at 8k, 937 ms over a game
+(scope 2.3) — because nothing guaranteed a previous search had repaid what it
+applied. Here `run_simulation`'s `Unwind` destructor repays on every exit
+including an exception mid-descent, so there is nothing to reset, and a walk that
+found something to do would be hiding a bug.
+
+**Chosen: no production equivalent at all. A READ-ONLY audit,
+`debug_total_vloss()`, behind `GUOFISH_DEBUG_VL` — default ON for Debug builds,
+OFF otherwise, so the sanitized run carries it and the Release module does not
+contain the symbol.**
+
+It scans the arena flat rather than traversing the tree: a loss stranded on an
+UNREACHABLE node is exactly what a compaction bug could leave behind, and a
+traversal would not see it.
+
+**`guofish_core.DEBUG_VL`, not a `build_info()` key.** It belongs in that dict by
+subject, and `tests/test_c0b_contention.py` pins `build_info()`'s exact key set.
+Global Rule 1 makes that pin the specification, so the flag moved rather than the
+test. It is reported at all so that "the Release module contains no defensive
+walk" is a positive assertion rather than an inference from a missing attribute —
+which a typo would satisfy just as well.
+
+## `SearchBoard::commit()` — the new root is a floor
+
+`apply_move` plays a move that is never taken back, so the en-passant and
+halfmove-clock undo stacks are dropped. That says so structurally: a descent that
+tried to unmake past the new root now trips `unmake_move`'s assert instead of
+quietly restoring a pre-root clock, which is a state no simulation should be able
+to reach. It also stops the stacks growing one entry per ply for a game.
+
+## The corpus, and the two budgets in it
+
+`tools/gen_c8_reuse_golden.py` plays five games: 190 applied moves, 380
+snapshots, 92,382 dump entries.
+
+**The acceptance game runs at the Gate 1 budget and the rest do not, and the
+trade is stated rather than buried.** The chunk table calls C8 "Gate 1 across
+`apply_move`", and scope 5 specifies Gate 1 at N >= 5000, so `gate1-20` — the
+brief's 20-move sequence — runs at 5,000 unchanged. The other four run at 2,000.
+What they add is SEAMS: 170 more, across four tree shapes, two virtual-loss
+magnitudes and both path-dependent draw rules. What they would add at 5,000 is
+nothing that only appears at simulation 4,999, and the per-search machinery at
+that budget is already certified by C5/C6/C7 over 48 runs. At 2,000 the corpus is
+~25 minutes of reference time and a 12 MB dump; at 5,000 it is most of a day.
+`test_the_twenty_move_gate1_sequence_ran_at_the_gate1_budget` asserts the split
+against the manifest so a reader cannot mistake it for a relaxed gate.
+
+**One thing in the generator is a real difference from C5/C6, not a tidy-up.**
+`gen_gate1_golden.walk_tree` records a dump entry with `is_root = (depth == 0)`,
+which was correct when every run began with `_expand_root` on a fresh node. Under
+tree reuse it is not: at ply 5 the root is a node expanded as an INTERIOR leaf
+during the ply-4 search, so its priors are the CPU softmax. The two tables
+disagree by up to ~2e-9 (C5's finding), and filing CPU priors under the root key
+would hand C++ the wrong ones the first time a promoted root really is expanded
+as a root — which happens 13 times in this corpus. So the walk is given a
+recorder proxy that sets `is_root` from whether `_expand_root` was actually
+called on that node OBJECT. Identity against a held list, because `MCTSNode`
+declares `__slots__` without `__weakref__` and can be neither tagged nor
+weak-referenced.
+
+**Three things are recorded per snapshot, and the third is the one C8 needs:**
+the visited records (the bit-exactness surface, C5's layout unchanged), the FULL
+subtree node count (the arena's occupancy after a compaction is exactly this — a
+copy that dropped an unvisited child moves it and the records would not notice),
+and a SHA-256 over the full-tree DFS of (depth, move, children_count, terminal).
+The digest is the structural diff on the Python side of the boundary: visited
+records can agree while the layout under them is stitched out of the wrong
+siblings.
+
+## The mutation drill mutates the SOURCE, not the golden data
+
+C5's and C6's drills corrupt a golden `.npz`, which is the right shape when the
+thing under test is a comparison. C8's brief asks for something else: "manually
+corrupt a `children_offset` index in the alternate arena post-compaction". The
+subject is the C++ compaction, so corrupting a golden file would drill the wrong
+thing.
+
+`tools/drill_c8_reuse.py` Part A copies `cpp/` and `CMakeLists.txt` into a
+scratch directory, applies a one-line change, builds a separate module into
+`<scratch>/module`, and runs the acceptance suite's own comparison helpers
+against it with that directory ahead of everything on `sys.path`. `golden/` is
+not opened for writing and the repository's module is untouched. Part B is the
+classic form, on corrupted copies of the C8 golden files, because the suite also
+has to be able to see a reference that has moved.
+
+The `offset-off-by-one` drill is run TWICE — once with the engine's structural
+diff on, once with it off — so the two mitigations are shown to be independently
+sufficient rather than jointly assumed.
+
+## Global Rules
+
+**Rule 1 — no test modified.** One collision, and the test won:
+`tests/test_c0b_contention.py::test_build_info_is_self_consistent` pins
+`build_info()`'s key set, so `DEBUG_VL` became a module attribute. No file under
+`tests/` was edited.
+
+**Rule 2 — golden data from the Python reference only.**
+`tools/gen_c8_reuse_golden.py`, one run, provenance in the manifest. Nothing in
+`golden/` was produced from C++ output and no pre-existing golden file changed —
+digests below.
+
+**Rule 3 — every previous chunk's tests still pass.** Four full-suite runs:
+
+| toolchain | config | result |
+|---|---|---|
+| MSVC 19.51 | Release | 1086 passed, 49 skipped, 112 s |
+| MSVC 19.51 | Debug + ASan + asserts + `DEBUG_VL` | 1087 passed, 48 skipped, 903 s |
+| clang 18.1.3 | Debug + asserts + `DEBUG_VL` | 1082 passed, 49 skipped, 99 s |
+| clang 18.1.3 | Debug + ASan + UBSan + LSan | 1082 passed, 49 skipped, 266 s |
+
+The one-test difference between the Release and ASan columns is
+`test_the_tree_is_quiescent_at_every_seam`, which skips where `GUOFISH_DEBUG_VL`
+is off — as designed, and as `test_there_is_no_production_virtual_loss_reset`
+asserts. The Windows/Linux difference is the pre-existing platform split, not
+new.
+
+**Rule 4 — warning-clean.** `/W4` on MSVC, `-Wall -Wextra` on clang, both
+silent, no pragmas and no `-Wno-*`.
+
+**Rule 5 — ASan and asserts.** Both sanitized runs above are green. The clang run
+reports no non-leak sanitizer errors, no UBSan runtime errors, and no leaked
+allocation whose stack mentions `guofish_core` — which matters here more than
+usual, because this chunk is the first one that allocates a second 20 MB arena
+at runtime. The Debug configuration additionally turns `GUOFISH_DEBUG_VL` on, so
+the sanitized run is also the run that asserts the virtual-loss invariant.
+
+**Rule 6 — no `#pragma pack`, no new `reinterpret_cast`.** The one place that
+wanted type punning is `bitwise_equal`, which uses `std::memcmp`.
+
+**Rule 7 — no new dependencies.**
+
+**Rule 8 — both toolchains.** MSVC 19.51 and clang 18.1.3, Release and
+sanitized, all four green. No platform branch was needed.
+
+**Rule 9 — this entry.**
+
+**Rule 10 — reported plainly.** Three things worth saying out loud rather than
+leaving to be inferred:
+
+* the non-acceptance games run at 2,000 simulations rather than Gate 1's 5,000
+  (argued above, asserted in the suite by
+  `test_the_twenty_move_gate1_sequence_ran_at_the_gate1_budget`);
+* the 15k-simulation memory figure in BENCH.md is an extrapolation from a
+  measured nodes-per-simulation rate, not a measurement, and is labelled as one
+  in both places;
+* **scope §2.3's "a few ms" for the compaction is optimistic by 3–5x.** Measured
+  at 184,272 nodes copied: 4.6 ms for the copy, 12.7 ms with the structural
+  diff, which scales to ~15 ms and ~41 ms at the 600k nodes the estimate was
+  written for. It does not change the conclusion the estimate supported — that
+  is 1.5–4% of a one-second move, paid once — but the estimate should not be
+  quoted as if it had been measured, and Phase 5 should plan against the
+  measured number. BENCH.md carries the working.
+
+**Mutation drill (Amendment B).** `tools/drill_c8_reuse.py`, eight drills, all
+eight caught. Five mutate a scratch COPY of the C++ source and rebuild; three
+corrupt scratch copies of the golden files. The brief's own mutation — a
+remapped `children_offset` one slot low — is caught by the engine's structural
+diff, which names the node:
+
+```
+guofish: the compacted tree does not match the tree it was copied from
+  path   : e7a7 f8g8
+  detail : move f8g8 where the source has d2a2
+```
+
+and, with that diff disabled, by the acceptance suite's record comparison and
+full-tree shape digest independently. `golden/` digests were recorded before and
+after the run and are unchanged.
+
+**`golden/` digests, verified after the drill:**
+
+```
+1a3f77a2cb920bc4da5f043e4c02edf51aada7a31c12eb9702f21226b9025530  c8_reuse_dump.npz
+f3e99de72158ca539a218ad6523f9be8fee963079caf90b869631ee1abff2429  c8_reuse_manifest.json
+01f7f14cb67339789b61a9e498ef5a22c83ab0151ceb79ef416185fabb96a220  c8_reuse_trees.npz
+202a92dba58ced156ec5d8d24c773e3cecb861eee58944763d09c568abaf8f1a  gate1_cache_manifest.json
+b45008fd142d0bbca9081360e0b6ebf27c3592ed349251da0f2ed40975da3f40  gate1_cache_terminal_trees.npz
+3524dc56e1746dc401b86ca8ca399f4f450271560247ec822a157f8a4ea4c4e3  gate1_cache_trees.npz
+b0332e8f0adfd7b4f9112210342e004610d7d6215920fe5e9eb7cf609426256e  gate1_dump.npz
+e0b9c342555a1e280ab80efbb339467aaf88a8e9051fef01e23f28caf3ac6748  gate1_manifest.json
+8e2e1d34e7752e7116730017d8ee5a38c11f2fd39a08f85d397dc3c14532b9ac  gate1_terminal_dump.npz
+c08d8eb173bd2008c8a0c78b54b18575d870ec55c59ab6463514c049a6809f48  gate1_terminal_manifest.json
+b45008fd142d0bbca9081360e0b6ebf27c3592ed349251da0f2ed40975da3f40  gate1_terminal_trees.npz
+aec5135e0a82f0f5baa1ef4cf39a5372090946bc40b940c83fe255371e357440  gate1_trees.npz
+a901750f28aa37490ac96c2d1a321e80ad50a175f1eaa5010820b519642ca504  keys.jsonl
+b0a91bc7e4e1a0f598a2577ad8b331bd6d9e46dac610d51e46f267e55c3e96fc  keys_adversarial.jsonl
+1754e3aab46825f6c0289a9a7b26dd0ca6ead4a58bc0d287a886e1b0de6151a2  movegen.jsonl
+ea9bf8dfe40196460b6c2d4a0c47217d64998193eb1b4a9f7bb2697b413ce562  tokens.npz
+```
+
+Every pre-C8 digest is identical to the one recorded in the C7 entry. The three
+new files are this chunk's.
