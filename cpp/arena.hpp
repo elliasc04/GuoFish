@@ -880,6 +880,59 @@ public:
                         std::memory_order_release);
     }
 
+    // C9. Record a game result on a node this thread has ALREADY claimed.
+    //
+    // `mark_terminal` above is a load, a plain store to `terminal_value_` and a
+    // release store, which is exactly right for one thread and a data race for
+    // two: W workers can reach the same first-visit terminal leaf at the same
+    // instant and both write the same float, which is benign in practice,
+    // undefined behaviour in the standard, and a ThreadSanitizer report either
+    // way. The fix is not a lock — it is to notice that the PENDING claim the
+    // parallel descent already takes before evaluating a leaf is exactly the
+    // exclusivity this needs.
+    //
+    // So this is the terminal-marking half of that claim: the caller holds
+    // PENDING, writes the value, and publishes Unexpanded|TERMINAL in one
+    // release store. Unexpanded, not Pending, because the claim is over — and
+    // TERMINAL beside it rather than instead of it, which is the C6 invariant
+    // this arena exists to make unrepresentable in the first place.
+    void mark_terminal_pending(std::uint32_t i, float value) {
+        check(i);
+        const std::uint8_t current = state_[i].load(std::memory_order_acquire);
+        if (lifecycle_of(current) != NodeState::Pending) {
+            throw std::logic_error("guofish::NodeArena::mark_terminal_pending: node " +
+                                   std::to_string(i) + " is not pending (state " +
+                                   std::to_string(current) + ")");
+        }
+        if (children_count_[i] != 0) {
+            throw std::logic_error("guofish::NodeArena::mark_terminal_pending: node " +
+                                   std::to_string(i) +
+                                   " already has children and cannot be terminal");
+        }
+        terminal_value_[i] = value;
+        state_[i].store(static_cast<std::uint8_t>(
+                            static_cast<std::uint8_t>(NodeState::Unexpanded) | kTerminalBit),
+                        std::memory_order_release);
+    }
+
+    // C9. Claim and mark in one call, for the caller that did not already hold
+    // the node — the claimable-draw case, where the descent discovers a
+    // fifty-move or threefold draw at a node it was only passing through.
+    //
+    // Returns false if someone else got there first. That is not an error and
+    // the caller does not retry: within one search, `draw_by_rule` is a function
+    // of the node (its path from the root is unique and the repetition history
+    // is fixed for the search), so a second thread that reaches the same node
+    // computes the same answer and is marking the same value. The loser simply
+    // backs up the draw it independently derived.
+    bool try_mark_terminal(std::uint32_t i, float value) {
+        if (!try_claim_pending(i)) {
+            return false;
+        }
+        mark_terminal_pending(i, value);
+        return true;
+    }
+
     // C8. Withdraw a terminal mark. THE ONLY LEGITIMATE CALLER IS ROOT
     // PROMOTION, and the reason is a rule of chess rather than a convenience.
     //

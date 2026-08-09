@@ -117,6 +117,7 @@
 #include "cache.hpp"
 #include "keys.hpp"
 #include "movegen.hpp"
+#include "parallel.hpp"
 #include "tablebase.hpp"
 #include "terminal.hpp"
 #include "tokens.hpp"
@@ -124,17 +125,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -780,6 +786,182 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// C9 — the stand-in evaluator, and why one is needed at all
+//
+// THIS IS NOT GOLDEN DATA AND NOTHING COMPARED AGAINST PYTHON MAY USE IT.
+//
+// The Gate 1 dump contains exactly the positions the SERIAL Python reference
+// evaluated. That is what makes a dump miss the strongest test in C5: the search
+// can only stay inside the dump if it walks the same tree, so a miss proves a
+// divergence. C9 breaks the premise. With K in-flight paths, virtual loss steers
+// descents onto branches the serial reference never opened — that is the entire
+// mechanism of leaf parallelism, and it is working correctly when it happens.
+// Measured: at W=1, K=8 the first miss arrives five plies in.
+//
+// So the acceptance layers split, and the split is the honest one:
+//
+//   layer 1  W=1, K=1. Explores exactly the serial tree, stays inside the dump,
+//            and is compared bit-for-bit against the Python trees. The fallback
+//            is OFF and `synthetic_evaluations` is asserted to be 0 — which is
+//            what keeps the dump-miss test's teeth.
+//   layers 2 and 3  W>=1, K>1. These assert REPRODUCIBILITY and CONSERVATION,
+//            not agreement with Python: bit-identical trees across two runs of
+//            the same configuration, exact virtual-loss return to zero, exact
+//            subtree visit sums, delivered sims equal to the budget. None of
+//            those is a claim about what the network said, so an evaluator that
+//            is merely deterministic and position-keyed serves them exactly.
+//            Real dump entries are still used wherever they exist; this fills
+//            only the holes, and the count of holes is reported.
+//
+// The alternative — regenerating a dump wide enough to cover every position a
+// parallel search might reach — is not available: the set depends on the
+// scheduling of the run being tested, so producing it would mean running the
+// implementation under test to decide what the reference should contain. That
+// is circular in exactly the way Global Rule 2 exists to prevent.
+//
+// The requirements on the stand-in are three, and only the first is obvious:
+//
+//   1. DETERMINISTIC per position. The same position must always produce the
+//      same value and the same priors, or the transposition cache and the tree
+//      would disagree with each other and a "reproducibility" test would be
+//      measuring the evaluator.
+//   2. A well-formed distribution over the move list the search generated.
+//   3. SMOOTH ACROSS POSITIONS — and this one is not optional, it is what makes
+//      layer 3's root-stability criterion measurable at all.
+//
+// The first version of this hashed the nn_key into a value, which satisfies (1)
+// and (2) and violates (3) completely: two positions one move apart get
+// uncorrelated values. A real network does not behave that way, and the
+// difference is not cosmetic. Two parallel runs open slightly different
+// branches, so under a hashing evaluator they draw different random numbers and
+// the root distribution moves for a reason that has nothing to do with
+// concurrency. Measured, over 8 runs per cell at W=4/K=8:
+//
+//   position  stand-in share of expansions   worst pairwise root TV distance
+//   0                             2.3%                                 5.9%
+//   4                            11.1%                                 9.9%
+//   5                            49.4%                                50.2%
+//   5                            72.0%                                77.2%
+//
+// The spread tracks the stand-in's SHARE, not the simulation count — which is
+// the signature of the evaluator driving it rather than the engine.
+//
+// So the stand-in is a chess evaluation instead: material with a small
+// positional term, and priors that prefer captures by victim value. It is a weak
+// evaluator and it is not meant to be a good one. What it is, is CONTINUOUS in
+// the way a network is — two positions one move apart differ by at most one
+// captured piece, so their values are close — which is the property that makes
+// "the root distribution barely moves between two runs" a statement about the
+// search rather than about the noise.
+class SyntheticEvaluator {
+public:
+    // Splitmix64's finaliser, used ONLY as a tiny tie-break below. It is not the
+    // evaluation; see the class comment for why that matters.
+    static std::uint64_t mix(std::uint64_t x) noexcept {
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    }
+
+    // A double in [0, 1) from the top 53 bits: the division is by a power of
+    // two, so it introduces no rounding of its own.
+    static double unit(std::uint64_t bits) noexcept {
+        return static_cast<double>(bits >> 11) * 0x1.0p-53;
+    }
+
+    // Centipawn-ish weights, indexed by the token encoding cpp/tokens.hpp uses:
+    // 1..6 is White pawn..king, 7..12 is Black pawn..king, 0 is empty. The king
+    // is 0 because both sides always have exactly one and it would cancel.
+    static double piece_value(std::int32_t token) noexcept {
+        switch (token) {
+            case 1: case 7: return 1.0;    // pawn
+            case 2: case 8: return 3.0;    // knight
+            case 3: case 9: return 3.2;    // bishop
+            case 4: case 10: return 5.0;   // rook
+            case 5: case 11: return 9.0;   // queen
+            default: return 0.0;           // king, empty
+        }
+    }
+
+    // The absolute (White-POV) value in (-1, 1), from material plus a small
+    // centralisation term.
+    //
+    // `tanh` rather than a clamp so the function is smooth everywhere: a clamp
+    // would make every position past the cut-off score identically, and a search
+    // cannot distinguish two positions it scores the same.
+    static double value_of(const ParsedFen &parsed) noexcept {
+        double material = 0.0;
+        double centre = 0.0;
+        for (int square = 0; square < 64; ++square) {
+            const std::int32_t token = parsed.placement.square_token[square];
+            if (token == kTokenEmpty || token == 0) {
+                continue;
+            }
+            const double value = piece_value(token);
+            const bool white = token <= 6;
+            material += white ? value : -value;
+            // Distance from the centre of the board, in files and ranks. Small
+            // enough not to swamp material, large enough that two positions with
+            // identical material are not identically scored.
+            const int file = square & 7;
+            const int rank = square >> 3;
+            const double dx = 3.5 - static_cast<double>(file < 4 ? 3 - file : file - 4);
+            const double dy = 3.5 - static_cast<double>(rank < 4 ? 3 - rank : rank - 4);
+            const double bonus = 0.01 * (dx + dy);
+            centre += white ? bonus : -bonus;
+        }
+        return std::tanh((material + centre) / 4.0);
+    }
+
+    // Fill `priors` over `moves`, for the position `parsed`.
+    //
+    // Captures score by the victim's value, promotions by the promoted piece's,
+    // and everything else scores 0 — then a softmax. The key-derived jitter is
+    // ~1% of a pawn and exists only to break exact ties: without it every quiet
+    // move in a position gets the identical prior, PUCT resolves the tie by child
+    // order, and the search fans out in a shape no real policy produces.
+    void evaluate(NNKey key, const ParsedFen &parsed, const std::uint16_t *moves,
+                  std::size_t count, std::vector<float> &priors) const {
+        priors.resize(count);
+        double best = -1e30;
+        scores_.resize(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const int to = move_to(moves[i]);
+            double score = piece_value(parsed.placement.square_token[to]);
+            switch (move_promotion(moves[i])) {
+                case Promotion::Queen: score += 8.0; break;
+                case Promotion::Rook: score += 4.0; break;
+                case Promotion::Bishop: score += 2.2; break;
+                case Promotion::Knight: score += 2.0; break;
+                case Promotion::None: break;
+            }
+            score += 0.01 * unit(mix(key.value ^ (static_cast<std::uint64_t>(moves[i]) *
+                                                  0x9E3779B97F4A7C15ULL)));
+            scores_[i] = score;
+            best = score > best ? score : best;
+        }
+        double total = 0.0;
+        for (std::size_t i = 0; i < count; ++i) {
+            // Shifted by the maximum before exponentiating, which is the
+            // standard guard against overflow and is what ATen does too.
+            const double weight = std::exp((scores_[i] - best) / 2.0);
+            scores_[i] = weight;
+            total += weight;
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+            priors[i] = static_cast<float>(scores_[i] / total);
+        }
+    }
+
+private:
+    // Scratch. Only ever touched on the thread that expands, which is the
+    // dispatcher in a parallel search and the caller in a serial one, because
+    // expansion is single-threaded by construction.
+    mutable std::vector<double> scores_;
+};
+
+// ---------------------------------------------------------------------------
 // Statistics
 //
 // The C6 counters are not decoration. The Gate 1 corpus is *measured* rather
@@ -827,6 +1009,13 @@ struct SearchStats {
     // when a run reports no overrides.
     std::int64_t tablebase_probes = 0;
     std::int64_t tablebase_overrides = 0;
+
+    // C9. Leaves the replay dump did not contain, answered by the stand-in
+    // evaluator instead. MUST BE ZERO for anything compared against Python —
+    // see SyntheticEvaluator for why it exists and what it is not. The counter
+    // is the whole safeguard: without it, "the fallback was off" is an assertion
+    // about a flag, and with it, it is an assertion about what happened.
+    std::int64_t synthetic_evaluations = 0;
 };
 
 // C8. Counters for the tree-reuse seam. Not part of SearchStats because they do
@@ -874,6 +1063,114 @@ struct TerminalNode {
 };
 
 // ---------------------------------------------------------------------------
+// C9 — the parallel search's configuration
+//
+// W AND K ARE NOT INHERITED FROM PYTHON, AND THE REASON IS ARITHMETIC.
+// The reference ran 32 workers because it was GIL-bound: a worker spent almost
+// all of its life blocked on `request.event.wait()`, so oversubscribing 16
+// hardware threads 2:1 cost nothing. C++ search threads actually run. Thirty-two
+// of them on this machine would mean real context switching with VIRTUAL LOSS
+// HELD ACROSS PREEMPTION by descheduled threads, which inflates in-flight VL
+// exposure and flattens the root visit distribution — the exact distortion the
+// chunk is trying to bound.
+//
+// The defaults below come from the measured curves, both of them:
+//
+//   * the GPU knee (tools/bench_c9_knee.py, BENCH.md C9): per-batch cost is FLAT
+//     at ~3.8-4.0 ms from batch 8 to batch 64 and then rises linearly, because
+//     below batch 128 the forward pass is bound by HOST-side ATen dispatch
+//     (~17-34 us per op on this machine, ~110 ops per forward), not by the GPU.
+//     So evals/s rises almost proportionally with batch size up to 64, reaches
+//     ~18k at 128 and stops. Small batches are actively expensive here — batch
+//     32 buys only ~8.4k evals/s — which is the opposite of what the "minimise
+//     outstanding" reading of the older curve suggested.
+//   * the CPU descent rate (C5, BENCH.md): 178k sims/s single-threaded. One
+//     thread can nearly saturate the GPU by itself, so W is small.
+//
+// `max_batch` therefore defaults to the knee (128) and `workers * in_flight`
+// defaults to 32 — the brief's default, which the W x K grid in BENCH.md is the
+// evidence for or against. Throughput is not the only axis: a configuration 10%
+// faster and visibly flatter at the root is the wrong trade, and the grid
+// reports both.
+// ---------------------------------------------------------------------------
+
+struct ParallelConfig {
+    int workers = 4;                 // W
+    int in_flight = 8;               // K, per worker
+    std::size_t max_batch = 128;     // the dispatcher never drains more at once
+    AffinityPolicy affinity = AffinityPolicy::PCorePhysical;
+    // Record every batch size and every outstanding-leaf count at drain time.
+    // On by default: scope 6.2 asks for the outstanding-leaf histogram and the
+    // saturated-vs-starved regime label as first-class instrumentation, and a
+    // few thousand int64s per search is not a cost worth a flag being off.
+    bool collect_histograms = true;
+
+    int max_outstanding() const noexcept { return workers * in_flight; }
+};
+
+// C9 counters. Deliberately NOT part of SearchStats: these describe the
+// machinery that ran the simulations, not the simulations, and every one of
+// them is identically zero for a serial search.
+struct ParallelStats {
+    std::int64_t requested = 0;          // simulations asked for
+    std::int64_t delivered = 0;          // simulations backed up into the root
+    std::int64_t queued_leaves = 0;      // leaves that went through the queue
+    std::int64_t worker_terminals = 0;   // leaves resolved on a worker, never queued
+    std::int64_t select_collisions = 0;  // descents discarded on a lost PENDING CAS
+    std::int64_t batches = 0;
+    std::int64_t largest_batch = 0;
+    std::int64_t worker_waits = 0;       // times a worker had to wait for a drain
+    std::int64_t hook_wait_ns = 0;       // total time the batch hook spent waiting
+    std::int64_t wall_ns = 0;
+    int workers = 0;
+    int in_flight = 0;
+    std::int64_t max_outstanding = 0;
+    // Which logical processors the workers were pinned to, in worker order.
+    // Empty means no pinning happened — see Topology::source for why.
+    std::vector<int> pinned_cpus;
+    std::string affinity = "none";
+    // scope 6.2's histograms.
+    std::vector<std::int64_t> batch_sizes;
+    std::vector<std::int64_t> outstanding_at_drain;
+    // The batch hook's wait, per batch, in nanoseconds. Empty unless a hook is
+    // installed; under the GIL probe this is the acquisition-latency histogram
+    // the C9 brief asks for.
+    std::vector<std::int64_t> hook_wait_ns_samples;
+};
+
+// The exact conservation invariants acceptance layer 3 is made of.
+//
+// These are ASSERTIONS ABOUT INTEGERS, with no epsilon anywhere, and that is
+// only possible because C9 moves value_sum to the Q32 `atomic<int64>`
+// accumulator and virtual loss is an integer COUNT. Under a floating-point
+// accumulator "the subtree sums match" would be a statement about rounding; here
+// it is a statement about arithmetic.
+//
+// The visit invariant is exact and worth stating precisely: for every EXPANDED
+// node, `visits == 1 + sum(visits of children)`. The 1 is the simulation that
+// expanded it. Nothing else can stop at an expanded node — the descent loop only
+// exits at a node that is unexpanded, terminal or depth-capped, and a
+// depth-capped node is at MAX_TREE_DEPTH and is therefore never expanded.
+struct TreeAudit {
+    std::int64_t nodes = 0;
+    std::int64_t expanded_nodes = 0;
+    std::int64_t visited_nodes = 0;
+    // Virtual loss, summed by a FLAT SCAN of the arena rather than a traversal:
+    // a loss stranded on a node that is no longer reachable is precisely the
+    // kind this is looking for, and a traversal would not see it.
+    std::int64_t vloss_total = 0;
+    std::int64_t vloss_nonzero_nodes = 0;
+    std::int64_t conservation_failures = 0;
+    // The first failure, in arena order, so a report can name a node rather
+    // than a count.
+    std::int64_t first_bad_node = -1;
+    std::int64_t first_bad_expected = 0;
+    std::int64_t first_bad_actual = 0;
+    std::int64_t root_visits = 0;
+    std::int64_t root_children_visits = 0;  // sum over the root's children
+};
+
+// ---------------------------------------------------------------------------
 // The search
 // ---------------------------------------------------------------------------
 
@@ -894,10 +1191,23 @@ public:
         if (config.cache_slots != 0) {
             cache_.emplace(config.cache_slots, config.cache_shards);
         }
+        // The serial descent drives the SEARCH's board, not a copy: apply_move,
+        // terminal_nodes and root_fen all read it after search() returns, and a
+        // descent that unwound a copy would leave the real one behind.
+        serial_.board = &board_;
+        serial_.stats = &stats_;
     }
 
     ReplayDump &dump() noexcept { return dump_; }
     const ReplayDump &dump() const noexcept { return dump_; }
+
+    // C9. Answer a dump miss with the deterministic stand-in evaluator instead
+    // of throwing. OFF BY DEFAULT, and nothing compared against Python may turn
+    // it on. See SyntheticEvaluator; `SearchStats::synthetic_evaluations` counts
+    // every leaf it answered, so "the fallback was off" is checkable after the
+    // fact rather than only before it.
+    void set_synthetic_fallback(bool on) noexcept { synthetic_fallback_ = on; }
+    bool synthetic_fallback() const noexcept { return synthetic_fallback_; }
     const SearchConfig &config() const noexcept { return config_; }
     const SearchStats &stats() const noexcept { return stats_; }
     const NodeArena<Accumulator> &arena() const noexcept { return arena_; }
@@ -953,7 +1263,9 @@ public:
     const TablebaseProber *tablebase() const noexcept { return tablebase_; }
 
     // The move the depth-1 hack seized on, packed; kNoMove when it did not fire.
-    std::uint16_t mating_move() const noexcept { return mating_move_; }
+    std::uint16_t mating_move() const noexcept {
+        return mating_move_.load(std::memory_order_relaxed);
+    }
 
     double c_puct_of(double parent_visits) const noexcept {
         double c = guofish::c_puct(parent_visits, config_.c_init, config_.c_base);
@@ -1051,12 +1363,167 @@ public:
             // MCTSWorker._work_loop checks completion_event at the TOP of the
             // loop, so the simulation that set it is counted and the next one
             // never starts.
-            if (mating_move_ != kNoMove) {
+            if (mating_move_.load(std::memory_order_relaxed) != kNoMove) {
                 break;
             }
-            run_simulation();
+            run_simulation(serial_);
         }
         return stats_;
+    }
+
+    // ---- C9: W workers, K in flight each ----------------------------------
+
+    // Run `num_simulations` the way production will: W search threads that
+    // never block on evaluation, an MPSC leaf queue, and one dispatcher that
+    // expands what they submit.
+    //
+    // THE THREE THINGS THIS CHANGES ABOUT A SIMULATION, and nothing else:
+    //
+    //  1. A worker that reaches an unexpanded leaf does not evaluate it. It
+    //     CASes the node from Unexpanded to PENDING, hands the leaf to the
+    //     queue *with its virtual loss still applied*, and starts the next
+    //     simulation immediately. Scope 2.2: search threads never block on
+    //     evaluation. The virtual loss is what keeps the next descent off the
+    //     same branch, and it is repaid by whoever backs the leaf up.
+    //  2. A worker that LOSES that CAS has descended into a path another
+    //     simulation already owns. It unwinds its own virtual loss, discards
+    //     the simulation, and retries — counted as `select_collisions`, which
+    //     scope 2.2 names as the VL-too-low signal.
+    //  3. Expansion happens on the dispatcher and only there, so the arena's
+    //     bump allocator has one writer and `set_children` has one caller per
+    //     node. Everything else — selection, the draw rules, terminal
+    //     classification, backup — runs on the workers, lock-free, against the
+    //     same atomics C4 built for it.
+    //
+    // WHEN THE DISPATCHER DRAINS, which is the one design decision here that a
+    // reader should not have to reverse-engineer.
+    //
+    // The brief requires the drain to be `min(available, max_batch)` with no
+    // minimum-batch floor and no straggler timeout — both of the Python
+    // collector's measured pathologies — and it separately requires W=1, K=8 to
+    // produce BIT-IDENTICAL trees across two runs. Those two requirements
+    // interact: a dispatcher that drains the instant a leaf appears makes the
+    // handoff point a function of thread scheduling, and at W=1 that changes
+    // whether simulation N+1 sees an expanded node or a virtual loss. The tree
+    // then differs run to run for a reason that is not a bug, and the only clean
+    // test of the in-flight machinery is lost.
+    //
+    // So the drain TRIGGER is "the queue is non-empty and no search thread can
+    // currently make progress" — every worker is either throttled, waiting after
+    // a collision, or finished. This is not a minimum-batch floor: the drain
+    // takes whatever is there, which at W=1/K=8/VL=0 is a single leaf, because
+    // at zero virtual loss the second descent re-selects the first descent's
+    // leaf, collides, and waits. And it is not a timeout: there is no clock
+    // anywhere in the dispatcher. Batch size is set by the outstanding-leaf
+    // count, which is what scope 2.2 asks for. See DECISIONS.md, C9.
+    //
+    // `pc.workers == 1 && pc.in_flight == 1` is the acceptance-layer-1 case and
+    // still runs through all of this machinery — the queue, the dispatcher, the
+    // PENDING CAS — rather than falling back to `search()`. A fallback would
+    // make layer 1 a test of code layer 3 does not use.
+    SearchStats search_parallel(int num_simulations, const ParallelConfig &pc) {
+        require_position();
+        if (dump_.empty()) {
+            throw std::logic_error("guofish::ReplaySearch::search_parallel: no replay dump loaded");
+        }
+        if (pc.workers < 1) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch::search_parallel: workers must be >= 1");
+        }
+        if (pc.in_flight < 1) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch::search_parallel: in_flight must be >= 1");
+        }
+        if (pc.max_batch < 1) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch::search_parallel: max_batch must be >= 1");
+        }
+
+        mating_move_.store(kNoMove, std::memory_order_relaxed);
+        if (!root_expanded_) {
+            expand_root();
+        }
+
+        par_ = ParallelStats{};
+        par_.workers = pc.workers;
+        par_.in_flight = pc.in_flight;
+        par_.max_outstanding = pc.max_outstanding();
+        par_.affinity = affinity_policy_name(pc.affinity);
+
+        const int existing = arena_.visit_count(root_);
+        target_ = num_simulations - existing;
+        par_.requested = target_ > 0 ? target_ : 0;
+        if (target_ <= 0) {
+            return stats_;
+        }
+
+        run_workers(pc);
+        return stats_;
+    }
+
+    const ParallelStats &parallel_stats() const noexcept { return par_; }
+
+    // Install a per-batch hook on the dispatcher, or clear it with nullptr.
+    // Borrowed, not owned. See BatchHook in cpp/parallel.hpp: the only
+    // implementation is the GIL probe, which exists to test scope 2.1's
+    // prediction on the real C9 thread topology.
+    void set_batch_hook(BatchHook *hook) noexcept { hook_ = hook; }
+
+    // The topology this build can see, whatever it is. Reported rather than
+    // assumed so a benchmark table can say what it ran on and a machine that
+    // does not report a hybrid split says so instead of pretending.
+    static const Topology &topology() {
+        static const Topology topo = detect_topology();
+        return topo;
+    }
+
+    // The exact conservation invariants. See TreeAudit.
+    //
+    // O(nodes) over the arena, so this is a test and instrumentation entry
+    // point, not something a search calls. It is exposed rather than asserted
+    // internally because acceptance layer 3 has to be able to REPORT the
+    // failure, and an assert that fires inside a worker thread reports a
+    // process abort.
+    TreeAudit audit() const {
+        require_position();
+        TreeAudit out;
+        out.nodes = static_cast<std::int64_t>(arena_.size());
+        for (std::size_t i = 0; i < arena_.size(); ++i) {
+            const auto node = static_cast<std::uint32_t>(i);
+            const std::int32_t vloss = arena_.vloss_count(node);
+            out.vloss_total += vloss;
+            if (vloss != 0) {
+                ++out.vloss_nonzero_nodes;
+            }
+            if (arena_.visit_count(node) > 0) {
+                ++out.visited_nodes;
+            }
+            const std::uint16_t count = arena_.children_count(node);
+            if (arena_.lifecycle(node) != NodeState::Expanded || count == 0) {
+                continue;
+            }
+            ++out.expanded_nodes;
+            std::int64_t sum = 0;
+            const std::uint32_t first = arena_.children_offset(node);
+            for (std::uint16_t k = 0; k < count; ++k) {
+                sum += arena_.visit_count(first + static_cast<std::uint32_t>(k));
+            }
+            if (node == root_) {
+                out.root_children_visits = sum;
+                out.root_visits = arena_.visit_count(node);
+            }
+            const std::int64_t expected = sum + 1;
+            const std::int64_t actual = arena_.visit_count(node);
+            if (expected != actual) {
+                ++out.conservation_failures;
+                if (out.first_bad_node < 0) {
+                    out.first_bad_node = static_cast<std::int64_t>(node);
+                    out.first_bad_expected = expected;
+                    out.first_bad_actual = actual;
+                }
+            }
+        }
+        return out;
     }
 
     // ---- C8: the seam between moves ---------------------------------------
@@ -1270,8 +1737,9 @@ public:
     // the same tie-break.
     std::uint16_t best_move() const {
         require_position();
-        if (mating_move_ != kNoMove) {
-            return mating_move_;
+        const std::uint16_t mate = mating_move_.load(std::memory_order_relaxed);
+        if (mate != kNoMove) {
+            return mate;
         }
         const std::uint16_t count = arena_.children_count(root_);
         if (count == 0) {
@@ -1373,6 +1841,105 @@ public:
     }
 
 private:
+    // One step of a descent. The raw library move is what unwinds the board;
+    // the arena index is what names the move in a diagnostic; the key, the
+    // occupancy and the irreversibility flag are what the two repetition rules
+    // read. Kept together so they can never fall out of step.
+    struct PathStep {
+        std::uint16_t raw_move;
+        std::uint32_t node;
+        std::uint64_t rep_key;
+        Bitboard occupied;
+        // `is_irreversible(move)` for the move that REACHED this position,
+        // evaluated on the position it was played from — which is python-chess's
+        // own evaluation point, after the pop.
+        bool irreversible_before;
+    };
+
+    // C9. EVERYTHING ONE SIMULATION MUTATES, IN ONE OBJECT.
+    //
+    // Through C8 these were plain members of the search: one board, one path,
+    // one applied-virtual-loss list, one scratch move buffer, because there was
+    // one descent at a time. C9 runs W of them at once, so the state has to be
+    // per-thread — and the honest way to make that true is to move it into a
+    // struct rather than to add a lock, because a lock around the descent would
+    // delete the entire point of the chunk.
+    //
+    // The serial path is not a special case of the parallel one and is not
+    // reimplemented for it: `search()` builds ONE Descent pointing at the
+    // search's own board and its own SearchStats, and runs exactly the code
+    // C5-C8 were certified on. Acceptance layer 1 (W=1, K=1 still bit-exact
+    // against Gate 1) is therefore a test of this refactor, and it is the first
+    // thing that would fail if the split were wrong.
+    //
+    // `board` is a POINTER because the serial descent must drive the search's
+    // own board — `apply_move`, `terminal_nodes` and `root_fen` all read it
+    // afterwards — while a worker drives its own copy, positioned at the root
+    // and returned there by the RAII unwind at the end of every simulation.
+    struct Descent {
+        SearchBoard own_board;              // a worker's copy; unused when serial
+        SearchBoard *board = nullptr;
+        SearchStats *stats = nullptr;
+
+        std::vector<std::uint32_t> applied;   // nodes carrying this descent's VL
+        std::vector<PathStep> path;
+        // The same path as NORMALISED PACKED MOVES. Kept alongside `path`
+        // rather than derived from it on demand because a failure message needs
+        // it after the descent has been handed off to another thread, at which
+        // point the arena indices in `path` are still valid but the board that
+        // could interpret them is halfway back up the tree.
+        std::vector<std::uint16_t> path_moves;
+        // `path_counts` in the reference: rep_key -> occurrences on THIS path.
+        // A flat vector rather than a hash map — the path is at most
+        // MAX_TREE_DEPTH long, the scan is linear over a contiguous 12-byte
+        // record, and clearing a vector between simulations does not touch the
+        // allocator.
+        std::vector<std::pair<std::uint64_t, int>> path_counts;
+
+        // Scratch for the leaf's legal moves, reused across simulations.
+        std::vector<std::uint16_t> packed;
+        std::vector<std::uint16_t> raw;
+    };
+
+    // Where a descent was standing, in the terms a failure message needs, and
+    // WITHOUT a board.
+    //
+    // C5-C8 built these strings from `board_` at the point of failure, which
+    // worked because the board was still at the leaf. Under C9 the leaf is
+    // evaluated on the dispatcher, which has no board at all and could not be
+    // given one cheaply — so the four things a diagnostic actually needs travel
+    // with the leaf instead. `fen_of(parsed, clock, fullmove)` reproduces
+    // `SearchBoard::diagnostic_fen()` exactly, by construction: that function is
+    // the same call on the same ParsedFen.
+    struct LeafDiag {
+        const ParsedFen *parsed;
+        int halfmove_clock;
+        int fullmove_number;
+        const std::uint16_t *path_moves;
+        std::size_t path_len;
+    };
+
+    static std::string diag_fen(const LeafDiag &diag) {
+        return fen_of(*diag.parsed, diag.halfmove_clock, diag.fullmove_number);
+    }
+
+    static std::string diag_path(const LeafDiag &diag) {
+        if (diag.path_len == 0) {
+            return "(root)";
+        }
+        return uci_list(diag.path_moves, diag.path_len);
+    }
+
+    // `parsed` is passed in rather than read off the board because the descent
+    // is already holding it — one ParsedFen build per step, not three (see
+    // run_simulation) — and rebuilding it here to make a diagnostic would be a
+    // second derivation of the very thing the diagnostic is about.
+    static LeafDiag diag_of(const Descent &d, const ParsedFen &parsed) {
+        return LeafDiag{&parsed, d.board->halfmove_clock(),
+                        static_cast<int>(d.board->board().fullMoveNumber()),
+                        d.path_moves.data(), d.path_moves.size()};
+    }
+
     void require_position() const {
         if (root_ == kNoNode) {
             throw std::logic_error("guofish::ReplaySearch: no position set");
@@ -1420,15 +1987,30 @@ private:
     // which is the obvious implementation — would leave a residue at VL 2.5 and
     // put Gate 1 out of reach on the run that matters most.
 
-    void apply_vloss(std::uint32_t node) {
+    void apply_vloss(Descent &d, std::uint32_t node) {
         arena_.add_vloss(node, 1);
-        applied_.push_back(node);
+        d.applied.push_back(node);
     }
 
-    void repay() {
-        while (!applied_.empty()) {
-            arena_.add_vloss(applied_.back(), -1);
-            applied_.pop_back();
+    void repay(Descent &d) {
+        while (!d.applied.empty()) {
+            arena_.add_vloss(d.applied.back(), -1);
+            d.applied.pop_back();
+        }
+    }
+
+    // C9. Repay a path that was handed to the dispatcher rather than resolved
+    // in place. Same arithmetic, different owner: the list arrived with the
+    // leaf, and the thread repaying it is not the thread that applied it.
+    //
+    // The counts are integers and `add_vloss` is a `fetch_add`, so apply and
+    // repay commute with every other thread's apply and repay and the total
+    // returns to exactly zero at quiescence regardless of interleaving. That is
+    // the property acceptance layer 3 asserts, and it is the reason virtual
+    // loss is a COUNT here and not a magnitude added into value_sum.
+    void repay_list(const std::vector<std::uint32_t> &applied) {
+        for (std::size_t i = applied.size(); i-- > 0;) {
+            arena_.add_vloss(applied[i], -1);
         }
     }
 
@@ -1463,7 +2045,7 @@ private:
     //   * the strict `>`. Ties go to the FIRST child in iteration order, and
     //     ~1% of selection steps are exact ties. This is why child order has to
     //     be canonical on both sides — see scope 2.6.
-    std::uint32_t select_child(std::uint32_t parent, bool at_root) {
+    std::uint32_t select_child(Descent &d, std::uint32_t parent, bool at_root) {
         const double parent_visits = effective_visits(parent);
         const double c = c_puct_of(parent_visits);
         const double sqrt_parent_visits = std::sqrt(parent_visits);
@@ -1496,7 +2078,7 @@ private:
             }
         }
 
-        ++stats_.select_steps;
+        ++d.stats->select_steps;
         return best_child;
     }
 
@@ -1525,6 +2107,12 @@ private:
         generate_canonical_moves(board_.board(), packed, raw);
     }
 
+    // C9. The same, for a worker driving its own board.
+    static void generate_canonical(const SearchBoard &source, std::vector<std::uint16_t> &packed,
+                                   std::vector<std::uint16_t> &raw) {
+        generate_canonical_moves(source.board(), packed, raw);
+    }
+
     // Look the current position up in the dump, or fail by name.
     //
     // THE MISS PATH IS A TEST, which is why it carries this much context. A
@@ -1538,17 +2126,18 @@ private:
     // are keyed by one derivation. Recomputing `nn_key(parsed)` here would put a
     // second derivation back in, which is the trap the brief names under
     // "Risks / NNKey Generation".
-    const ReplayDump::Entry &lookup(NNKey key, bool at_root) {
+    const ReplayDump::Entry &lookup(NNKey key, bool at_root, const LeafDiag &diag) {
         const ReplayDump::Entry *entry = dump_.find(key, at_root);
         if (entry != nullptr) {
             return *entry;
         }
+        const int raw_ep = diag.parsed->ep_square;
         throw ReplayMiss(
             "guofish: replay dump miss (" + std::string(at_root ? "root" : "interior") +
             " table)\n  nn_key : 0x" + hex64(key.value) +
-            "\n  fen    : " + board_.diagnostic_fen() +
-            "\n  raw ep : " + (board_.raw_ep() < 0 ? std::string("-") : square_name(board_.raw_ep())) +
-            "\n  path   : " + path_from_root() +
+            "\n  fen    : " + diag_fen(diag) +
+            "\n  raw ep : " + (raw_ep < 0 ? std::string("-") : square_name(raw_ep)) +
+            "\n  path   : " + diag_path(diag) +
             "\n  The dump is generated from the Python reference, so a miss means "
             "this search reached a position the reference never evaluated, or "
             "tokenized a position it did evaluate differently.");
@@ -1574,7 +2163,7 @@ private:
     void expand(std::uint32_t node, const std::uint16_t *moves, const float *priors,
                 std::size_t count, const std::vector<std::uint16_t> &packed,
                 const std::vector<std::uint16_t> &raw, const char *source_phrase,
-                const char *source_label) {
+                const char *source_label, const LeafDiag &diag, SearchStats &stats) {
         assert(!packed.empty());
         assert(moves != nullptr && priors != nullptr);
 
@@ -1589,7 +2178,7 @@ private:
         if (packed.size() != count || !std::equal(packed.begin(), packed.end(), moves)) {
             throw ReplayMiss(
                 std::string("guofish: legal-move mismatch against ") + source_phrase + " at " +
-                board_.diagnostic_fen() + "\n  path     : " + path_from_root() +
+                diag_fen(diag) + "\n  path     : " + diag_path(diag) +
                 "\n  C++      : " + uci_list(packed.data(), packed.size()) +
                 "\n  " + source_label + ": " + uci_list(moves, count));
         }
@@ -1603,7 +2192,7 @@ private:
             raw_move_[child] = raw[k];
         }
         arena_.set_children(node, offset, static_cast<std::uint16_t>(packed.size()));
-        ++stats_.expansions;
+        ++stats.expansions;
     }
 
     // ParallelMCTS._expand_root: expand, seed one visit, seed the value.
@@ -1644,8 +2233,10 @@ private:
                 "\n  A finished game has no move to search for. The reference returns "
                 "None here, which the UCI layer reports as bestmove 0000.");
         }
+        const LeafDiag diag{&root_parsed_, board_.halfmove_clock(),
+                            static_cast<int>(board_.board().fullMoveNumber()), nullptr, 0};
         const ReplayDump::Entry &entry =
-            lookup(EvalRow(root_parsed_).key(), /*at_root=*/true);
+            lookup(EvalRow(root_parsed_).key(), /*at_root=*/true, diag);
 
         // C8. A PROMOTED root can arrive already marked terminal — that is what
         // C6's claimable draws are for: `draw_by_rule` marks the node and leaves
@@ -1667,7 +2258,7 @@ private:
         }
 
         expand(root_, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
-               "golden   ");
+               "golden   ", diag, stats_);
         // ASSIGNED, not accumulated. `_expand_root` writes `root.visit_count = 1`
         // and `root.value_sum = ...`, and until C8 the distinction could not be
         // observed: a fresh root came out of the arena cleared, so += and = were
@@ -1714,13 +2305,13 @@ private:
     // is not written anywhere a position could look it up: a draw here is a
     // property of the PATH, and the same position reached by another line is not
     // drawn. That is the discipline C7's cache has to inherit.
-    bool draw_by_rule(std::uint64_t key) {
-        if (board_.halfmove_clock() >= 100) {
-            ++stats_.fifty_move_hits;
+    bool draw_by_rule(Descent &d, std::uint64_t key) {
+        if (d.board->halfmove_clock() >= 100) {
+            ++d.stats->fifty_move_hits;
             return true;
         }
         int seen = 1;
-        for (auto &entry : path_counts_) {
+        for (auto &entry : d.path_counts) {
             if (entry.first == key) {
                 seen = entry.second + 1;
                 entry.second = seen;
@@ -1728,12 +2319,16 @@ private:
             }
         }
         if (seen == 1) {
-            path_counts_.emplace_back(key, 1);
+            d.path_counts.emplace_back(key, 1);
         }
+        // `rep_history_` is written only by set_position and apply_move, both of
+        // which run with no search in flight, so every worker reads it without
+        // a lock and without a copy. That was designed for in C8; this is where
+        // it is collected.
         const auto it = rep_history_.find(key);
         const int history = (it == rep_history_.end()) ? 0 : it->second;
         if (history + seen >= 3) {
-            ++stats_.threefold_hits;
+            ++d.stats->threefold_hits;
             return true;
         }
         return false;
@@ -1753,7 +2348,8 @@ private:
     // occurrences earlier, on every descent step. It is implemented rather than
     // asserted away because "unreachable" is a claim about the caller, and the
     // caller is `outcome_of`, which is a transcription of a function that asks.
-    bool is_repetition(int count) const {
+    bool is_repetition(const Descent &d, int count) const {
+        const std::vector<PathStep> &path_ = d.path;
         if (path_.empty()) {
             // The leaf is the root, which only happens if the root was handed
             // back unexpanded. Nothing has been played, so nothing has repeated.
@@ -1812,15 +2408,20 @@ private:
     // `mark_terminal` is the arena's, and it refuses a node that already has
     // children. Nothing here can hand it one: a node with children is Expanded,
     // and the descent loop never stops at an Expanded node with children.
-    void mark_terminal(std::uint32_t node, TerminalReason reason, double value) {
+    static void count_terminal(SearchStats &stats, TerminalReason reason) {
         switch (reason) {
-            case TerminalReason::Checkmate: ++stats_.checkmates; break;
-            case TerminalReason::Stalemate: ++stats_.stalemates; break;
-            case TerminalReason::InsufficientMaterial: ++stats_.insufficient_material; break;
-            case TerminalReason::SeventyFiveMoves: ++stats_.seventyfive_moves; break;
-            case TerminalReason::FivefoldRepetition: ++stats_.fivefold_repetitions; break;
+            case TerminalReason::Checkmate: ++stats.checkmates; break;
+            case TerminalReason::Stalemate: ++stats.stalemates; break;
+            case TerminalReason::InsufficientMaterial: ++stats.insufficient_material; break;
+            case TerminalReason::SeventyFiveMoves: ++stats.seventyfive_moves; break;
+            case TerminalReason::FivefoldRepetition: ++stats.fivefold_repetitions; break;
             case TerminalReason::None: break;
         }
+    }
+
+    void mark_terminal(SearchStats &stats, std::uint32_t node, TerminalReason reason,
+                       double value) {
+        count_terminal(stats, reason);
         arena_.mark_terminal(node, static_cast<float>(value));
     }
 
@@ -1839,32 +2440,36 @@ private:
     // assuming `root_visits == sims`.
     //
     // It is reproduced and NOT improved. See DECISIONS.md, C6.
-    void maybe_mate_short_circuit(int depth, double value, std::uint32_t node) {
+    void maybe_mate_short_circuit(SearchStats &stats, int depth, double value,
+                                  std::uint32_t node) {
         if (depth == 1 && value == 1.0 && arena_.move(node) != kNoMove) {
-            mating_move_ = arena_.move(node);
-            ++stats_.mate_short_circuits;
+            // C9: a relaxed store. Two workers can find two different mates in
+            // one on the same ply and the last writer wins, which is exactly
+            // what the reference's `self.stats['mating_move'] = node.move` does
+            // from inside a worker thread. Both are mates in one, so either is
+            // a correct answer; the sequencing is not, and cannot be, defined.
+            mating_move_.store(arena_.move(node), std::memory_order_relaxed);
+            ++stats.mate_short_circuits;
         }
     }
 
     // --- one simulation ----------------------------------------------------
 
-    void run_simulation() {
+    void run_simulation(Descent &d) {
         // Restores the board and repays every applied virtual loss on ANY exit,
         // including an exception mid-descent. The reference does the same with a
         // `finally`; here it is a destructor, which is why C8 can delete the
         // defensive full-tree vloss reset entirely.
         struct Unwind {
             ReplaySearch *self;
+            Descent *d;
             ~Unwind() {
-                self->repay();
-                while (!self->path_.empty()) {
-                    self->board_.unmake_move(chess::Move(self->path_.back().raw_move));
-                    self->path_.pop_back();
-                }
+                self->repay(*d);
+                self->rewind_board(*d);
             }
-        } unwind{this};
+        } unwind{this, &d};
 
-        path_counts_.clear();
+        d.path_counts.clear();
 
         std::uint32_t node = root_;
         int depth = 0;
@@ -1874,10 +2479,10 @@ private:
         // rep_key, and at the leaf for nn_key), and the after of one step is the
         // before of the next. One ParsedFen build per descent step, not three.
         ParsedFen parsed = root_parsed_;
-        apply_vloss(node);
+        apply_vloss(d, node);
 
         while (arena_.lifecycle(node) == NodeState::Expanded && arena_.children_count(node) > 0) {
-            const std::uint32_t child = select_child(node, depth == 0);
+            const std::uint32_t child = select_child(d, node, depth == 0);
             assert(child != kNoNode);
             const chess::Move move(raw_move_[child]);
 
@@ -1887,22 +2492,23 @@ private:
             // with g1/c1, and `_reduces_castling_rights` compares it against the
             // castling-rights ROOK squares, where the two encodings differ.
             const int from = move.from().index();
-            const int to = uci_destination(board_.board(), move).index();
+            const int to = uci_destination(d.board->board(), move).index();
             const bool zeroing = guofish::is_zeroing(parsed, from, to);
             const bool irreversible = guofish::is_irreversible(parsed, from, to);
 
-            board_.make_move(move, zeroing);
-            parsed = board_.parsed();
+            d.board->make_move(move, zeroing);
+            parsed = d.board->parsed();
             const std::uint64_t key = rep_key(parsed).value;
 
-            path_.push_back(PathStep{move.move(), child, key, parsed.placement.occupied(),
-                                     irreversible});
+            d.path.push_back(PathStep{move.move(), child, key, parsed.placement.occupied(),
+                                      irreversible});
+            d.path_moves.push_back(arena_.move(child));
             node = child;
             ++depth;
-            apply_vloss(node);
+            apply_vloss(d, node);
 
-            if (depth > stats_.max_depth) {
-                stats_.max_depth = depth;
+            if (depth > d.stats->max_depth) {
+                d.stats->max_depth = depth;
             }
 
             // === Draw by rule: fifty-move or threefold repetition ===
@@ -1912,12 +2518,12 @@ private:
             // a draw since it was expanded. The node is marked terminal and left
             // UNEXPANDED, which is what makes it recoverable if a host declines
             // the claim and hands it back as the position to move from.
-            if (draw_by_rule(key)) {
-                ++stats_.draw_by_rule_hits;
-                repay();
+            if (draw_by_rule(d, key)) {
+                ++d.stats->draw_by_rule_hits;
+                repay(d);
                 arena_.mark_terminal(node, 0.0f);
                 backpropagate(node, 0.0);
-                ++stats_.simulations;
+                ++d.stats->simulations;
                 return;
             }
 
@@ -1926,22 +2532,22 @@ private:
             // result, and marking it would make it unrepresentable as a future
             // search root.
             if (depth >= config_.max_tree_depth) {
-                ++stats_.depth_cap_hits;
-                repay();
+                ++d.stats->depth_cap_hits;
+                repay(d);
                 backpropagate(node, 0.0);
-                ++stats_.simulations;
+                ++d.stats->simulations;
                 return;
             }
         }
 
         // === Cached terminal: a node an earlier simulation already resolved ===
         if (arena_.is_terminal(node)) {
-            ++stats_.terminal_fast_path_hits;
+            ++d.stats->terminal_fast_path_hits;
             const double value = arena_.terminal_value(node);
-            repay();
+            repay(d);
             backpropagate(node, value);
-            maybe_mate_short_circuit(depth, value, node);
-            ++stats_.simulations;
+            maybe_mate_short_circuit(*d.stats, depth, value, node);
+            ++d.stats->simulations;
             return;
         }
 
@@ -1950,20 +2556,20 @@ private:
         // The legal moves are generated once and used twice — `outcome_of` needs
         // the count, `expand` needs the list. Generating them separately would
         // be a second opportunity for the two to disagree about the position.
-        std::vector<std::uint16_t> packed;
-        std::vector<std::uint16_t> raw;
-        generate_canonical(packed, raw);
+        std::vector<std::uint16_t> &packed = d.packed;
+        std::vector<std::uint16_t> &raw = d.raw;
+        generate_canonical(*d.board, packed, raw);
 
         const TerminalReason reason =
-            outcome_of(parsed, board_.in_check(), packed.size(), board_.halfmove_clock(),
-                       /*fivefold_repetition=*/packed.empty() ? false : is_repetition(5));
+            outcome_of(parsed, d.board->in_check(), packed.size(), d.board->halfmove_clock(),
+                       /*fivefold_repetition=*/packed.empty() ? false : is_repetition(d, 5));
         if (reason != TerminalReason::None) {
             const double value = terminal_value_of(reason);
-            mark_terminal(node, reason, value);
-            repay();
+            mark_terminal(*d.stats, node, reason, value);
+            repay(d);
             backpropagate(node, value);
-            maybe_mate_short_circuit(depth, value, node);
-            ++stats_.simulations;
+            maybe_mate_short_circuit(*d.stats, depth, value, node);
+            ++d.stats->simulations;
             return;
         }
 
@@ -1974,30 +2580,9 @@ private:
         // use `row.key()`; nothing below recomputes it. See EvalRow in
         // cpp/keys.hpp for why that is a requirement and not a tidiness.
         const EvalRow row(parsed);
-        NetworkValue nn_value{0.0};
-
-        if (cache_.has_value() && cache_->probe(row.key(), cache_hit_)) {
-            ++stats_.cache_hits;
-            expand(node, cache_hit_.moves.data(), cache_hit_.priors.data(),
-                   cache_hit_.moves.size(), packed, raw, "the transposition cache",
-                   "cache    ");
-            nn_value = cache_hit_.value;
-        } else {
-            if (cache_.has_value()) {
-                ++stats_.cache_misses;
-            }
-            const ReplayDump::Entry &entry = lookup(row.key(), /*at_root=*/false);
-            expand(node, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
-                   "golden   ");
-            nn_value = NetworkValue(entry.value);
-
-            // The insert takes the NETWORK's value, before any tablebase
-            // override — see below. This is the line the reference gets wrong.
-            if (cache_.has_value()) {
-                cache_->insert(row.key(), nn_value, entry.moves, entry.priors, entry.count);
-                ++stats_.cache_inserts;
-            }
-        }
+        const LeafDiag diag = diag_of(d, parsed);
+        const NetworkValue nn_value =
+            evaluate_and_expand(node, row, packed, raw, diag, cache_hit_, *d.stats);
 
         // === Mode 2: the tablebase value override ===
         //
@@ -2022,25 +2607,144 @@ private:
         // `backup_value` is in the MOVER's perspective, which is what
         // backpropagate consumes; both branches convert from their own absolute
         // (White-POV) value through the overload named for its kind.
+        const double backup_value =
+            apply_tablebase(nn_value, parsed, d.board->halfmove_clock(), *d.stats);
+
+        // Repay BEFORE the backup, which is the reference's ordering: backprop
+        // always runs with zero in-flight loss on the path it walks.
+        repay(d);
+        backpropagate(node, backup_value);
+        ++d.stats->simulations;
+    }
+
+    // Unwind a descent's board to the root. Split out of the RAII guard so the
+    // parallel worker — which hands its path off rather than resolving it — can
+    // reuse exactly the same walk.
+    void rewind_board(Descent &d) {
+        while (!d.path.empty()) {
+            d.board->unmake_move(chess::Move(d.path.back().raw_move));
+            d.path.pop_back();
+        }
+        d.path_moves.clear();
+    }
+
+    // The cache probe, the dump lookup, the expansion and the cache insert, in
+    // the reference's order.
+    //
+    // C9 lifts this out of run_simulation unchanged so that BOTH callers are one
+    // piece of code: the serial descent, and the dispatcher expanding a leaf a
+    // worker handed it. That is not tidiness. `expand` is where the legal-move
+    // list is checked against the priors it is about to be paired with, and
+    // where the cache's poisoning class would surface; two copies of it would be
+    // two places for the leaf and its evaluation to stop agreeing.
+    //
+    // ONE derivation of the key, from the exact token row an evaluator would be
+    // handed. The cache probe, the dump lookup and the cache insert all use
+    // `row.key()`; nothing here recomputes it. See EvalRow in cpp/keys.hpp for
+    // why that is a requirement and not a tidiness.
+    NetworkValue evaluate_and_expand(std::uint32_t node, const EvalRow &row,
+                                     const std::vector<std::uint16_t> &packed,
+                                     const std::vector<std::uint16_t> &raw,
+                                     const LeafDiag &diag, CachedEval &scratch,
+                                     SearchStats &stats) {
+        if (cache_.has_value() && cache_->probe(row.key(), scratch)) {
+            ++stats.cache_hits;
+            expand(node, scratch.moves.data(), scratch.priors.data(), scratch.moves.size(), packed,
+                   raw, "the transposition cache", "cache    ", diag, stats);
+            return scratch.value;
+        }
+        if (cache_.has_value()) {
+            ++stats.cache_misses;
+        }
+
+        // C9. A leaf the SERIAL reference never reached, on a run that is
+        // allowed to reach it. Off by default, so C5 through C8 keep the
+        // hard-failure behaviour their acceptance rests on.
+        const ReplayDump::Entry *entry = dump_.find(row.key(), /*at_root=*/false);
+        if (entry == nullptr && synthetic_fallback_) {
+            ++stats.synthetic_evaluations;
+            // `diag.parsed` is the leaf's position, held by whichever caller we
+            // are on — the descent's own `parsed` when serial, the leaf's copy
+            // when the dispatcher expands it. Reading it from there rather than
+            // rebuilding one keeps this on the same single derivation everything
+            // else in the expansion path uses.
+            const ParsedFen &parsed = *diag.parsed;
+            synthetic_.evaluate(row.key(), parsed, packed.data(), packed.size(),
+                                synthetic_priors_);
+            const NetworkValue value(SyntheticEvaluator::value_of(parsed));
+            expand(node, packed.data(), synthetic_priors_.data(), packed.size(), packed, raw,
+                   "the stand-in evaluator", "stand-in ", diag, stats);
+            if (cache_.has_value()) {
+                // `insert` takes the move count as a uint16, and the move list
+                // came from movegen, so it is bounded by kMaxLegalMoves — but
+                // the narrowing is written out rather than left implicit,
+                // because a silent truncation here would pair a move list with
+                // the wrong priors, which is the one failure cpp/cache.hpp is
+                // built to make impossible.
+                assert(packed.size() <= kMaxLegalMoves);
+                cache_->insert(row.key(), value, packed.data(), synthetic_priors_.data(),
+                               static_cast<std::uint16_t>(packed.size()));
+                ++stats.cache_inserts;
+            }
+            return value;
+        }
+        if (entry == nullptr) {
+            // The named failure, unchanged. lookup() re-does the find so the
+            // message stays in one place.
+            lookup(row.key(), /*at_root=*/false, diag);
+        }
+        expand(node, entry->moves, entry->priors, entry->count, packed, raw, "the replay dump",
+               "golden   ", diag, stats);
+        const NetworkValue nn_value(entry->value);
+
+        // The insert takes the NETWORK's value, before any tablebase override —
+        // see apply_tablebase. This is the line the reference gets wrong.
+        if (cache_.has_value()) {
+            cache_->insert(row.key(), nn_value, entry->moves, entry->priors, entry->count);
+            ++stats.cache_inserts;
+        }
+        return nn_value;
+    }
+
+    // === Mode 2: the tablebase value override ===
+    //
+    // TREE-LOCAL, AND AFTER THE INSERT. The reference overrides first and caches
+    // the result, with the comment that this saves a re-probe on a later
+    // transposition. It does, and it is unsound: a Syzygy WDL ignores the
+    // fifty-move rule, so it is a function of the position AND the halfmove
+    // clock, while the cache key is a function of the position alone —
+    // deliberately, because the clock is not a token. The stored WDL is then
+    // served to the same position at a clock where the truth is a draw.
+    // cpp/tablebase.hpp has the full argument; the reference's own
+    // instrumentation counts the crossing.
+    //
+    // Here the override touches the returned value and nothing else, so it
+    // reaches exactly one node — the leaf that was probed — through exactly one
+    // backup. Nothing another position could read ever sees it, and the cache
+    // entry written above already holds the network's own value. This is not a
+    // discipline that has to be maintained: `probe_tablebase_value` returns a
+    // `TablebaseValue`, `insert` takes a `NetworkValue`, and there is no
+    // conversion, so moving the probe above the insert does not compile.
+    //
+    // The return is in the MOVER's perspective, which is what backpropagate
+    // consumes; both branches convert from their own absolute (White-POV) value
+    // through the overload named for its kind.
+    double apply_tablebase(NetworkValue nn_value, const ParsedFen &parsed, int halfmove_clock,
+                           SearchStats &stats) {
         double backup_value = mover_value(nn_value, parsed.white_to_move);
         if (tablebase_ != nullptr && within_tablebase_range(parsed)) {
-            ++stats_.tablebase_probes;
+            ++stats.tablebase_probes;
             const std::optional<TablebaseValue> tb =
-                probe_tablebase_value(*tablebase_, parsed, board_.halfmove_clock());
+                probe_tablebase_value(*tablebase_, parsed, halfmove_clock);
             if (tb.has_value()) {
-                ++stats_.tablebase_overrides;
+                ++stats.tablebase_overrides;
                 backup_value = mover_value(*tb, parsed.white_to_move);
             }
             // On a miss the neural value stands, exactly as the reference does
             // it: a position the loaded tables do not cover is not a position
             // about which anything has been learned.
         }
-
-        // Repay BEFORE the backup, which is the reference's ordering: backprop
-        // always runs with zero in-flight loss on the path it walks.
-        repay();
-        backpropagate(node, backup_value);
-        ++stats_.simulations;
+        return backup_value;
     }
 
     // --- C8: the compacting copy -------------------------------------------
@@ -2446,6 +3150,630 @@ private:
         }
     }
 
+    // --- C9: the parallel engine -------------------------------------------
+
+    enum class LeafOutcome : std::uint8_t {
+        Delivered,   // the worker resolved and backed it up itself
+        Submitted,   // handed to the dispatcher, virtual loss still applied
+        Discarded,   // lost the PENDING claim; nothing was backed up
+    };
+
+    // One in-flight leaf. `MpscNode` is the queue link; deriving from it rather
+    // than embedding it is what lets the dispatcher recover the leaf from what
+    // the queue hands back with a `static_cast` down a non-virtual base, so
+    // Global Rule 6's reinterpret_cast question never arises.
+    //
+    // Everything the dispatcher needs to evaluate, expand, repay and back up
+    // travels in here, because by the time it runs the worker's board is
+    // somewhere else entirely. In particular `applied` — the virtual-loss path —
+    // is MOVED out of the worker's descent, so ownership of the repayment moves
+    // with it and no thread can repay a loss it does not hold.
+    struct LeafNode : MpscNode {
+        std::uint32_t node = kNoNode;
+        ParsedFen parsed;
+        int halfmove_clock = 0;
+        int fullmove_number = 1;
+        std::vector<std::uint16_t> packed;
+        std::vector<std::uint16_t> raw;
+        std::vector<std::uint32_t> applied;
+        std::vector<std::uint16_t> path_moves;
+        // Produced by one worker, released by the dispatcher: SPSC per slot, so
+        // one atomic flag is the whole protocol.
+        std::atomic<bool> in_use{false};
+    };
+
+    void run_workers(const ParallelConfig &pc) {
+        const int workers = pc.workers;
+        const int per_worker = pc.in_flight;
+
+        queue_ = std::make_unique<MpscQueue>();
+        slots_.clear();
+        slots_.reserve(static_cast<std::size_t>(workers) * static_cast<std::size_t>(per_worker));
+        for (int i = 0; i < workers * per_worker; ++i) {
+            slots_.push_back(std::make_unique<LeafNode>());
+        }
+
+        // Assigned before the Descents are built, because each Descent holds a
+        // pointer into this vector and a later resize would dangle every one.
+        worker_stats_.assign(static_cast<std::size_t>(workers), SearchStats{});
+        dispatch_stats_ = SearchStats{};
+
+        descents_.clear();
+        descents_.reserve(static_cast<std::size_t>(workers));
+        for (int i = 0; i < workers; ++i) {
+            auto d = std::make_unique<Descent>();
+            // A COPY of the search's board, positioned at the root. Copying is
+            // what makes the descent lock-free: chess-library's make/unmake is
+            // stateful, and W threads sharing one Board would need a lock around
+            // the single hottest thing in the engine.
+            d->own_board = board_;
+            d->board = &d->own_board;
+            d->stats = &worker_stats_[static_cast<std::size_t>(i)];
+            descents_.push_back(std::move(d));
+        }
+
+        issued_.store(0, std::memory_order_relaxed);
+        delivered_.store(0, std::memory_order_relaxed);
+        outstanding_.store(0, std::memory_order_relaxed);
+        queued_.store(0, std::memory_order_relaxed);
+        drain_epoch_.store(0, std::memory_order_relaxed);
+        aborted_.store(false, std::memory_order_relaxed);
+        error_ = nullptr;
+        waiting_workers_ = 0;
+        running_workers_ = workers;
+        collisions_ = 0;
+        waits_ = 0;
+
+        const std::vector<int> slots_for_affinity = affinity_slots(topology(), pc.affinity);
+        // SIZED BEFORE ANY THREAD STARTS. Each worker writes its own element if
+        // the platform refuses the pin request, and growing the vector while an
+        // earlier worker holds a reference into it would reallocate under that
+        // worker — a use-after-free that only fires on a machine where pinning
+        // FAILS, i.e. never on the machine it was written on.
+        par_.pinned_cpus.assign(static_cast<std::size_t>(workers), -1);
+        for (int i = 0; i < workers; ++i) {
+            par_.pinned_cpus[static_cast<std::size_t>(i)] =
+                slots_for_affinity.empty()
+                    ? -1
+                    : slots_for_affinity[static_cast<std::size_t>(i) % slots_for_affinity.size()];
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<std::size_t>(workers) + 1);
+        std::thread dispatcher([this, &pc] { dispatcher_loop(pc); });
+        for (int i = 0; i < workers; ++i) {
+            const int cpu = par_.pinned_cpus[static_cast<std::size_t>(i)];
+            threads.emplace_back([this, &pc, i, cpu] {
+                if (cpu >= 0 && !pin_current_thread(cpu)) {
+                    // Reported, not thrown. A machine that will not honour an
+                    // affinity request still runs the search correctly; what it
+                    // must not do is let a BENCH.md row claim a pinning that did
+                    // not happen, so the slot is rewritten to -1. Each worker
+                    // writes only its own element of a vector that was sized
+                    // before any thread existed.
+                    par_.pinned_cpus[static_cast<std::size_t>(i)] = -1;
+                }
+                worker_loop(i, pc);
+            });
+        }
+        for (std::thread &t : threads) {
+            t.join();
+        }
+        dispatcher.join();
+
+        par_.wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+
+        release_stranded_leaves();
+        merge_worker_stats();
+        par_.delivered = delivered_.load(std::memory_order_relaxed);
+        par_.select_collisions = collisions_;
+        par_.worker_waits = waits_;
+        par_.worker_terminals = par_.delivered - par_.queued_leaves;
+
+        if (error_) {
+            std::exception_ptr error = error_;
+            error_ = nullptr;
+            std::rethrow_exception(error);
+        }
+    }
+
+    // Nothing should be left here. The only way a slot survives the join is an
+    // exception thrown out of the dispatcher mid-batch — and in that case the
+    // leaf's virtual loss is still applied and its node is still PENDING, so
+    // "the tree is now in an undefined state" would be a second failure caused
+    // by the first. Unwinding here means the C9 conservation invariants hold
+    // even on the error path, which is what makes them assertable at all.
+    void release_stranded_leaves() {
+        for (std::unique_ptr<LeafNode> &slot : slots_) {
+            if (!slot->in_use.load(std::memory_order_acquire)) {
+                continue;
+            }
+            repay_list(slot->applied);
+            slot->applied.clear();
+            // kNoNode is a slot that was acquired and then abandoned by a
+            // throwing descent: it never reached a leaf, so there is no PENDING
+            // claim to withdraw. Its virtual loss was already repaid by
+            // run_simulation_parallel's RAII unwind on the way out.
+            if (slot->node != kNoNode &&
+                arena_.lifecycle(slot->node) == NodeState::Pending) {
+                arena_.release_pending(slot->node);
+            }
+            slot->node = kNoNode;
+            slot->in_use.store(false, std::memory_order_release);
+        }
+    }
+
+    // Worker order then the dispatcher, always. Integer addition is
+    // associative, so the merged totals are independent of how the threads
+    // interleaved — the same property that lets Q32 make the tree itself
+    // reproducible. `max_depth` is a maximum rather than a sum and is folded as
+    // one.
+    void merge_worker_stats() {
+        const auto fold = [](SearchStats &into, const SearchStats &from) {
+            into.simulations += from.simulations;
+            into.expansions += from.expansions;
+            into.depth_cap_hits += from.depth_cap_hits;
+            into.select_steps += from.select_steps;
+            into.max_depth = from.max_depth > into.max_depth ? from.max_depth : into.max_depth;
+            into.draw_by_rule_hits += from.draw_by_rule_hits;
+            into.fifty_move_hits += from.fifty_move_hits;
+            into.threefold_hits += from.threefold_hits;
+            into.checkmates += from.checkmates;
+            into.stalemates += from.stalemates;
+            into.insufficient_material += from.insufficient_material;
+            into.seventyfive_moves += from.seventyfive_moves;
+            into.fivefold_repetitions += from.fivefold_repetitions;
+            into.terminal_fast_path_hits += from.terminal_fast_path_hits;
+            into.mate_short_circuits += from.mate_short_circuits;
+            into.cache_hits += from.cache_hits;
+            into.cache_misses += from.cache_misses;
+            into.cache_inserts += from.cache_inserts;
+            into.tablebase_probes += from.tablebase_probes;
+            into.tablebase_overrides += from.tablebase_overrides;
+            into.synthetic_evaluations += from.synthetic_evaluations;
+        };
+        for (const SearchStats &s : worker_stats_) {
+            fold(stats_, s);
+        }
+        fold(stats_, dispatch_stats_);
+    }
+
+    void record_error(std::exception_ptr error) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!error_) {
+                error_ = std::move(error);
+            }
+            // SET UNDER THE MUTEX. Both wait predicates read `aborted_`, so a
+            // store outside the lock races the window between a waiter
+            // evaluating its predicate and actually sleeping: the notify fires
+            // into an empty condition variable and the waiter never wakes. That
+            // is a deadlock reachable from any exception — an exhausted arena,
+            // a dump miss — which is to say from the paths a test is most likely
+            // to take.
+            aborted_.store(true, std::memory_order_release);
+        }
+        worker_cv_.notify_all();
+        dispatch_cv_.notify_one();
+    }
+
+    // A free slot of this worker's own K, or nullptr.
+    //
+    // PER-WORKER RINGS RATHER THAN A SHARED POOL. The brief phrases the throttle
+    // two ways — "K in-flight paths per thread" and "stall only when the global
+    // count hits W*K" — and they differ when the workers are unbalanced: a
+    // worker can run out of its own K while the global count is below W*K. The
+    // difference is not observable here, because the dispatcher drains only when
+    // EVERY worker is blocked, so a worker that blocks early simply blocks
+    // sooner into the same drain. What the rings buy is that a submission
+    // touches no shared allocator at all — the hot path is one relaxed load and
+    // one release store on a flag this worker is the only producer for.
+    // `worker_waits` in ParallelStats counts how often it mattered.
+    LeafNode *acquire_slot(int base, int per_worker) {
+        for (int k = 0; k < per_worker; ++k) {
+            LeafNode *slot = slots_[static_cast<std::size_t>(base + k)].get();
+            if (!slot->in_use.load(std::memory_order_acquire)) {
+                // Cleared on acquisition, not on release. A descent that throws
+                // between here and the submission leaves the slot marked in use,
+                // and release_stranded_leaves would otherwise find last
+                // simulation's node index sitting in it and try to release a
+                // PENDING claim that belongs to a leaf which was already
+                // expanded. kNoNode is how that slot says "I hold nothing".
+                slot->node = kNoNode;
+                slot->applied.clear();
+                slot->in_use.store(true, std::memory_order_release);
+                return slot;
+            }
+        }
+        return nullptr;
+    }
+
+    // Sleep until the dispatcher has finished a drain, or the search is over.
+    //
+    // `epoch` is read by the caller BEFORE it discovered it could not proceed,
+    // so a drain that completed in between is not missed and this returns
+    // immediately. Registering in `waiting_workers_` is also what ARMS the
+    // dispatcher: its drain condition is "the queue is non-empty and every
+    // worker is either waiting or finished".
+    void worker_block(std::uint64_t epoch) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++waiting_workers_;
+        dispatch_cv_.notify_one();
+        worker_cv_.wait(lock, [&] {
+            return aborted_.load(std::memory_order_relaxed) ||
+                   drain_epoch_.load(std::memory_order_relaxed) != epoch;
+        });
+        --waiting_workers_;
+    }
+
+    void worker_loop(int id, const ParallelConfig &pc) {
+        Descent &d = *descents_[static_cast<std::size_t>(id)];
+        const int base = id * pc.in_flight;
+        std::int64_t collisions = 0;
+        std::int64_t waits = 0;
+
+        try {
+            for (;;) {
+                if (aborted_.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                // MCTSWorker._work_loop checks completion_event at the TOP of
+                // the loop, so the simulation that set it is counted and the
+                // next one never starts.
+                if (mating_move_.load(std::memory_order_relaxed) != kNoMove) {
+                    break;
+                }
+
+                // CLAIM A SIMULATION, EXACTLY ONE.
+                //
+                // `issued_` counts simulations that will each deliver exactly
+                // one backup into the root. A thread that draws a slot at or
+                // past the target gives it straight back and leaves; a thread
+                // whose descent is DISCARDED gives its slot back too and loops,
+                // so the slot is never lost — the discarding thread is still in
+                // the loop and will re-take it if nobody else does. At
+                // quiescence `issued_` is therefore exactly `target_`, which is
+                // what makes "delivered sims exactly match the requested
+                // budget" an equality rather than an approximation.
+                const int slot = issued_.fetch_add(1, std::memory_order_acq_rel);
+                if (slot >= target_) {
+                    issued_.fetch_sub(1, std::memory_order_acq_rel);
+                    break;
+                }
+
+                // THROTTLE. Read the epoch, THEN re-check for a slot, THEN
+                // sleep — in that order, every time round.
+                //
+                // Hoisting the epoch read out of the loop looks like an
+                // optimisation and is a busy-wait: after the first wake,
+                // `drain_epoch_ != epoch` is permanently true, so every
+                // subsequent worker_block returns instantly and the thread
+                // spins on acquire_slot instead of sleeping. It only shows up
+                // when a drain can fail to free one of THIS worker's slots —
+                // W>1 with max_batch below the outstanding count — which is
+                // exactly the configuration a throughput sweep reaches and a
+                // W=1 test does not.
+                LeafNode *item = nullptr;
+                for (;;) {
+                    const std::uint64_t epoch = drain_epoch_.load(std::memory_order_relaxed);
+                    item = acquire_slot(base, pc.in_flight);
+                    if (item != nullptr || aborted_.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    ++waits;
+                    worker_block(epoch);
+                }
+                if (item == nullptr) {
+                    issued_.fetch_sub(1, std::memory_order_acq_rel);
+                    break;
+                }
+
+                const std::uint64_t before = drain_epoch_.load(std::memory_order_relaxed);
+                const LeafOutcome outcome = run_simulation_parallel(d, item);
+                if (outcome == LeafOutcome::Submitted) {
+                    continue;  // the dispatcher owns the slot now
+                }
+                item->in_use.store(false, std::memory_order_release);
+                if (outcome == LeafOutcome::Delivered) {
+                    delivered_.fetch_add(1, std::memory_order_acq_rel);
+                    continue;
+                }
+                // Discarded: another simulation owns the leaf we descended to.
+                // Hand the budget slot back and wait for the dispatcher to
+                // resolve it, rather than spinning on a descent that will make
+                // the identical choice — which, at virtual loss 0, it would,
+                // forever.
+                ++collisions;
+                issued_.fetch_sub(1, std::memory_order_acq_rel);
+                ++waits;
+                worker_block(before);
+            }
+        } catch (...) {
+            record_error(std::current_exception());
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            --running_workers_;
+            collisions_ += collisions;
+            waits_ += waits;
+        }
+        dispatch_cv_.notify_one();
+    }
+
+    // One simulation on a worker thread.
+    //
+    // This is `run_simulation` with the leaf handling replaced and NOTHING else
+    // changed: the same selection, the same descent-step draw checks in the same
+    // order, the same depth cap, the same terminal classification, the same
+    // backup. The two are deliberately not merged behind a flag — the serial one
+    // is the code C5 through C8 were certified on and it is left alone, and
+    // acceptance layer 1 is what checks that this one agrees with it.
+    LeafOutcome run_simulation_parallel(Descent &d, LeafNode *item) {
+        struct Unwind {
+            ReplaySearch *self;
+            Descent *d;
+            ~Unwind() {
+                // A submitted leaf swapped its applied list out, so this repays
+                // nothing for it — ownership of the repayment left with the
+                // leaf. Everything else, including an exception mid-descent,
+                // repays here.
+                self->repay(*d);
+                self->rewind_board(*d);
+            }
+        } unwind{this, &d};
+
+        d.path_counts.clear();
+
+        std::uint32_t node = root_;
+        int depth = 0;
+        ParsedFen parsed = root_parsed_;
+        apply_vloss(d, node);
+
+        for (;;) {
+            while (arena_.lifecycle(node) == NodeState::Expanded &&
+                   arena_.children_count(node) > 0) {
+                const std::uint32_t child = select_child(d, node, depth == 0);
+                assert(child != kNoNode);
+                const chess::Move move(raw_move_[child]);
+
+                const int from = move.from().index();
+                const int to = uci_destination(d.board->board(), move).index();
+                const bool zeroing = guofish::is_zeroing(parsed, from, to);
+                const bool irreversible = guofish::is_irreversible(parsed, from, to);
+
+                d.board->make_move(move, zeroing);
+                parsed = d.board->parsed();
+                const std::uint64_t key = rep_key(parsed).value;
+
+                d.path.push_back(PathStep{move.move(), child, key, parsed.placement.occupied(),
+                                          irreversible});
+                d.path_moves.push_back(arena_.move(child));
+                node = child;
+                ++depth;
+                apply_vloss(d, node);
+
+                if (depth > d.stats->max_depth) {
+                    d.stats->max_depth = depth;
+                }
+
+                if (draw_by_rule(d, key)) {
+                    ++d.stats->draw_by_rule_hits;
+                    repay(d);
+                    // May lose the claim to a thread that reached the same node
+                    // and derived the same draw; see try_mark_terminal. Either
+                    // way the node ends up terminal with 0.0 and this
+                    // simulation backs up 0.0.
+                    arena_.try_mark_terminal(node, 0.0f);
+                    backpropagate(node, 0.0);
+                    ++d.stats->simulations;
+                    return LeafOutcome::Delivered;
+                }
+
+                if (depth >= config_.max_tree_depth) {
+                    ++d.stats->depth_cap_hits;
+                    repay(d);
+                    backpropagate(node, 0.0);
+                    ++d.stats->simulations;
+                    return LeafOutcome::Delivered;
+                }
+            }
+
+            if (arena_.is_terminal(node)) {
+                ++d.stats->terminal_fast_path_hits;
+                const double value = arena_.terminal_value(node);
+                repay(d);
+                backpropagate(node, value);
+                maybe_mate_short_circuit(*d.stats, depth, value, node);
+                ++d.stats->simulations;
+                return LeafOutcome::Delivered;
+            }
+
+            // THE SELECT COLLISION, scope 2.2's one remaining race.
+            if (arena_.try_claim_pending(node)) {
+                break;
+            }
+            // Lost it. Three ways, and only one of them is a collision:
+            //   * the node became terminal    -> take the fast path above;
+            //   * the node became expanded    -> keep descending through it;
+            //   * the node is PENDING         -> a real collision.
+            if (arena_.is_terminal(node)) {
+                continue;
+            }
+            if (arena_.lifecycle(node) == NodeState::Expanded &&
+                arena_.children_count(node) > 0) {
+                continue;
+            }
+            return LeafOutcome::Discarded;
+        }
+
+        // We hold `node` as PENDING; nothing else can expand or mark it.
+        generate_canonical(*d.board, d.packed, d.raw);
+
+        const TerminalReason reason =
+            outcome_of(parsed, d.board->in_check(), d.packed.size(), d.board->halfmove_clock(),
+                       /*fivefold_repetition=*/d.packed.empty() ? false : is_repetition(d, 5));
+        if (reason != TerminalReason::None) {
+            const double value = terminal_value_of(reason);
+            count_terminal(*d.stats, reason);
+            arena_.mark_terminal_pending(node, static_cast<float>(value));
+            repay(d);
+            backpropagate(node, value);
+            maybe_mate_short_circuit(*d.stats, depth, value, node);
+            ++d.stats->simulations;
+            return LeafOutcome::Delivered;
+        }
+
+        // === Hand it to the dispatcher ===================================
+        //
+        // The virtual loss stays applied and the node stays PENDING. This is
+        // the whole point of the chunk: the thread does not wait for the
+        // evaluation, and the tree carries the fact that a simulation is in
+        // flight through here until it is backed up.
+        item->node = node;
+        item->parsed = parsed;
+        item->halfmove_clock = d.board->halfmove_clock();
+        item->fullmove_number = static_cast<int>(d.board->board().fullMoveNumber());
+        item->packed = d.packed;
+        item->raw = d.raw;
+        item->path_moves = d.path_moves;
+        // MOVED, not copied: the descent must not repay what the dispatcher is
+        // now responsible for, and a swap makes that structural rather than
+        // remembered. `d.applied` comes back empty, so the RAII unwind above
+        // repays nothing.
+        item->applied.swap(d.applied);
+
+        outstanding_.fetch_add(1, std::memory_order_acq_rel);
+        // PUSH FIRST, THEN COUNT. The dispatcher pops exactly `queued_` items
+        // and spins if the queue hands back nothing, so counting first would
+        // open a window where it spins on a leaf that has not been linked yet.
+        // The window is short and the spin yields, but it is avoidable for
+        // free: after this order, a non-zero `queued_` means the items are
+        // already reachable.
+        queue_->push(item);
+        queued_.fetch_add(1, std::memory_order_acq_rel);
+        return LeafOutcome::Submitted;
+    }
+
+    void dispatcher_loop(const ParallelConfig &pc) {
+        try {
+            for (;;) {
+                std::size_t available = 0;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    dispatch_cv_.wait(lock, [&] {
+                        if (aborted_.load(std::memory_order_relaxed)) {
+                            return true;
+                        }
+                        const int queued = queued_.load(std::memory_order_relaxed);
+                        if (running_workers_ == 0) {
+                            return true;
+                        }
+                        // No floor and no clock: whatever is there, once no
+                        // search thread can add to it. See search_parallel.
+                        return queued > 0 && waiting_workers_ >= running_workers_;
+                    });
+                    const int queued = queued_.load(std::memory_order_relaxed);
+                    if (queued <= 0) {
+                        if (running_workers_ == 0 || aborted_.load(std::memory_order_relaxed)) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if (aborted_.load(std::memory_order_relaxed)) {
+                        // Leave the queue alone; release_stranded_leaves unwinds
+                        // it once the threads are joined, which is the only
+                        // place that can be done without racing a producer.
+                        return;
+                    }
+                    available = static_cast<std::size_t>(queued);
+                }
+
+                const std::size_t take = available < pc.max_batch ? available : pc.max_batch;
+                process_batch(take, pc);
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    drain_epoch_.fetch_add(1, std::memory_order_acq_rel);
+                }
+                worker_cv_.notify_all();
+            }
+        } catch (...) {
+            record_error(std::current_exception());
+        }
+    }
+
+    void process_batch(std::size_t take, const ParallelConfig &pc) {
+        batch_.clear();
+        batch_.reserve(take);
+        for (std::size_t i = 0; i < take; ++i) {
+            MpscNode *link = nullptr;
+            for (;;) {
+                link = queue_->try_pop();
+                if (link != nullptr) {
+                    break;
+                }
+                // A producer is between its exchange and its link store. It
+                // cannot be blocked and it cannot be far away; yielding is
+                // cheaper than any handshake that would prevent the window.
+                std::this_thread::yield();
+            }
+            batch_.push_back(static_cast<LeafNode *>(link));
+        }
+        queued_.fetch_sub(static_cast<int>(take), std::memory_order_acq_rel);
+
+        ++par_.batches;
+        if (static_cast<std::int64_t>(take) > par_.largest_batch) {
+            par_.largest_batch = static_cast<std::int64_t>(take);
+        }
+        if (pc.collect_histograms) {
+            par_.batch_sizes.push_back(static_cast<std::int64_t>(take));
+            par_.outstanding_at_drain.push_back(outstanding_.load(std::memory_order_relaxed));
+        }
+        if (hook_ != nullptr) {
+            const std::int64_t wait = hook_->before_batch(take);
+            par_.hook_wait_ns += wait;
+            if (pc.collect_histograms) {
+                par_.hook_wait_ns_samples.push_back(wait);
+            }
+        }
+
+        // SEQUENTIALLY, on this thread. Expansion is single-threaded by
+        // construction (scope 2.2), which is what leaves `set_children` with one
+        // caller per node and the arena's bump allocator with one writer.
+        for (LeafNode *item : batch_) {
+            expand_and_backup(*item);
+        }
+    }
+
+    void expand_and_backup(LeafNode &item) {
+        const LeafDiag diag{&item.parsed, item.halfmove_clock, item.fullmove_number,
+                            item.path_moves.data(), item.path_moves.size()};
+        const EvalRow row(item.parsed);
+        const NetworkValue nn_value = evaluate_and_expand(item.node, row, item.packed, item.raw,
+                                                          diag, dispatch_cache_, dispatch_stats_);
+        const double backup_value =
+            apply_tablebase(nn_value, item.parsed, item.halfmove_clock, dispatch_stats_);
+
+        // Repay BEFORE the backup, which is the reference's ordering: backprop
+        // always runs with zero in-flight loss on the path it walks — this
+        // path, at least. Other threads' losses are on other paths and are
+        // theirs to repay.
+        repay_list(item.applied);
+        item.applied.clear();
+        backpropagate(item.node, backup_value);
+        ++dispatch_stats_.simulations;
+        ++par_.queued_leaves;
+
+        delivered_.fetch_add(1, std::memory_order_acq_rel);
+        outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+        item.in_use.store(false, std::memory_order_release);
+    }
+
     // --- diagnostics -------------------------------------------------------
 
     static std::string hex64(std::uint64_t value) {
@@ -2481,27 +3809,6 @@ private:
                 out += ' ';
             }
             out += uci_of(packed[i]);
-        }
-        return out;
-    }
-
-    // The move path from the root to wherever the descent currently is, in
-    // normalised UCI.
-    //
-    // Read off the ARENA's stored move rather than re-derived from the raw
-    // library move: the arena already holds the normalised packing (castling as
-    // e1g1, not e1h1), and re-deriving it would need the board as it stood
-    // BEFORE the castle, which the descent has already moved past.
-    std::string path_from_root() const {
-        if (path_.empty()) {
-            return "(root)";
-        }
-        std::string out;
-        for (std::size_t i = 0; i < path_.size(); ++i) {
-            if (i != 0) {
-                out += ' ';
-            }
-            out += uci_of(arena_.move(path_[i].node));
         }
         return out;
     }
@@ -2545,9 +3852,19 @@ private:
     // Borrowed. nullptr is tablebases off, which is the shipping default.
     const TablebaseProber *tablebase_ = nullptr;
 
+    // C9. The stand-in evaluator and its scratch. `synthetic_priors_` is only
+    // ever touched on the thread that expands — the dispatcher in a parallel
+    // search, the caller in a serial one — because expansion is single-threaded
+    // by construction, which is what lets one buffer serve it.
+    bool synthetic_fallback_ = false;
+    SyntheticEvaluator synthetic_;
+    std::vector<float> synthetic_priors_;
+
     std::uint32_t root_ = kNoNode;
     bool root_expanded_ = false;
-    std::uint16_t mating_move_ = kNoMove;
+    // C9. Atomic because W workers can find a mate in one at the same instant.
+    // See maybe_mate_short_circuit.
+    std::atomic<std::uint16_t> mating_move_{kNoMove};
 
     // The root position, in the three forms the descent needs it in. Computed
     // once by set_position rather than per simulation.
@@ -2566,30 +3883,66 @@ private:
     // order. Grows by one key per applied move — 80 keys over a game.
     std::vector<std::uint64_t> history_keys_;
 
-    // One step of the current descent. The raw library move is what unwinds the
-    // board; the arena index is what names the move in a diagnostic; the key,
-    // the occupancy and the irreversibility flag are what the two repetition
-    // rules read. Kept together so they can never fall out of step.
-    struct PathStep {
-        std::uint16_t raw_move;
-        std::uint32_t node;
-        std::uint64_t rep_key;
-        Bitboard occupied;
-        // `is_irreversible(move)` for the move that REACHED this position,
-        // evaluated on the position it was played from — which is python-chess's
-        // own evaluation point, after the pop.
-        bool irreversible_before;
-    };
+    // The one descent `search()` runs, pointing at the search's own board and
+    // its own counters. Scratch is reused across simulations so a
+    // 5,000-simulation search performs no allocation after the first few
+    // descents.
+    Descent serial_;
 
-    // Scratch, reused across simulations so a 5,000-simulation search performs
-    // no allocation after the first few descents.
-    std::vector<std::uint32_t> applied_;
-    std::vector<PathStep> path_;
-    // `path_counts` in the reference: rep_key -> occurrences on THIS path. A
-    // flat vector rather than a hash map — the path is at most MAX_TREE_DEPTH
-    // long, the scan is linear over a contiguous 12-byte record, and clearing a
-    // vector between simulations does not touch the allocator.
-    std::vector<std::pair<std::uint64_t, int>> path_counts_;
+    // --- C9 ----------------------------------------------------------------
+    //
+    // All of this is alive only between the first and last line of
+    // `run_workers`. Nothing here is touched by `search()`, and every counter is
+    // reset at the top of a parallel search rather than carried across one, so a
+    // second `search_parallel` on the same tree starts from a known state.
+
+    ParallelStats par_;
+    // Borrowed. See BatchHook.
+    BatchHook *hook_ = nullptr;
+
+    std::vector<std::unique_ptr<Descent>> descents_;
+    std::vector<SearchStats> worker_stats_;
+    SearchStats dispatch_stats_;
+    // The dispatcher's cache-hit scratch. Separate from `cache_hit_`, which
+    // belongs to the serial descent, because both could otherwise be live at
+    // once in a process that interleaved the two entry points.
+    CachedEval dispatch_cache_;
+
+    std::vector<std::unique_ptr<LeafNode>> slots_;
+    std::unique_ptr<MpscQueue> queue_;
+    // The dispatcher's working set for one drain. A member so a search performs
+    // no allocation per batch once it has grown to max_batch.
+    std::vector<LeafNode *> batch_;
+
+    // Simulations claimed. See worker_loop for why this is a claim-and-return
+    // protocol rather than a plain counter.
+    std::atomic<int> issued_{0};
+    // Simulations backed up into the root. Incremented by whichever thread
+    // performed the backup — a worker for a terminal, the dispatcher for an
+    // evaluated leaf — so it is the count of DELIVERED simulations and not of
+    // requested ones. Python's `stats['simulations'] += 1` was an unsynchronized
+    // read-modify-write over the same quantity across 32 threads; this is a
+    // `fetch_add`, which is why C9 can assert an equality where the reference
+    // could only report an estimate.
+    std::atomic<std::int64_t> delivered_{0};
+    // Leaves submitted and not yet backed up. This is the quantity scope 2.2
+    // makes the batch-governing knob, and the one every in-flight virtual loss
+    // belongs to.
+    std::atomic<int> outstanding_{0};
+    // Leaves in the queue and not yet popped. Read only by the dispatcher.
+    std::atomic<int> queued_{0};
+    std::atomic<std::uint64_t> drain_epoch_{0};
+    std::atomic<bool> aborted_{false};
+    int target_ = 0;
+
+    std::mutex mutex_;
+    std::condition_variable worker_cv_;
+    std::condition_variable dispatch_cv_;
+    int waiting_workers_ = 0;
+    int running_workers_ = 0;
+    std::int64_t collisions_ = 0;
+    std::int64_t waits_ = 0;
+    std::exception_ptr error_;
 };
 
 using DoubleReplaySearch = ReplaySearch<DoubleAccumulator>;

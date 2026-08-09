@@ -800,3 +800,338 @@ max 4.5 ms, on a game whose largest compaction is 2,600 nodes.
   but not zero.
 * The ASan build is roughly 8x slower here (the full suite runs in 15 min
   against 110 s) and its numbers do not belong in this table.
+
+---
+
+## C9 — The GPU knee, the W × K grid, and what the root distribution costs
+
+Reproduce with `python tools/bench_c9_knee.py --markdown` (GPU, needs torch) and
+`python tools/bench_c9.py --markdown` (CPU only, replay evaluator).
+
+### C9a — Where the evaluation curve actually knees
+
+The chunk brief required this measured before any W × K was locked, because two
+prior measurements gave *opposite* advice. They are now both explained.
+
+Sweep of batch ∈ {8…256} on the 10.9M v5 student, RTX 5070, torch 2.8.0+cu129,
+bf16 autocast, real board tokens from the Pass B shards.
+`torch.cuda.synchronize()` around **every** timed iteration.
+
+Three paths, because they are three different claims: `forward` is
+device-resident tokens and forward only; `reference` is
+`core.mctsv4._evaluate_batch` verbatim (H2D int64 → forward → full 4096-wide
+`.cpu()`); `gathered` is scope §2.1/§2.5's production path (pinned int32 H2D →
+forward → 64-wide gather → narrow D2H).
+
+**`gathered` — the curve C10 will run on:**
+
+| batch | isolated ms | saturated ms | best ms | best pos/s | SM MHz |
+|------:|------------:|-------------:|--------:|-----------:|-------:|
+| 8 | 5.766 | 5.663 | 4.101 | 1,951 | 2955 |
+| 16 | 4.927 | 5.469 | 3.763 | 4,252 | 2932 |
+| 32 | 5.528 | 5.692 | 3.821 | 8,374 | 2932 |
+| 64 | 5.019 | 5.484 | 4.009 | 15,965 | 2917 |
+| 128 | 7.462 | 7.826 | 7.046 | 18,166 | 2895 |
+| 256 | 14.320 | 14.525 | 13.946 | 18,356 | 2910 |
+
+`forward` peaks at 19,420 pos/s and `reference` at 17,950; the ordering across
+paths is stable and the shape is identical.
+
+**The knee is at batch 128, and the cost below it is on the HOST, not the GPU.**
+
+Per-batch time is flat at ~3.8–4.0 ms from batch 8 to batch 64 and only then
+rises linearly. That flat segment is not GPU work. Measured directly:
+
+| probe | host launch time | drain after |
+|---|---:|---:|
+| one v5 forward, batch 8 | 4.700 ms | 0.035 ms |
+| one v5 forward, batch 64 | 5.673 ms | 0.061 ms |
+| one v5 forward, batch 256 | 13.147 ms | 0.814 ms |
+| single 64×384 @ 384×384 matmul | 17.0 µs | — |
+| single `nn.Linear(384,384)` | 34.4 µs | — |
+| one `TransformerEncoderLayer` | 0.611 ms | — |
+
+`launch ≈ total` and `drain ≈ 0` below batch 128: the GPU finishes faster than
+the host can enqueue. At ~17–34 µs per ATen op on this machine and ~110 ops per
+forward, a 6-layer v5 forward costs ~4 ms of **CPU** regardless of batch size.
+
+This reconciles both prior measurements rather than choosing between them:
+
+* the recon-era model (**B ≈ 4.86 ms fixed, flat to batch 64**) was *right about
+  the shape* and wrong about the cause — it is host dispatch, not launch
+  latency, and it does not vanish under pipelining;
+* the 2026-08 model (**B ≈ 0, I ≈ 54 µs, linear**) sampled only 128 and 256,
+  which are both in the GPU-bound regime, and mistook the linear tail for the
+  whole curve.
+
+**Two things follow that C10 and C12 inherit.** Small batches are actively
+expensive here — batch 32 buys only ~8.4k evals/s — so the "minimise outstanding
+outright" reading of the newer curve does not hold. And the dispatcher will hold
+the GIL for ~4 ms per batch while launching kernels, which is four orders above
+the ~60 ns boundary cost C0b measured; CUDA graphs are the obvious lever and
+belong to C12.
+
+A methodological note worth keeping: the first run of this sweep produced a
+completely different curve (median 4–6 ms with p10 3.6 / p90 8.9 at every batch
+size) because a synchronized per-call measurement lets the GPU idle between
+iterations and an RTX 5070 drops to ~307 MHz of its 3090 MHz within that gap.
+Every row above reports the SM clock it was taken at, for exactly that reason.
+
+### C9b — The W × K grid, with W=1/K=1 as the reference row
+
+8 quiet positions × 6 repeats, 2,000 sims, virtual loss 2.5, `max_batch` 128,
+P-core pinning, Q32 accumulator. `TV vs serial` is total-variation distance
+between this cell's root visit distribution and the W=1/K=1 row's on the same
+position; `run-to-run TV` is the worst distance between two repeats of the same
+cell.
+
+| W | K | outstanding | sims/s | mean batch | collisions/sim | TV vs serial | run-to-run TV (mean / worst) | top share | stand-in% |
+|--:|--:|------------:|-------:|-----------:|---------------:|-------------:|----------------------------:|----------:|----------:|
+| 1 | 1 | 1 | 55,646 | 1.0 | 0.0000 | 0.0% | 0.0% / 0.0% | 78.4% | 0.0% |
+| 2 | 4 | 8 | 156,588 | 6.9 | 0.0313 | 14.5% | 2.6% / 7.2% | 77.8% | 9.2% |
+| 4 | 4 | 16 | 195,790 | 12.2 | 0.0808 | 16.3% | 5.1% / 26.7% | 73.2% | 11.3% |
+| 6 | 4 | 24 | 211,086 | 17.1 | 0.1184 | 19.3% | 4.4% / 17.5% | 69.3% | 13.9% |
+| 8 | 4 | 32 | 185,929 | 22.6 | 0.1019 | 29.3% | 11.3% / 62.8% | 60.8% | 25.0% |
+| 2 | 8 | 16 | 136,890 | 12.8 | 0.0282 | 16.4% | 4.2% / 20.9% | 72.7% | 11.3% |
+| **4** | **8** | **32** | **190,152** | **21.0** | **0.0792** | **28.6%** | **11.3% / 59.9%** | **61.0%** | **24.1%** |
+| 6 | 8 | 48 | 216,233 | 27.6 | 0.1154 | 32.0% | 5.2% / 9.4% | 59.3% | 26.6% |
+| 8 | 8 | 64 | 200,062 | 36.2 | 0.1071 | 35.3% | 7.2% / 16.4% | 53.2% | 29.3% |
+| 2 | 16 | 32 | 158,072 | 24.2 | 0.0236 | 29.6% | 8.6% / 40.8% | 59.8% | 24.8% |
+| 4 | 16 | 64 | 197,443 | 34.6 | 0.0623 | 34.8% | 7.7% / 24.4% | 54.3% | 28.3% |
+| 6 | 16 | 96 | 216,060 | 41.5 | 0.0974 | 36.7% | 7.7% / 20.0% | 50.6% | 31.3% |
+| 8 | 16 | 128 | 213,157 | 53.8 | 0.0981 | 39.4% | 5.0% / 10.5% | 45.6% | 36.9% |
+
+**Do not read the `run-to-run TV` column as this engine's reproducibility.** It
+is an upper bound contaminated by the stand-in evaluator — see the caveat under
+C9c, and DECISIONS.md C9 for the measurement showing the column tracking the
+stand-in's *share* rather than the simulation count. The acceptance criterion
+built on it is a ratio against `TV vs serial` (both equally contaminated), not an
+absolute bound; the absolute version is deferred to C10, where the real evaluator
+removes the confound. `test_layer3_root_visit_distribution_is_stable_across_runs`
+measures 0.15 against a 0.75 tolerance.
+
+### C9c — The control row, and the finding it produced
+
+The same measurement at **W=1** and K equal to each cell's W×K. These hold the
+same number of leaves in flight — therefore the same virtual-loss exposure — but
+have no concurrency at all and are deterministic.
+
+| W | K | outstanding | sims/s | TV vs serial | top share | stand-in% |
+|--:|--:|------------:|-------:|-------------:|----------:|----------:|
+| 1 | 1 | 1 | 55,646 | 0.0% | 78.4% | 0.0% |
+| 1 | 8 | 8 | 102,013 | 14.7% | 77.3% | 8.9% |
+| 1 | 16 | 16 | 118,228 | 22.4% | 66.8% | 14.2% |
+| 1 | 24 | 24 | 126,425 | 31.3% | 61.4% | 25.5% |
+| 1 | 32 | 32 | 129,582 | 34.3% | 55.8% | 28.0% |
+| 1 | 48 | 48 | 137,934 | 39.3% | 48.2% | 34.1% |
+| 1 | 64 | 64 | 137,640 | 40.7% | 44.5% | 38.7% |
+| 1 | 96 | 96 | 136,798 | 43.3% | 43.6% | 44.6% |
+| 1 | 128 | 128 | 134,426 | 44.9% | 41.0% | 47.3% |
+
+**Root flattening is a function of the outstanding-leaf count and of nothing
+else.** Compare like for like at equal in-flight counts:
+
+| outstanding | deterministic (W=1) | concurrent | excess |
+|---:|---:|---|---:|
+| 16 | 22.4% | 16.3% (W=4/K=4), 16.4% (W=2/K=8) | **−6.1 pp** |
+| 32 | 34.3% | 28.6% (W=4/K=8), 29.3% (W=8/K=4), 29.6% (W=2/K=16) | **−5.2 pp** |
+| 64 | 40.7% | 35.3% (W=8/K=8), 34.8% (W=4/K=16) | **−5.6 pp** |
+| 128 | 44.9% | 39.4% (W=8/K=16) | **−5.5 pp** |
+
+The concurrent configurations are consistently *less* flattened than the
+deterministic control holding the same leaves in flight, never more. **The new
+parallelism model carries no concurrency tax of its own** — the entire cost is
+virtual-loss exposure, exactly as scope §2.2 predicted when it made
+`max_outstanding` the governing knob in place of the worker count. This is the
+diagnostic the C9 brief asked for and it is the chunk's main measured result.
+
+The effect size matches Python's landmark closely: top-move share falls
+78.4% (serial) → 77.3% (8) → 66.8% (16) → 55.8% (32) → 44.5% (64) → 41.0% (128),
+against Python's serial 58% → 37% at 32 outstanding.
+
+The reproduction is `python tools/bench_c9.py --markdown`, whose `--control`
+rows are on by default for this reason, and the property is pinned as a test:
+`test_root_flattening_tracks_outstanding_leaves_not_worker_count`.
+
+**Caveat, stated because it bounds every number in the two tables above.** C9
+runs on the replay evaluator, whose dump holds exactly the positions the *serial*
+Python reference evaluated. A parallel search leaves that set within about five
+plies, so 24–37% of expansions at production settings are answered by the
+stand-in evaluator (`stand-in%` column). Absolute `TV vs serial` figures are
+therefore an upper bound: the serial row has 0% stand-in coverage and every other
+row does not. The *comparisons between rows at equal outstanding count* — which
+is where the finding lives — are sound, because those rows carry near-identical
+stand-in shares (e.g. 28.0% vs 24.1% at 32 outstanding).
+
+### C9d — Thread affinity: measured, and only visible at a realistic budget
+
+K=8, 6 positions × 5 repeats. **20,000 sims per run**, which matters: the same
+sweep at 2,000 sims shows no effect at all, because a 10 ms search does not give
+Windows' Thread Director time to move anything.
+
+| configuration | outstanding | sims/s @ 20k | sims/s @ 2k |
+|---|---:|---:|---:|
+| W=4, one thread per P-core | 32 | **184,907** | 196,663 |
+| W=4, unpinned | 32 | 160,869 | 195,928 |
+| W=6, one thread per P-core | 48 | **225,825** | 209,989 |
+| W=6, unpinned | 48 | 181,357 | 214,160 |
+| W=12, both SMT siblings | 96 | **240,330** | 234,295 |
+| W=12, unpinned | 96 | 230,478 | 227,922 |
+| W=12, all logical (E-cores included) | 96 | 237,861 | 228,998 |
+
+Pinning to P-cores buys **+14.9% at W=4** and **+24.5% at W=6**, and only +4.3%
+at W=12 where the threads fill the P-core complex anyway. The brief's reasoning
+holds: a worker parked on an E-core holds the root's contended atomics longer,
+and the root is on every descent path.
+
+W=6 vs W=12 answers as **W=6, one thread per P-core**. W=12 is 6.4% faster in raw
+sims/s, but it does that at 96 outstanding leaves against 48 — twice the
+virtual-loss exposure, worth ~5 points of top-move share — and throughput is not
+the binding constraint (see C9e). SMT does help descent slightly, which is
+consistent with it being memory-latency-bound; it is not worth the leaves.
+
+### C9e — Why throughput does not decide this
+
+The CPU numbers above are on the replay evaluator, i.e. the descent rate with a
+free evaluator. The GPU ceiling from C9a is ~18.4k evals/s at batch 128; at the
+measured 24.7% cache hit rate (C7) that is ~24.4k sims/s. Every cell in the grid
+is 5–10× that. **The CPU is not the constraint and cannot be made one by
+choosing W** — so W and K are chosen on root-distribution quality, and the only
+question throughput answers is which configurations are ruled out. None are.
+
+Sizing against Gate 4's floor, using C9a's `gathered` column:
+
+| outstanding | evals/s | ⇒ sims/s at 24.7% hits | vs Gate 4 floor (8k) | top share |
+|---:|---:|---:|---|---:|
+| 16 | 4,252 | 5,647 | **short** | 73% |
+| 32 | 8,374 | 11,121 | 1.39× | 61% |
+| 64 | 15,965 | 21,201 | 2.65× (clears the 15k stretch) | 53% |
+| 128 | 18,166 | 24,124 | 3.02× | 46% |
+
+The sims/s column is `evals/s ÷ (1 − 0.247)` and is therefore a **floor**: scope
+§6.2 reconciles `sims = evals + cache hits + terminal visits`, and terminal
+visits need no evaluation either, so the true rate is above these. It is also a
+GPU-side ceiling only — it assumes the dispatcher can keep the device fed, which
+C9's quiescence drain trigger does not fully do (workers idle during a batch).
+C10 measures the real thing.
+
+**Shipping default: W=4, K=8, `max_batch` 128, P-core physical pinning.** 32
+outstanding clears Gate 4's floor with 1.39× margin at 61% top-move share. Going
+to 64 outstanding would clear the 15k stretch target but costs 8 points of top
+share, and the brief is explicit that a configuration faster and visibly flatter
+at the root is the wrong trade. If C12 finds Gate 4 short, W=4/K=16 or W=8/K=8 is
+the lever, and it is a measured trade rather than a guess.
+
+### C9f — Dispatcher GIL acquisition: the prediction held
+
+Scope §2.1's prediction was specific — acquisition stays near the uncontended
+floor, and any excursion toward milliseconds means Python bytecode is running
+during a search that should not be. W=4/K=8, dispatcher acquires once per batch.
+
+| run | batches | median | p90 | p99 | max | total | share of wall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2,000 sims | 107 | 1.00 µs | 2.10 µs | 2.70 µs | 9.90 µs | 0.133 ms | 1.64% |
+| 20,000 sims | 906 | 1.30 µs | 2.40 µs | 3.60 µs | 12.20 µs | 1.409 ms | 1.46% |
+| in-suite | 236 | 1.60 µs | — | 3.70 µs | 17.20 µs | 0.425 ms | 1.60% |
+
+**Prediction held.** p99 is 2.7–3.7 µs against C10's 200 µs trigger for C++-side
+`info` emission — nearly two orders of margin — and the worst single acquisition
+across every run is 17 µs. Nothing competes for the interpreter during a search,
+which is what §2.1's discipline predicted and what C10 depends on.
+
+The median sits above C0b's ~60 ns floor because this is a *foreign* thread
+acquiring for real (C0b's 60 ns was a recursive no-op on the calling thread), and
+because `std::chrono::steady_clock` on Windows is QPC at a 100 ns tick.
+
+This measurement is taken with the replay evaluator, so it is the floor and not
+the answer: C10 puts torch in the callback, and C9a says that callback will hold
+the GIL for ~4 ms per batch. The number to watch there is the dispatcher's
+*acquire wait*, which is what this measures, not the call duration.
+
+### C9g — ThreadSanitizer: the mandatory acceptance run
+
+TSan does not exist on MSVC, which is the reason Global Rule 8 requires this
+codebase to build on Linux at all. Build: Clang 18.1.3, Debug, `-fsanitize=thread`,
+asserts live, `TSAN_OPTIONS=halt_on_error=0:history_size=7:second_deadlock_stack=1`
+so a run reports *every* race rather than stopping at the first.
+
+```
+$ LD_PRELOAD="$(clang -print-file-name=libclang_rt.tsan-x86_64.so)" \
+  TSAN_OPTIONS=halt_on_error=0:history_size=7:second_deadlock_stack=1 \
+  PYTHONPATH="$HOME/build/gf-c9-tsan" python -m pytest tests/ -q
+
+1229 passed, 49 skipped in 651.03s (0:10:51)
+pytest exit=0
+
+ThreadSanitizer warnings: 0
+```
+
+That covers acceptance layers 2 and 3 and the whole W × K sweep — every
+`search_parallel` test in `tests/test_c9_concurrency.py` runs under it, including
+W=8/K=16 at 128 outstanding leaves.
+
+**The sanitizer is demonstrably able to fail.** A clean run is evidence only if
+"TSan reported nothing" can be distinguished from "TSan was not looking", and the
+two produce identical logs. `guofish_core.race_probe()` increments a plain `int`
+from four threads with no synchronisation:
+
+```
+WARNING: ThreadSanitizer: data race (pid=32190)
+  Read of size 4 at 0x7ffc61fbfacc by thread T2:
+    #0 ...::race_probe...::operator()() const cpp/bindings.cpp:2750:39
+  Previous write of size 4 at 0x7ffc61fbfacc by thread T1:
+    #0 ...::race_probe...::operator()() const cpp/bindings.cpp:2750:37
+  Location is stack of main thread.
+```
+
+`test_thread_sanitizer_can_actually_fail` asserts this: under a TSan build the
+probe must produce a `data race` report and a non-zero exit; under any other
+build it must run to completion with no report. `guofish_core.TSAN` reports which
+build is loaded, so the acceptance claim rests on a checked fact rather than on a
+log file's name.
+
+**What a clean TSan run does not prove.** Both concurrency bugs found during this
+chunk — a missed wakeup on the abort path, and a worker spinning instead of
+sleeping because the drain epoch was read outside its retry loop — are *not* data
+races, and TSan was silent on both. They were found by acceptance layer 2 and by a
+test suite that took 600 s instead of 3 s. TSan proves the absence of races; it
+does not prove the absence of concurrency bugs, and the layered acceptance is what
+covers the rest.
+
+### C9h — AddressSanitizer + UndefinedBehaviorSanitizer
+
+Same source, Clang 18.1.3, Debug, `-fsanitize=address,undefined`:
+
+```
+1229 passed, 49 skipped in 401.00s (0:06:40)
+
+leaks whose stack mentions guofish_core : 0
+UBSan runtime errors                    : 0
+ASan hard errors (heap/stack/global/UAF): 0
+SUMMARY: AddressSanitizer: 1349986 byte(s) leaked in 1254 allocation(s)
+```
+
+The 1.35 MB is CPython and numpy holding interpreter-lifetime allocations, which
+`README_BUILD.md` documents at ~1.4 MB in ~1300 allocations. The discriminating
+check is the first line, not the total: **zero** leaked allocations run through
+`guofish_core`. That property was briefly lost in this chunk and restored — see
+DECISIONS.md, C9, on why `py::enum_` was removed from the Python surface.
+
+### Measurement notes
+
+* `sims/s` is always **delivered** simulations, counted by `fetch_add` on the
+  thread that performed the backup — never the requested budget. Every cell also
+  asserts `delivered == requested`, `vloss_total == 0` and zero conservation
+  failures before it is allowed into a table; a cell whose numbers are not
+  conserved is not a measurement.
+* The W=1/K=1 row's 55.6k sims/s is far below C5's 178k single-threaded figure
+  and that is expected, not a regression: at one in-flight path every simulation
+  round-trips through the dispatcher handshake. K=1 is an acceptance
+  configuration, not a production one.
+* `mean batch` tracks the outstanding count rather than the worker count, which
+  is the property scope §2.2 asked for. At virtual loss 0 with K=8 it collapses
+  to ~1 — the second descent re-selects the first descent's leaf and collides —
+  and that is the positive evidence that the dispatcher has no minimum-batch
+  floor.
+* The knee sweep needs a GPU and torch; the grid does not. Everything in C9b–C9f
+  runs on the replay evaluator and belongs in CI.

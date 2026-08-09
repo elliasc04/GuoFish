@@ -4034,3 +4034,638 @@ ea9bf8dfe40196460b6c2d4a0c47217d64998193eb1b4a9f7bb2697b413ce562  tokens.npz
 
 Every pre-C8 digest is identical to the one recorded in the C7 entry. The three
 new files are this chunk's.
+
+---
+
+# C9 — Concurrency: W workers, K in flight, one dispatcher (2026-08-08)
+
+The third high-risk chunk, and the one where "looks fine" is least trustworthy.
+Everything below is a judgment call the brief did not settle, in the order a
+reader would meet it.
+
+## The dispatcher's drain trigger, which is the one decision a reader should not have to reverse-engineer
+
+The brief requires two things that interact, and the interaction is not
+acknowledged in either sentence:
+
+* *"The dispatcher thread drains `min(available, max_batch)` without a
+  minimum-batch floor or straggler timeouts."*
+* *"W=1, K=8 must be run twice. Because descent is single-threaded and batch
+  ordering is deterministic, the output MUST be bit-identical trees."*
+
+A dispatcher that drains the instant a leaf appears satisfies the first and
+**cannot** satisfy the second. At W=1 the worker submits a leaf and immediately
+begins the next descent; whether the dispatcher has expanded that leaf by the
+time the next descent reaches it is a scheduling question, and the two cases give
+different trees — one sees an expanded node, the other sees a virtual loss. The
+second claim's premise ("batch ordering is deterministic") is only true if
+something makes the *handoff points* deterministic, and nothing in the brief
+does.
+
+**Chosen:** the drain trigger is *"the queue is non-empty and no search thread
+can currently make progress"* — every worker is throttled, waiting after a
+collision, or finished.
+
+Considered and rejected:
+
+* **Drain eagerly.** Fails acceptance layer 2, which the brief calls the only
+  clean test of the in-flight machinery and says nothing proceeds without.
+* **Drain eagerly, and make layer 2 a special case** (e.g. an inline dispatcher
+  at W=1). Then layer 2 tests code that layer 3 does not use, which is worse
+  than not testing it.
+* **A minimum batch size.** This is the Python lockstep pathology by name.
+* **A straggler timeout.** This is the Python starved-queue pathology by name.
+
+Why the chosen trigger is not either pathology, stated precisely because it
+superficially resembles the first: there is **no threshold on batch size** — the
+drain takes whatever is there, and at W=1/K=8 with virtual loss 0 that is a batch
+of **one**, because the second descent re-selects the first descent's leaf,
+collides, and waits. `test_the_dispatcher_has_no_minimum_batch_floor` asserts
+that a batch of size 1 actually occurs. And there is **no clock anywhere in the
+dispatcher** — no deadline, no timeout, no sleep. Batch size is set by the
+outstanding-leaf count, which is exactly what scope §2.2 asks for.
+
+The cost is real and worth stating: workers idle during a drain, so CPU and
+evaluator do not overlap. At the measured rates that is nearly free — descent is
+5–10× the GPU's ceiling (BENCH.md C9e) — but it is a genuine 10%-class
+throughput ceiling that a future chunk could lift by letting the throttle count
+only *queued* leaves rather than *unresolved* ones. That change would trade layer
+2's reproducibility away, so it should not be made without a replacement test.
+
+## Per-worker slot rings, not a shared pool
+
+The brief phrases the throttle two ways — *"K in-flight paths per thread"* and
+*"a thread must stall ONLY if the global outstanding-leaf count hits W*K"* — and
+they differ when the workers are unbalanced: a worker can exhaust its own K while
+the global count is below W×K.
+
+**Chosen:** per-worker rings of K slots, plus a global `outstanding_` counter
+used for reporting and for the histogram scope §6.2 asks for.
+
+The difference is unobservable here, and the reason is the drain trigger above:
+the dispatcher drains only when *every* worker is blocked, so a worker that
+blocks early simply blocks sooner into the same drain. What the rings buy is that
+a submission touches no shared allocator — the hot path is one relaxed load and
+one release store on a flag this worker is the only producer for.
+`ParallelStats::worker_waits` counts how often a worker had to wait, so the
+distinction stays visible if it ever stops being free.
+
+## The descent state had to be split out, and that is what acceptance layer 1 tests
+
+Through C8, `run_simulation` mutated plain members of the search: one board, one
+path, one applied-virtual-loss list. W of them at once needs that state
+per-thread, and the honest way to get there is a `Descent` struct — a lock around
+the descent would delete the entire point of the chunk.
+
+The serial path is **not** reimplemented on top of the parallel one. `search()`
+builds one `Descent` pointing at the search's own board and its own
+`SearchStats`, and runs exactly the code C5–C8 were certified on;
+`run_simulation_parallel` is a separate function that differs only in leaf
+handling. Two functions rather than one behind a flag, because the flag would
+put a branch inside the hottest loop in the engine and because the serial one is
+the certified artifact and should be left alone.
+
+`Descent::board` is a pointer rather than a value for a reason that is easy to
+get wrong: the serial descent must drive the *search's* board, since `apply_move`,
+`terminal_nodes` and `root_fen` all read it afterwards. A descent that unwound a
+copy would leave the real board where the last simulation left it.
+
+Acceptance layer 1 (W=1/K=1 bit-exact against Gate 1, both corpora, both
+virtual-loss magnitudes, 145 runs) is the test of this refactor, and it passes.
+
+## Diagnostics had to stop reading the board
+
+`lookup` and `expand` built their failure messages from `board_` at the point of
+failure, which worked because the board was still at the leaf. Under C9 the leaf
+is evaluated on the dispatcher, which has no board and could not cheaply be given
+one. So a small `LeafDiag` — the `ParsedFen`, the halfmove clock, the fullmove
+number, and the path as packed moves — travels with the leaf.
+
+`fen_of(parsed, clock, fullmove)` reproduces `SearchBoard::diagnostic_fen()`
+exactly, by construction: that function *is* the same call on the same
+`ParsedFen`. The message text is unchanged, which matters because
+`tests/test_c5_gate1_quiet.py` pins the literal column headings.
+
+`Descent::path_moves` is maintained alongside `path` rather than derived from it,
+because a failure message needs the path after the descent has been handed to
+another thread — at which point the arena indices are still valid but the board
+that could interpret them is halfway back up the tree.
+
+## Two new arena methods, both about one write to `terminal_value_`
+
+`mark_terminal` is a load, a plain store to `terminal_value_[i]`, and a release
+store. Correct for one thread; a data race for two, and W workers *can* reach the
+same first-visit terminal leaf simultaneously. Both would write the same float —
+benign in practice, undefined behaviour in the standard, and a ThreadSanitizer
+report either way.
+
+The fix is not a lock. The parallel descent already takes a PENDING claim before
+evaluating a leaf, and that claim *is* the exclusivity this needs. So:
+
+* **`mark_terminal_pending(i, value)`** — the caller already holds PENDING (the
+  intrinsic-terminal case, where the worker claimed the leaf in order to submit
+  it). Writes the value and publishes `Unexpanded | TERMINAL` in one release
+  store.
+* **`try_mark_terminal(i, value)`** — claim and mark, for the caller that did not
+  already hold the node: the claimable-draw case, where the descent discovers a
+  fifty-move or threefold draw at a node it was only passing through. Returns
+  false if someone else got there first.
+
+`try_mark_terminal` returning false is **not** an error and the caller does not
+retry. Within one search, `draw_by_rule` is a function of the node alone — a
+node's path from the root is unique in a tree, and the repetition history is
+fixed for the search — so a second thread reaching the same node computes the
+same answer and is marking the same value. The loser backs up the draw it
+independently derived.
+
+Both are additive; `mark_terminal` is untouched and the serial path still calls
+it, so C5–C8's certified behaviour is unchanged.
+
+**One behavioural divergence between the two paths, recorded rather than fixed.**
+`mark_terminal` *throws* if the node already has children; `try_mark_terminal`
+returns false and the parallel descent backs up 0.0 without marking. The case is
+unreachable within a search (a draw node is never expanded) but is reachable
+across `apply_move`, where tree reuse can turn an already-expanded node into a
+draw. The serial path would crash there and the parallel path would not. Neither
+is exercised by the corpus; the parallel behaviour is the better one, and the
+divergence is flagged here rather than harmonised, because harmonising it means
+changing C5–C8's certified code on a case no test covers.
+
+## `value_sum` is Q32 here, and that is what makes the invariants exact
+
+Scope §2.3 pre-decided this and C4 built both accumulators; C9 is where the
+consequence is collected. Integer `fetch_add` is associative, so the accumulated
+sum does not depend on thread interleaving, and the conservation invariants are
+statements about arithmetic rather than about rounding:
+
+* every expanded node has `visits == 1 + sum(children visits)`;
+* the arena-wide virtual-loss total returns to exactly 0;
+* delivered simulations equal the requested budget exactly.
+
+No epsilon appears anywhere in `tests/test_c9_concurrency.py`.
+
+Acceptance layer 1 still runs the **double** accumulator, because Gate 1's
+`value_sum` comparison is bit-exact against Python's floats. Both are exercised:
+`test_q32_and_double_accumulators_agree_on_the_tree_shape` runs the same position
+through both and requires identical visit counts and the same best move, with the
+value sums agreeing to within Q32's stated 2⁻³² resolution times the visit count
+— a bound derived from the representation rather than an epsilon chosen to pass.
+
+## Exact simulation accounting, and why it is a claim-and-return protocol
+
+Python's `stats['simulations'] += 1` was an unsynchronized read-modify-write over
+this exact quantity across 32 threads, which is why its throughput figures could
+not be trusted to the last few percent.
+
+A worker claims a simulation with `issued_.fetch_add(1)` before starting. A claim
+at or past the target is handed straight back and the thread leaves. A descent
+that is **discarded** (lost PENDING claim) also hands its claim back and loops —
+so the slot is never lost, because the discarding thread is still in the loop and
+will re-take it if nobody else does. At quiescence `issued_` is therefore exactly
+`target_`, and `delivered_` — incremented by `fetch_add` on whichever thread
+performed the backup — equals it.
+
+The proof that no slot is stranded: suppose all threads have exited with
+`issued_ == k < target`. The last thread to exit did so because its
+`fetch_add` returned a value ≥ target; after its compensating `fetch_sub` the
+counter reads k, so the value it saw was k, and k < target. Contradiction.
+
+## The stand-in evaluator: what it is, what it is not, and why layers 2 and 3 need one
+
+**This is the most consequential judgment call in the chunk and the one most
+likely to be challenged, so the reasoning is written out in full.**
+
+The Gate 1 dump holds exactly the positions the *serial* Python reference
+evaluated. That is precisely what makes a dump miss the strongest test in C5: the
+search can only stay inside the dump if it walks the same tree, so a miss proves
+a divergence. C9 breaks that premise **on purpose**. With K in-flight paths,
+virtual loss steers descents onto branches the serial reference never opened —
+that is the entire mechanism of leaf parallelism, and it is working correctly
+when it happens. Measured: the first miss arrives about five plies in at W=1,
+K=8.
+
+Regenerating a dump wide enough is not available. The set of positions a parallel
+search reaches depends on the scheduling of the run under test, so producing the
+reference would mean running the implementation under test to decide what the
+reference should contain. That is circular in exactly the way Global Rule 2
+exists to prevent.
+
+**Chosen:** an opt-in, counted fallback. `ReplaySearch::set_synthetic_fallback`
+defaults to **off**, so C5–C8 keep the hard-failure behaviour their acceptance
+rests on. `SearchStats::synthetic_evaluations` counts every leaf it answered, so
+"the fallback was off" is checkable *after* the run rather than only asserted
+before it — acceptance layer 1 asserts it is 0 on all 145 runs.
+
+The split that follows is the honest one:
+
+* **layer 1** compares against Python, runs with the fallback off, asserts the
+  counter is 0;
+* **layers 2 and 3** assert reproducibility and conservation — neither is a claim
+  about what the network said — and run with it on. Real dump entries are still
+  used wherever they exist.
+
+**The first version of the stand-in was wrong, and the way it was wrong is worth
+recording.** It hashed the `nn_key` into a value and a prior distribution. That
+is deterministic and well-formed, and it fails a third requirement I had not
+identified: it is not *smooth across positions*. Two positions one move apart get
+uncorrelated values, which no real evaluator does. Two parallel runs open
+slightly different branches, so under a hashing evaluator they draw different
+random numbers and the root distribution moves for a reason that has nothing to
+do with concurrency. Measured, 8 runs per cell at W=4/K=8:
+
+| position | stand-in share of expansions | worst pairwise root TV |
+|---|---:|---:|
+| 0 | 2.3% | 5.9% |
+| 4 | 11.1% | 9.9% |
+| 5 | 49.4% | 50.2% |
+| 5 | 72.0% | 77.2% |
+
+The spread tracks the stand-in's *share*, not the simulation count — the
+signature of the evaluator driving it rather than the engine. Replaced with a
+material-plus-centralisation evaluation and capture-ordered priors: a weak
+evaluator, and deliberately not a good one, but **continuous** in the way a
+network is, so two positions one move apart differ by at most one captured piece.
+That is the property that makes "the root distribution barely moves between two
+runs" a statement about the search rather than about the noise.
+
+## Acceptance layer 3's root-stability criterion was restated, and the original is deferred to C10
+
+The brief asks for *"root visit distribution is stable across 10 runs within a
+stated tolerance"*. **The absolute-tolerance version is not honestly measurable
+in C9**, and the first attempt at it in this chunk failed for the right reason: a
+3 pp tolerance derived from one position's spread failed on another position at
+3.64 pp, and the correct response was to question the statistic rather than to
+raise the number.
+
+Two things defeat an absolute bound:
+
+1. On a contested position the top two root moves are within a few percent of
+   each other, so which one leads after 2,000 simulations is decided by a few
+   hundred visits and moves run to run. That is correct MCTS behaviour under any
+   parallelism.
+2. 24–37% of expansions at production settings come from the stand-in evaluator,
+   and the section above shows the spread tracking that share.
+
+**Chosen:** a ratio. The criterion compares the distance between two runs of the
+*same* configuration against the distance from that configuration to W=1/K=1, its
+own serial ground truth, and requires the first to be comfortably smaller. It
+says: the tree this configuration builds is a property of its virtual-loss
+exposure, and scheduling perturbs it by less than that exposure already does.
+Both distances carry the stand-in contamination roughly equally, so the ratio is
+far more robust than either number alone. Tolerance 0.75; measured 0.15.
+
+A second assertion keeps the ratio from being satisfiable by a configuration that
+has simply wandered far from serial: run-to-run distance must also stay below
+0.21, the total-variation distance between Python's serial root distribution
+(58/28/11/3) and its 32-outstanding one (37/29/23/11). That is the effect the
+whole W×K sizing exercise is about, so scheduling alone moving the answer by as
+much as the entire parallelism decision would be a failure.
+
+**The absolute-tolerance version is carried to C10**, where the real evaluator
+removes the confound. This is a partial deferral of a stated acceptance
+criterion, not a pass, and it is recorded as such in the C9 result.
+
+## Root flattening is caused by outstanding leaves, not by concurrency
+
+The measurement the brief asked for, and the chunk's main finding. Full tables in
+BENCH.md C9b–C9c; the short form:
+
+| outstanding | deterministic W=1 | concurrent | excess |
+|---:|---:|---|---:|
+| 16 | 22.4% | 16.3% / 16.4% | −6.1 pp |
+| 32 | 34.3% | 28.6% / 29.3% / 29.6% | −5.2 pp |
+| 64 | 40.7% | 35.3% / 34.8% | −5.6 pp |
+| 128 | 44.9% | 39.4% | −5.5 pp |
+
+Holding the number of in-flight leaves fixed, the concurrent configurations are
+consistently *less* flattened than the deterministic W=1 control, never more. The
+new parallelism model carries **no concurrency tax of its own**; the entire cost
+is virtual-loss exposure, which is what scope §2.2 predicted when it made
+`max_outstanding` the governing knob in place of the worker count.
+
+This is now a test rather than a table:
+`test_root_flattening_tracks_outstanding_leaves_not_worker_count`.
+
+It also settles a question the brief left open. W and K matter only through their
+product, so the split between them is free to be chosen on other grounds — which
+is why the affinity result below can pick W without arguing about quality.
+
+## Affinity policy: pin to P-cores, one thread per physical core
+
+The brief asked for W=6 (one per P-core) against W=12 (SMT siblings) explicitly.
+
+Measured at 20,000 sims (BENCH.md C9d): pinning buys **+14.9% at W=4** and
+**+24.5% at W=6**; W=12 SMT is the raw throughput winner at 240k sims/s against
+W=6's 226k.
+
+**Chosen: `PCorePhysical`, W=4 by default.** W=12's 6.4% throughput edge comes at
+96 outstanding leaves against 48 — twice the virtual-loss exposure, worth ~5
+points of top-move share — and throughput is not the binding constraint: every
+grid cell is 5–10× the GPU ceiling. SMT does appear to help descent slightly,
+which is consistent with pointer-chasing being memory-latency-bound; it is not
+worth the leaves.
+
+**The affinity effect is invisible at a short budget**, and that is a measurement
+trap worth recording: the identical sweep at 2,000 sims shows pinned and unpinned
+within noise of each other (196.7k vs 195.9k at W=4), because a 10 ms search does
+not give Windows' Thread Director time to move anything. Any future affinity
+measurement must use a realistic budget.
+
+Everything degrades rather than fails. `Topology::source` reports the API or
+sysfs path it came from, or the reason there are none, and a platform that will
+not report a hybrid split says so instead of guessing — WSL2 does not expose
+`cpu_capacity`, so the Linux runs report `hybrid=False` and treat all 16 logical
+processors as performance cores. Pinning threads to an *inferred* layout would be
+worse than not pinning them, because the resulting BENCH.md row would claim
+something untrue. A refused affinity request rewrites the reported slot to −1
+rather than throwing.
+
+The dispatcher is deliberately **not** pinned. The brief asks for the search
+threads; the dispatcher's placement becomes a real question in C10, when it
+starts launching kernels and holding the GIL for milliseconds.
+
+## The MPSC queue is Vyukov's, and FIFO is a requirement
+
+Chosen over a mutex-protected deque for one reason that matters and one that does
+not. **Matters:** a producer's push is a single `exchange` plus a single store, so
+a search thread preempted between them cannot block any other producer — and with
+W threads on a hybrid scheduler, "a thread was descheduled at a bad moment" is a
+normal event. **Does not:** raw throughput; there is one push per simulation
+against ~5.6 µs of descent, and a mutex would be fast enough.
+
+FIFO is load-bearing, not incidental. Acceptance layer 2 holds only if the
+dispatcher expands leaves in submission order, because expansion order determines
+the tree the next descent sees. A LIFO stack — the cheaper lock-free structure —
+would fail layer 2 for a reason that is not a bug.
+
+`LeafNode` derives from `MpscNode` so the dispatcher recovers the leaf with a
+`static_cast` down a non-virtual base. That is deliberate: Global Rule 6's
+`reinterpret_cast` question never arises.
+
+## Two real concurrency bugs found during the chunk
+
+Recorded because both were found by the tests rather than by reading, and both
+are the kind that would have been attributed to something else later.
+
+**1. Missed wakeup on the abort path.** `record_error` set `aborted_` *outside*
+the mutex, then notified. Both wait predicates read `aborted_`, so the store
+raced the window between a waiter evaluating its predicate and actually sleeping:
+the notify fired into an empty condition variable and the waiter never woke. A
+deadlock reachable from any exception — an exhausted arena, a dump miss — which
+is to say from the paths a test is most likely to take. Fixed by setting the flag
+under the mutex.
+
+**2. A worker spinning instead of sleeping.** The throttle loop read the drain
+epoch *once*, outside the retry loop:
+
+```
+epoch = drain_epoch_.load();
+while ((item = acquire_slot()) == nullptr) { worker_block(epoch); }
+```
+
+After the first wake, `drain_epoch_ != epoch` is permanently true, so every
+subsequent `worker_block` returned instantly and the thread spun on
+`acquire_slot`. It only manifests when a drain can fail to free one of *this*
+worker's slots — W>1 with `max_batch` below the outstanding count — which is a
+configuration a throughput sweep reaches and a W=1 test does not. Symptom was a
+test suite that ran for >600 s at 100% CPU instead of 3 s. Fixed by reading the
+epoch inside the loop, before re-checking the condition and before sleeping.
+
+Neither is a data race, so neither would have been caught by ThreadSanitizer.
+That is worth noting alongside the clean TSan run: TSan proves the absence of
+races, not the absence of concurrency bugs.
+
+## The sanitizer's own credentials
+
+A clean ThreadSanitizer run is C9's mandatory acceptance evidence, and it is
+evidence only if the sanitizer can be shown to fail — the same argument the
+mutation drill makes about golden data. "TSan reported nothing" and "TSan was not
+looking" produce identical logs.
+
+So `guofish_core.race_probe()` increments a plain `int` from four threads with no
+synchronisation. Under a TSan build that must produce a report;
+`test_thread_sanitizer_can_actually_fail` runs it in a subprocess with
+`halt_on_error=1` and requires a non-zero exit and a `data race` in stderr. On a
+non-TSan build it asserts the opposite — the probe runs to completion — so the
+test is meaningful on both platforms rather than a skip that hides a hole.
+
+This deliberately introduces undefined behaviour into the module. It is
+quarantined behind an explicit call that only the test makes, and nothing in the
+engine references it.
+
+`guofish_core.TSAN` reports the build flag, following the `DEBUG_VL` precedent
+rather than extending `build_info()`, whose key set `tests/test_c0b_contention.py`
+pins.
+
+## The cache is probed on the dispatcher, not on the worker
+
+A cache hit still costs a queue trip and an outstanding slot. The reference
+checks its cache in the worker before submitting.
+
+**Chosen:** probe where the expansion happens. Scope §2.2 says expansion is
+single-threaded by construction, and that is what leaves `set_children` with one
+caller per node and the arena's bump allocator with one writer. Splitting the
+probe from the expansion would mean a hit and a miss take different paths through
+the concurrency, which is a second thing to get right for a saving that is
+invisible at C9's defaults (the cache is off by default, and C7's acceptance runs
+the serial path).
+
+Recorded as a C12 lever: probing on the worker would let a hit skip the queue
+entirely, at the cost of a second expansion entry point.
+
+## Skips are data-driven, per Amendment D
+
+The first version of `test_layer1_...` parametrised over `range(200)` and skipped
+the tail, producing 294 skips no report could account for. Amendment D exists
+because exactly that pattern hid a 242-test hole on Linux for a whole chunk. The
+parametrisation now reads the manifests at collection time and yields one
+parameter per recorded run; a missing golden file yields one parameter that
+*fails* with the regeneration instructions rather than silently yielding zero
+tests.
+
+## The affinity policy crosses the boundary as a string, because `py::enum_` leaks
+
+`py::enum_<AffinityPolicy>` was the obvious binding and it was the only
+`py::enum_` in the module. AddressSanitizer on Linux/Clang found it leaking its
+registration at import: **4,402 bytes in 78 allocations**, every stack running
+through `pybind11::enum_<guofish::AffinityPolicy>` →
+`pybind11::cpp_function::make_function_record()` → `pybind11_init_guofish_core`.
+
+The measurement is an A/B against `HEAD` rather than an inference. Same
+compiler, same flags, same bare `import guofish_core`:
+
+| build | leaked on import | frames through module init |
+|---|---:|---:|
+| `HEAD` (C8) | 0 bytes | 0 |
+| C9 with `py::enum_` | 4,402 bytes | 79 |
+| C9 with strings | 0 bytes | 0 |
+
+The number is trivial, one-time, and not per-search — it would never show up as
+a growing footprint. **It was still worth removing**, and the reason is not the
+bytes. `README_BUILD.md`'s leak discriminator is *"no leaked allocation's stack
+should mention `guofish_core`"*, and that grep is the only tool a non-C++ reader
+has for telling our leaks from CPython's ~1.4 MB of interpreter-lifetime
+allocations. Spending it on an enum's ergonomics would blunt it permanently: from
+then on, every future genuine leak could hide behind "oh, that's just the enum".
+
+So `ParallelConfig.affinity` is a string from `guofish_core.AFFINITY_POLICIES`.
+The C++ `AffinityPolicy` enum is unchanged — it is the right internal type — and
+only the Python surface moved. `ParallelStats::affinity` already reported a
+string, so the config and the report are now symmetric, and the round trip is
+asserted. An unrecognised name raises `ValueError` naming every valid policy
+rather than degrading to `"none"`: a silent fallback would make a BENCH.md row
+claim an affinity it never applied, which is the untrue-provenance class this
+project has already been bitten by twice.
+
+Considered and rejected: keeping the enum and documenting the leak (blunts the
+tool); a `py::class_` with static members (same registration machinery, likely
+the same result); integer constants (loses the readable value in
+`parallel_stats`).
+
+## `.gitattributes`, which Amendment E required and which did not exist
+
+Amendment E — written after the C3b incident, where `git checkout` under
+`core.autocrlf=true` rewrote `core/mctsv4.py` LF→CRLF with `git status` clean and
+`git diff` empty, silently breaking the sha256 that `gate1_manifest.json` records
+as the provenance of every Gate 1 artifact — requires a `.gitattributes` pinning
+`*.py text eol=lf`. **There was none in the repository.** `core.autocrlf` is
+still `true` on this machine, so the incident's precondition was live.
+
+Added, out of C9's scope but squarely inside Global Rule 3's "leave the previous
+chunks' guarantees intact". Verified before and after: `core/mctsv4.py` is
+LF-only and hashes to `c0dae236…e427fac`, which is exactly the
+`reference_sha256` in `golden/gate1_manifest.json`. The attribute pins that,
+rather than changing it.
+
+Extended beyond the minimum to `*.jsonl` (line-oriented corpora, where a CRLF
+rewrite changes every record's bytes) and to `*.npz` / `*.pt` / `*.bin` as
+`binary` (archives that must never be touched at all). `golden/` is gitignored
+today, so this protects the corpora if and when the risk register's "golden/
+either enters the repo or is archived with a committed manifest" is acted on.
+
+## Mutation drill (Amendment B)
+
+C9 adds no golden files. Layer 1 consumes `gate1_trees.npz` and
+`gate1_terminal_trees.npz`, which `tools/drill_c5_gate1.py` and
+`tools/drill_c6_gate1.py` already drill; what needed demonstrating is that the
+*C9 test* detects corruption, not that the data can be corrupted.
+
+Run against a corrupted **copy** in a scratch directory via
+`GUOFISH_GOLDEN_GATE1_TREES`, with the real file's digest recorded either side.
+One value changed — `visits[7]`, 1 → 2:
+
+```
+golden/gate1_trees.npz sha256 BEFORE : aec5135e0a82f0f5baa1ef4cf39a5372090946bc40b940c83fe255371e357440
+golden/gate1_trees.npz sha256 AFTER  : aec5135e0a82f0f5baa1ef4cf39a5372090946bc40b940c83fe255371e357440
+golden untouched: True
+
+E  AssertionError: quiet run 0 (vl=0.0, sims=5000) diverged from the Gate 1 reference under W=1/K=1
+E    first divergence at DFS node 7
+E      path   : a1a2 b6a7
+E      field  : visits
+E      python : 2
+E      c++    : 1
+FAILED tests/test_c9_concurrency.py::test_layer1_w1_k1_is_bit_exact_against_gate1[quiet0-vl0.0-vis]
+```
+
+The failure names the node, the move path from the root and both sides' values,
+which is the reporting discipline the C5 brief set and this test inherits.
+
+## Rule compliance
+
+* **Rules 1 and 2.** `git status` over `tests/` and `golden/` shows one
+  addition, `tests/test_c9_concurrency.py`, and nothing else. Every golden
+  digest is byte-identical to the manifest recorded in the C7/C8 entries.
+* **Rule 3.** Full suite, both platforms, with skips enumerated (Amendment D):
+
+  | build | collected | passed | skipped | skip breakdown |
+  |---|---:|---:|---:|---|
+  | Windows / MSVC 19.51 Release | 1282 | 1233 | 49 | 48 C6 census columns + 1 `GUOFISH_DEBUG_VL` off |
+  | Linux / Clang 18.1.3 Release | 1277 | 1228 | 50 | 48 C6 + 1 `GUOFISH_DEBUG_VL` + 1 whole-module |
+  | Linux / Clang ASan+UBSan (Debug) | 1277 | 1229 | 49 | 48 C6 + 1 whole-module |
+  | Linux / Clang **TSan** (Debug) | 1277 | 1229 | 49 | 48 C6 + 1 whole-module |
+
+  The Debug rows pass one more test than the Release row and skip one fewer,
+  because `GUOFISH_DEBUG_VL` is on there and C8's virtual-loss audit compiles in.
+  Skipped + passed exceeds `collected` by exactly one on every Linux row: the
+  module-scope skip is reported as an outcome without being collected.
+
+  **The cross-platform delta, itemised — and it is 5 tests, not 1 skip.**
+  `tests/test_reference_defects.py` collects 5 tests on Windows and **0** on
+  Linux, because the Linux venv has neither `python-chess` nor `torch` and the
+  file imports them at module scope. It reports as a single `SKIPPED [1]` line,
+  which understates it five to one. Per-file collection counts are identical
+  everywhere else, so this file is the entire difference between 1282 and 1277.
+  It is a sanctioned exception to Amendment D — see below.
+
+  The `GUOFISH_DEBUG_VL` skip appears in Release builds and not Debug ones, by
+  design (C8).
+
+### A flaky C0b timing test, observed and attributed
+
+`test_c0b_contention.py::test_the_dispatch_gap_is_never_less_adversarial` failed
+on three of four Linux full-suite runs during this chunk, and passed on all of
+them once the machine was quiet (run alone: 1 failure in 3; full suite on an idle
+host: passes, exit 0).
+
+Attributed to load, not to C9, on three grounds: it exercises
+`contention_bench`, which C9 does not touch; its assertion is a comparison
+between two *timing* p50s, which `README_BUILD.md` already warns is
+load-sensitive ("a loaded machine changes the answer"); and every failing run
+overlapped a concurrent build or a second test suite on the same host. Recorded
+rather than silently re-run, because "it passed the fourth time" is exactly how a
+real intermittent defect gets waved through — if it recurs on an idle machine, it
+is not this.
+
+### `test_reference_defects.py` is a sanctioned exception to Amendment D
+
+Amendment D says *"Module-scope skips are banned; use guarded imports + per-test
+markers."* `tests/test_reference_defects.py:96-97` uses module-scope
+`pytest.importorskip("chess")` / `("torch")`, which is why it collects 5 tests on
+Windows and 0 on Linux while reporting as a single `SKIPPED [1]` line.
+
+**Ruled an exception rather than a violation (project owner, 2026-08-08.)** The
+file exists solely to pin the three defect fixes in `core/mctsv4.py`; that
+reference is legacy and will not be developed further, so the file is a one-time
+pin rather than a living test surface. It runs on Windows, which is where the
+reference and the golden generators live.
+
+Amendment D was written after the C7 incident, where the same mechanism silently
+hid a 242-test file and Rule 3 "passed" at 1068 on Windows against 821 on Linux.
+That rule stands for every other file. What it demands and what is delivered here
+is that the delta be *enumerable*: the difference between 1282 and 1277 collected
+tests is this file and nothing else, per-file collection counts are identical
+everywhere else, and it is 5 tests rather than the 1 the skip line suggests.
+* **Rule 4.** Warning-clean at `/W4` (MSVC 19.51) and `-Wall -Wextra`
+  (Clang 18.1.3). One warning was raised and fixed rather than suppressed: a
+  `size_t`→`uint16_t` narrowing at the stand-in evaluator's cache insert, now an
+  explicit cast with an assert and a comment on why the bound holds.
+* **Rule 5.** ASan + UBSan clean: zero UBSan runtime errors, zero ASan hard
+  errors, and **zero leaked allocations whose stack mentions `guofish_core`** —
+  restored by removing `py::enum_`, see above. Asserts live (`build_info()
+  ['asserts'] == True`).
+* **Rule 6.** No `#pragma pack`. Four `reinterpret_cast`s in the codebase, two of
+  them added here for `GetLogicalProcessorInformationEx`'s heterogeneous record
+  buffer, all four carrying their justification on the **preceding** line per
+  Amendment C. The dispatcher recovers a leaf from the queue with a `static_cast`
+  down a non-virtual base specifically to avoid a fifth.
+* **Rule 7.** No new dependencies. `<thread>`, `<mutex>`, `<condition_variable>`,
+  `<atomic>` and the platform's own topology API; nothing vendored.
+* **Rule 8.** Both toolchains build and both suites pass. The Windows-only
+  (`GetLogicalProcessorInformationEx`) and POSIX-only (`pthread_setaffinity_np`,
+  sysfs) branches are each compiled on their platform, and each degrades to "no
+  pinning, and here is why" rather than failing.
+
+## What is not done
+
+* **Layer 3's absolute root-stability tolerance**, deferred to C10 with the
+  measurement that justifies the deferral. See above.
+* **A production `max_outstanding` above 64**, which the knee says would clear
+  the 15k stretch target. Not taken, because the brief's instruction is to
+  optimise for the smallest W×K that keeps the GPU fed and the quality cost is
+  measured at ~8 points of top-move share.
+* **Dispatcher pinning.** Left to the OS; becomes a real question in C10.
+* **Overlapping descent with evaluation.** The quiescence drain trigger means
+  workers idle while a batch is expanded. Nearly free at C9's rates; a ~10%-class
+  ceiling in C10. Lifting it costs layer 2's reproducibility, so it needs a
+  replacement test first.

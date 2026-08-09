@@ -1,0 +1,6 @@
+*.py text eol=lf
+
+*.jsonl text eol=lf
+*.npz binary
+*.pt binary
+*.bin binary

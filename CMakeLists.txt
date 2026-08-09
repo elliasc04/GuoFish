@@ -11,6 +11,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 0. Options
 # ---------------------------------------------------------------------------
 option(GUOFISH_ASAN "Build with AddressSanitizer (plus UBSan on Clang/GCC)" OFF)
+# C9. Linux/Clang only; see section 2b.
+option(GUOFISH_TSAN "Build with ThreadSanitizer (Linux/Clang only)" OFF)
 
 # C8. Compile the full-tree virtual-loss AUDIT (`ReplaySearch::debug_total_vloss`).
 #
@@ -107,6 +109,37 @@ if (GUOFISH_ASAN)
     # Global Rule 5 also requires debug asserts to be live. The Debug config has
     # them on already; this makes the sanitizer build correct even if someone
     # configures it as RelWithDebInfo.
+    foreach (flag_var CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_MINSIZEREL)
+        string(REGEX REPLACE "[-/]DNDEBUG" "" ${flag_var} "${${flag_var}}")
+    endforeach ()
+endif ()
+
+# ---------------------------------------------------------------------------
+# 2b. ThreadSanitizer — C9 acceptance, and Linux/Clang only.
+#
+# TSan DOES NOT EXIST ON MSVC. That is the whole reason Global Rule 8 requires
+# this codebase to build on Linux at all: production is Windows, but the only
+# tool that can prove the C9 descent is race-free runs somewhere else. A clean
+# TSan run over acceptance layers 2 and 3 is part of C9's acceptance, not an
+# optional extra.
+#
+# Mutually exclusive with GUOFISH_ASAN — the two instrument the same shadow
+# memory and cannot be combined — and the error is raised here rather than left
+# to a linker message nobody reads.
+if (GUOFISH_TSAN)
+    if (GUOFISH_ASAN)
+        message(FATAL_ERROR
+                "GUOFISH_TSAN and GUOFISH_ASAN cannot both be ON: ThreadSanitizer and "
+                "AddressSanitizer use incompatible shadow-memory layouts. Configure two "
+                "build directories instead.")
+    endif ()
+    if (MSVC)
+        message(FATAL_ERROR
+                "GUOFISH_TSAN is not available under MSVC — ThreadSanitizer has no MSVC "
+                "implementation. Build it on Linux/Clang; see README_BUILD.md.")
+    endif ()
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=thread)
     foreach (flag_var CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_MINSIZEREL)
         string(REGEX REPLACE "[-/]DNDEBUG" "" ${flag_var} "${${flag_var}}")
     endforeach ()

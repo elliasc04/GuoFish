@@ -37,6 +37,7 @@ skips there.
 | Option | Default | Meaning |
 |---|---|---|
 | `GUOFISH_ASAN` | `OFF` | AddressSanitizer; also UndefinedBehaviorSanitizer on Clang. Strips `/RTC1` and disables incremental linking on MSVC. Keeps `assert()` live even in release configs. |
+| `GUOFISH_TSAN` | `OFF` | ThreadSanitizer. **Linux/Clang only** — TSan has no MSVC implementation, and CMake fails the configure rather than producing a build that silently checks nothing. Mutually exclusive with `GUOFISH_ASAN`. C9's acceptance requires a clean run; see "Linux, ThreadSanitizer" below. |
 | `GUOFISH_MODULE_OUTPUT_DIR` | repo root | Where the built `.pyd`/`.so` is written. |
 | `GUOFISH_VALUE_SUM` | `q32` | Which accumulator `guofish::DefaultArena` and `guofish_core.NodeArena` name: `q32` (production) or `double` (Gate 1 equivalence). Both `NodeArena` types are compiled and bound in *every* build; this only selects the default. |
 | `GUOFISH_DEBUG_VL` | `ON` for `Debug`, else `OFF` | Compile `ReplaySearch.debug_total_vloss()`, C8's read-only full-tree virtual-loss audit. Its absence from a Release build is the point — C8 forbids a production equivalent of the reference's defensive `_reset_virtual_loss` walk — so the flag is reported as `guofish_core.DEBUG_VL` and `tests/test_c8_reuse.py` asserts both halves: the invariant where the audit exists, the absence where it should not. |
@@ -202,6 +203,49 @@ The `LD_PRELOAD` is required. Python itself is not ASan-instrumented, so without
 it the import aborts with *"ASan runtime does not come first in initial library
 list"*.
 
+### Linux, ThreadSanitizer — C9 acceptance
+
+**TSan does not exist on MSVC.** That is the reason Global Rule 8 requires this
+codebase to build on Linux at all: production is Windows, but the only tool that
+can prove the C9 descent is race-free runs somewhere else. A clean TSan run over
+acceptance layers 2 and 3 is part of C9's acceptance, not an optional extra.
+
+`GUOFISH_TSAN` and `GUOFISH_ASAN` are mutually exclusive — they use incompatible
+shadow-memory layouts — and CMake raises a `FATAL_ERROR` rather than leaving it
+to a linker message nobody reads. Use two build directories.
+
+```bash
+cmake -S "$SRC" -B ~/build/gf-tsan -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DPython_EXECUTABLE="$VENV/bin/python" \
+    -DGUOFISH_MODULE_OUTPUT_DIR="$HOME/build/gf-tsan" \
+    -DGUOFISH_TSAN=ON
+cmake --build ~/build/gf-tsan
+
+cd "$SRC"
+LD_PRELOAD="$(clang -print-file-name=libclang_rt.tsan-x86_64.so)" \
+TSAN_OPTIONS=halt_on_error=0:history_size=7:second_deadlock_stack=1 \
+PYTHONPATH="$HOME/build/gf-tsan" \
+    "$VENV/bin/python" -m pytest tests/ -q
+```
+
+The `LD_PRELOAD` is required for the same reason it is under ASan: Python itself
+is not instrumented, so without it the import fails with `undefined symbol:
+__tsan_write_range`.
+
+`halt_on_error=0` so that a run reports *every* race rather than stopping at the
+first. Grep the output for `WARNING: ThreadSanitizer`; the count must be zero.
+
+**Verify the sanitizer has teeth before believing a clean run.**
+`guofish_core.race_probe()` is a deliberate four-thread data race on a plain
+`int`, and `test_thread_sanitizer_can_actually_fail` asserts that it produces a
+report on a TSan build and runs to completion on any other. A clean run without
+this check is indistinguishable from a sanitizer that was not instrumenting the
+module. `guofish_core.TSAN` reports which build you are on.
+
+TSan costs roughly 13x here — the full suite runs in ~12 min against 54 s.
+
 ### Reading the leak report
 
 LeakSanitizer will always report roughly 1.4 MB leaked in ~1300 allocations.
@@ -239,6 +283,12 @@ implementations (Global Rule 2). Results are transcribed into `BENCH.md`.
 | `python tools/bench_c2.py --python` | as above, plus the `board_to_tokens` reference on this machine (imports torch) |
 | `python tools/bench_c4.py --trials 5` | C4 table: sibling scan under both accumulators, four working sets |
 | `python tools/bench_c4.py --sweep` | as above, plus the exhaustive Q32 round-trip sweep over all 2.13e9 floats in [-1, 1] (~10 s on Release, ~52 s under ASan) |
+| `python tools/bench_c5.py --markdown` | C5 table: search throughput on the replay evaluator |
+| `python tools/bench_c6.py --markdown` | C6 table: what terminal handling costs, both corpora |
+| `python tools/bench_c8.py` | C8: arena high-water over whole games, compaction cost |
+| `python tools/bench_c9_knee.py --markdown` | **C9a: the GPU evaluation knee.** Needs torch and a CUDA device. Synchronizes around every timed iteration — see BENCH.md on why an un-synchronized measurement produces a different and wrong curve |
+| `python tools/bench_c9.py --markdown` | C9b–C9f: the W × K grid with its W=1 control rows, the affinity comparison, and the dispatcher GIL histogram. Replay evaluator only, no GPU |
+| `python tools/bench_c9.py --affinity-only --sims 20000` | the affinity table alone, at a budget long enough for the effect to appear — at 2,000 sims pinning measures as noise |
 
 On Linux, prefix with the build directory as usual:
 

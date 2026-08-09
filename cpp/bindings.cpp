@@ -85,6 +85,22 @@
 #  define GUOFISH_UBSAN_BUILD 0
 #endif
 
+// C9. Same three-step, and it has to be three steps for the same reason: MSVC
+// has no `__has_feature` and its preprocessor does not short-circuit `&&`, so a
+// single `defined(__has_feature) && __has_feature(...)` is a hard parse error
+// there rather than a false.
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define GUOFISH_TSAN_BUILD 1
+#  endif
+#endif
+#if !defined(GUOFISH_TSAN_BUILD) && defined(__SANITIZE_THREAD__)
+#  define GUOFISH_TSAN_BUILD 1
+#endif
+#if !defined(GUOFISH_TSAN_BUILD)
+#  define GUOFISH_TSAN_BUILD 0
+#endif
+
 namespace py = pybind11;
 
 namespace {
@@ -1709,6 +1725,159 @@ private:
     mutable std::int64_t calls_ = 0;
 };
 
+// ---------------------------------------------------------------------------
+// C9 — the parallel search's Python surface
+// ---------------------------------------------------------------------------
+
+// A numpy int64 view of a vector, for the histograms scope §6.2 asks for.
+// Percentiles are computed in Python from these rather than in C++, because the
+// C9 brief asks for a histogram and not a mean: the tail is the entire question.
+py::array_t<std::int64_t> int64_array(const std::vector<std::int64_t> &values) {
+    py::array_t<std::int64_t> out(static_cast<py::ssize_t>(values.size()));
+    std::copy(values.begin(), values.end(), out.mutable_data());
+    return out;
+}
+
+py::dict parallel_stats_dict(const guofish::ParallelStats &stats) {
+    py::dict d;
+    d["requested"] = stats.requested;
+    d["delivered"] = stats.delivered;
+    d["queued_leaves"] = stats.queued_leaves;
+    d["worker_terminals"] = stats.worker_terminals;
+    d["select_collisions"] = stats.select_collisions;
+    d["batches"] = stats.batches;
+    d["largest_batch"] = stats.largest_batch;
+    d["worker_waits"] = stats.worker_waits;
+    d["wall_ns"] = stats.wall_ns;
+    d["workers"] = stats.workers;
+    d["in_flight"] = stats.in_flight;
+    d["max_outstanding"] = stats.max_outstanding;
+    d["affinity"] = stats.affinity;
+    d["pinned_cpus"] = stats.pinned_cpus;
+    d["batch_sizes"] = int64_array(stats.batch_sizes);
+    d["outstanding_at_drain"] = int64_array(stats.outstanding_at_drain);
+    d["hook_wait_ns"] = stats.hook_wait_ns;
+    d["hook_wait_ns_samples"] = int64_array(stats.hook_wait_ns_samples);
+    d["mean_batch"] = stats.batches > 0
+                          ? static_cast<double>(stats.queued_leaves) /
+                                static_cast<double>(stats.batches)
+                          : 0.0;
+    d["sims_per_s"] = stats.wall_ns > 0 ? static_cast<double>(stats.delivered) * 1e9 /
+                                              static_cast<double>(stats.wall_ns)
+                                        : 0.0;
+    return d;
+}
+
+py::dict tree_audit_dict(const guofish::TreeAudit &audit) {
+    py::dict d;
+    d["nodes"] = audit.nodes;
+    d["expanded_nodes"] = audit.expanded_nodes;
+    d["visited_nodes"] = audit.visited_nodes;
+    d["vloss_total"] = audit.vloss_total;
+    d["vloss_nonzero_nodes"] = audit.vloss_nonzero_nodes;
+    d["conservation_failures"] = audit.conservation_failures;
+    d["first_bad_node"] = audit.first_bad_node;
+    d["first_bad_expected"] = audit.first_bad_expected;
+    d["first_bad_actual"] = audit.first_bad_actual;
+    d["root_visits"] = audit.root_visits;
+    d["root_children_visits"] = audit.root_children_visits;
+    return d;
+}
+
+py::dict topology_dict(const guofish::Topology &topo) {
+    py::dict d;
+    d["pcore_physical"] = topo.pcore_physical;
+    d["pcore_all"] = topo.pcore_all;
+    d["ecore_all"] = topo.ecore_all;
+    d["all_logical"] = topo.all_logical;
+    d["hybrid"] = topo.hybrid;
+    d["source"] = topo.source;
+    d["hardware_concurrency"] = static_cast<int>(std::thread::hardware_concurrency());
+    return d;
+}
+
+// THE GIL-ACQUISITION PROBE, and it is a prediction test rather than a
+// measurement for its own sake.
+//
+// C0b established that the pybind11 boundary itself costs ~60 ns uncontended, so
+// all of the GIL cost scope §2.1 projects is CONTENTION and none of it is the
+// mechanism. Under §2.1's discipline the only Python-relevant threads during a
+// search are the dispatcher and a main thread blocked on `stdin`, which releases
+// the GIL while blocked. The prediction that follows is specific: acquisition
+// latency stays near the uncontended floor, and any excursion toward
+// milliseconds means Python bytecode is running during a search that should not
+// be.
+//
+// This installs the measurement on the REAL C9 topology — a C++-created
+// dispatcher thread holding no GIL, W pinned search threads that touch no Python
+// at all, and whatever the caller has left running on the interpreter — one
+// chunk before C10 makes the answer load-bearing. `guofish_core.GilProbe` is
+// handed to `set_batch_hook`; the per-batch waits come back in
+// parallel_stats()["hook_wait_ns_samples"].
+class GilProbe final : public guofish::BatchHook {
+public:
+    std::int64_t before_batch(std::size_t batch_size) override {
+        const auto before = std::chrono::steady_clock::now();
+        // Scoped to this function: acquired here, released on return, exactly
+        // as C10's evaluator callback will bracket its torch calls.
+        py::gil_scoped_acquire acquire;
+        const auto after = std::chrono::steady_clock::now();
+        const std::int64_t wait =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(after - before).count();
+        ++acquisitions_;
+        rows_ += static_cast<std::int64_t>(batch_size);
+        return wait;
+    }
+
+    std::int64_t acquisitions() const noexcept { return acquisitions_; }
+    std::int64_t rows() const noexcept { return rows_; }
+
+private:
+    std::int64_t acquisitions_ = 0;
+    std::int64_t rows_ = 0;
+};
+
+// The search() / search_parallel() return value. One builder so the two entry
+// points cannot drift into reporting different things about the same tree.
+template <class Search>
+py::dict search_stats_dict(const Search &self, const guofish::SearchStats &stats) {
+    py::dict d;
+    d["simulations"] = stats.simulations;
+    d["expansions"] = stats.expansions;
+    d["depth_cap_hits"] = stats.depth_cap_hits;
+    d["max_depth"] = stats.max_depth;
+    d["select_steps"] = stats.select_steps;
+    d["root_visits"] = self.arena().visit_count(self.root());
+    d["nodes"] = self.arena().size();
+    // C6.
+    d["draw_by_rule_hits"] = stats.draw_by_rule_hits;
+    d["fifty_move_hits"] = stats.fifty_move_hits;
+    d["threefold_hits"] = stats.threefold_hits;
+    d["checkmates"] = stats.checkmates;
+    d["stalemates"] = stats.stalemates;
+    d["insufficient_material"] = stats.insufficient_material;
+    d["seventyfive_moves"] = stats.seventyfive_moves;
+    d["fivefold_repetitions"] = stats.fivefold_repetitions;
+    d["terminal_fast_path_hits"] = stats.terminal_fast_path_hits;
+    d["mate_short_circuits"] = stats.mate_short_circuits;
+    // C7. Per-SEARCH, unlike `cache_stats`, which is per-cache lifetime — the
+    // cache survives set_position, as the reference's does.
+    d["cache_hits"] = stats.cache_hits;
+    d["cache_misses"] = stats.cache_misses;
+    d["cache_inserts"] = stats.cache_inserts;
+    d["tablebase_probes"] = stats.tablebase_probes;
+    d["tablebase_overrides"] = stats.tablebase_overrides;
+    // C9. Must be 0 for anything compared against Python.
+    d["synthetic_evaluations"] = stats.synthetic_evaluations;
+    d["mating_move"] = self.mating_move() == guofish::kNoMove
+                           ? py::none().cast<py::object>()
+                           : py::cast(move_to_uci(self.mating_move()));
+    d["best_move"] = self.best_move() == guofish::kNoMove
+                         ? py::none().cast<py::object>()
+                         : py::cast(move_to_uci(self.best_move()));
+    return d;
+}
+
 // Bind one ReplaySearch instantiation, exactly as C4 binds one NodeArena: twice,
 // so neither accumulator can rot behind an #ifdef and a test can drive both
 // through one code path. Gate 1 runs the double build, which is the one that has
@@ -1770,41 +1939,7 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
         .def(
             "search",
             [](Search &self, int num_simulations) {
-                const guofish::SearchStats stats = self.search(num_simulations);
-                py::dict d;
-                d["simulations"] = stats.simulations;
-                d["expansions"] = stats.expansions;
-                d["depth_cap_hits"] = stats.depth_cap_hits;
-                d["max_depth"] = stats.max_depth;
-                d["select_steps"] = stats.select_steps;
-                d["root_visits"] = self.arena().visit_count(self.root());
-                d["nodes"] = self.arena().size();
-                // C6.
-                d["draw_by_rule_hits"] = stats.draw_by_rule_hits;
-                d["fifty_move_hits"] = stats.fifty_move_hits;
-                d["threefold_hits"] = stats.threefold_hits;
-                d["checkmates"] = stats.checkmates;
-                d["stalemates"] = stats.stalemates;
-                d["insufficient_material"] = stats.insufficient_material;
-                d["seventyfive_moves"] = stats.seventyfive_moves;
-                d["fivefold_repetitions"] = stats.fivefold_repetitions;
-                d["terminal_fast_path_hits"] = stats.terminal_fast_path_hits;
-                d["mate_short_circuits"] = stats.mate_short_circuits;
-                // C7. Per-SEARCH, unlike `cache_stats`, which is per-cache
-                // lifetime — the cache survives set_position, as the
-                // reference's does.
-                d["cache_hits"] = stats.cache_hits;
-                d["cache_misses"] = stats.cache_misses;
-                d["cache_inserts"] = stats.cache_inserts;
-                d["tablebase_probes"] = stats.tablebase_probes;
-                d["tablebase_overrides"] = stats.tablebase_overrides;
-                d["mating_move"] = self.mating_move() == guofish::kNoMove
-                                       ? py::none().cast<py::object>()
-                                       : py::cast(move_to_uci(self.mating_move()));
-                d["best_move"] = self.best_move() == guofish::kNoMove
-                                     ? py::none().cast<py::object>()
-                                     : py::cast(move_to_uci(self.best_move()));
-                return d;
+                return search_stats_dict(self, self.search(num_simulations));
             },
             py::arg("num_simulations"),
             "Run until the root has `num_simulations` visits, matching "
@@ -1812,6 +1947,100 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
             "short-circuit fires, which ends the search early exactly as the reference's "
             "completion_event does. Raises RuntimeError on a replay-dump miss (naming the "
             "FEN, the move path and the key) or if the ROOT itself has no legal moves.")
+
+        // --- C9: W workers, K in flight -------------------------------------
+
+        .def(
+            "search_parallel",
+            [](Search &self, int num_simulations, const guofish::ParallelConfig &pc) {
+                guofish::SearchStats stats;
+                {
+                    // THE GIL IS RELEASED FOR THE WHOLE SEARCH, and it has to
+                    // be: this call starts W+1 C++ threads and joins them, and
+                    // holding the interpreter lock across that would serialise
+                    // nothing (no worker touches Python) while making the batch
+                    // hook — which acquires the GIL to measure how long
+                    // acquiring it takes — deadlock on the caller's own hold.
+                    py::gil_scoped_release release;
+                    stats = self.search_parallel(num_simulations, pc);
+                }
+                return search_stats_dict(self, stats);
+            },
+            py::arg("num_simulations"), py::arg("config"),
+            "Run to `num_simulations` root visits with W search threads and K in-flight paths "
+            "each, an MPSC leaf queue and one dispatcher.\n\n"
+            "Returns the same dict as search(), so a caller can compare the two directly. The "
+            "C9-specific counters are in parallel_stats().\n\n"
+            "Search threads never block on evaluation: a worker descends, applies virtual "
+            "loss, CASes the leaf from Unexpanded to PENDING, submits it and immediately "
+            "begins the next simulation. A worker that loses that CAS unwinds its own virtual "
+            "loss, discards the simulation and retries — counted as select_collisions. "
+            "Expansion happens only on the dispatcher.\n\n"
+            "The dispatcher drains min(available, max_batch) with no minimum-batch floor and "
+            "no straggler timeout; it drains when the queue is non-empty and no search thread "
+            "can add to it. That trigger is what makes W=1 reproducible run to run (acceptance "
+            "layer 2) while still sizing batches by the outstanding-leaf count rather than by "
+            "the worker count. See DECISIONS.md, C9.")
+
+        .def(
+            "parallel_stats",
+            [](const Search &self) { return parallel_stats_dict(self.parallel_stats()); },
+            "The counters from the last search_parallel(). All zero after a serial search().\n\n"
+            "`delivered` is the number of simulations actually backed up into the root, "
+            "counted with a fetch_add by whichever thread performed the backup — not the "
+            "requested budget. The reference's `stats['simulations'] += 1` was an "
+            "unsynchronized read-modify-write over the same quantity across 32 threads, which "
+            "is why its throughput figures could not be trusted to the last few percent.")
+
+        .def(
+            "audit", [](const Search &self) { return tree_audit_dict(self.audit()); },
+            "The exact conservation invariants, with no epsilon anywhere.\n\n"
+            "`vloss_total` is a FLAT SCAN of the arena, not a traversal: a virtual loss "
+            "stranded on a node that is no longer reachable is exactly the kind of leak this "
+            "is looking for, and a traversal would not see it. It must be 0 at the end of any "
+            "search, at any virtual-loss magnitude, because the counts are integers.\n\n"
+            "`conservation_failures` counts expanded nodes where visits != 1 + sum(children "
+            "visits). The 1 is the simulation that expanded the node; nothing else can stop "
+            "at an expanded node. `first_bad_node` names the first one in arena order so a "
+            "failure can be reported rather than merely counted.\n\n"
+            "The visit invariant assumes a tree built by search alone. SearchConfig."
+            "ponder_decay rescales inherited visit counts on promotion and would break it by "
+            "design; it is 1.0 by default and the C9 tests do not enable it.")
+
+        .def_property(
+            "synthetic_fallback", &Search::synthetic_fallback, &Search::set_synthetic_fallback,
+            "C9. Answer a replay-dump miss with a deterministic stand-in evaluator instead of "
+            "raising.\n\n"
+            "OFF BY DEFAULT, AND NOTHING COMPARED AGAINST PYTHON MAY TURN IT ON. The Gate 1 "
+            "dump holds exactly the positions the SERIAL reference evaluated, which is what "
+            "makes a miss the strongest test in C5. With K in-flight paths, virtual loss "
+            "steers descents onto branches the serial reference never opened — that is leaf "
+            "parallelism working, not failing — and the first miss arrives about five plies "
+            "in at W=1, K=8.\n\n"
+            "So acceptance layer 1 (W=1, K=1, bit-exact against Python) runs with this off, "
+            "and layers 2 and 3 — which assert reproducibility and conservation, not agreement "
+            "with Python — run with it on. Real dump entries are still used wherever they "
+            "exist. search()['synthetic_evaluations'] counts the holes it filled, so a Gate 1 "
+            "run asserts 0 rather than trusting the flag.")
+
+        .def(
+            "set_batch_hook",
+            [](Search &self, GilProbe *probe) { self.set_batch_hook(probe); },
+            py::arg("hook").none(true), py::keep_alive<1, 2>(),
+            "Install a per-batch hook on the dispatcher, or clear it with None.\n\n"
+            "The only implementation is GilProbe, which measures how long the dispatcher — a "
+            "C++-created thread holding no GIL — waits to acquire it, once per batch. That is "
+            "the measurement scope §2.1's discipline rests on and C10 depends on being "
+            "cheap; C9 takes it on the real thread topology first.")
+
+        .def_static(
+            "topology", [] { return topology_dict(Search::topology()); },
+            "What this build can see of the machine's CPU topology, and where it came from.\n\n"
+            "`source` is the API or the sysfs path, or the reason there are no numbers. A "
+            "kernel that does not report the hybrid split (WSL2 does not expose cpu_capacity) "
+            "reports hybrid=False and every core as a performance core, rather than a guess: "
+            "pinning threads to a layout that was inferred would be worse than not pinning "
+            "them, because the resulting benchmark row would claim something untrue.")
 
         // --- C8: tree reuse -------------------------------------------------
 
@@ -2167,6 +2396,11 @@ PYBIND11_MODULE(guofish_core, m) {
     // virtual-loss walk" is a statement the acceptance test can assert
     // positively, rather than an inference from a missing attribute — which
     // would also be satisfied by a typo.
+    // C9. Same reasoning, same place: build_info()'s key set is pinned, and
+    // "the ThreadSanitizer acceptance run really was a ThreadSanitizer build"
+    // has to be assertable rather than inferred from a log file's filename.
+    m.attr("TSAN") = static_cast<bool>(GUOFISH_TSAN_BUILD);
+
 #if defined(GUOFISH_DEBUG_VL)
     m.attr("DEBUG_VL") = true;
 #else
@@ -2434,6 +2668,146 @@ PYBIND11_MODULE(guofish_core, m) {
                        "names this as the mitigation for ping-pong fixup bugs, so it is engine "
                        "behaviour rather than a test fixture; the flag is how a Release build "
                        "opts in. Costs one extra O(nodes) pass per apply_move.");
+
+    // -----------------------------------------------------------------------
+    // C9 — concurrency
+    // -----------------------------------------------------------------------
+
+    // Where the W search threads are pinned, as STRINGS rather than a bound
+    // enum. See guofish::affinity_policy_from_name: `py::enum_` is the only
+    // binding shape in this module that leaks its registration at import
+    // (measured: 4,402 bytes, against zero without it), and README_BUILD.md's
+    // leak discriminator — "no leaked allocation's stack should mention
+    // guofish_core" — is worth more than an enum's ergonomics.
+    //
+    // Pinning is not a micro-optimisation on this machine. A worker parked on an
+    // E-core by Windows' Thread Director holds the ROOT's contended atomics for
+    // longer, and the root is touched by every descent and every backup, so one
+    // slow thread in that path costs more than its own throughput. Measured at
+    // 20,000 sims: +14.9% at W=4, +24.5% at W=6 (BENCH.md C9d).
+    m.attr("AFFINITY_POLICIES") = py::make_tuple(
+        "none",            // let the OS place the threads
+        "pcore_physical",  // one thread per performance core, SMT siblings idle
+        "pcore_smt",       // every logical processor of every performance core
+        "all_logical");    // every logical processor, efficiency cores included
+
+    py::class_<guofish::ParallelConfig>(
+        m, "ParallelConfig",
+        "W search threads, K in-flight paths each, and the dispatcher's batch ceiling.\n\n"
+        "The defaults are not Python's. The reference ran 32 workers because it was GIL-bound "
+        "and a worker spent almost all of its life blocked, so oversubscribing 16 hardware "
+        "threads 2:1 cost nothing; C++ search threads actually run, and 32 of them would mean "
+        "virtual loss held across preemption by descheduled threads. `max_batch` defaults to "
+        "the measured GPU knee (BENCH.md, C9), which on this machine is set by HOST-side ATen "
+        "dispatch rather than by the GPU: per-batch cost is flat at ~4 ms out to batch 64 and "
+        "rises linearly after 128.")
+        .def(py::init([](int workers, int in_flight, std::size_t max_batch,
+                         const std::string &affinity, bool collect_histograms) {
+                 guofish::ParallelConfig pc;
+                 pc.workers = workers;
+                 pc.in_flight = in_flight;
+                 pc.max_batch = max_batch;
+                 // Throws ValueError naming the valid policies; an unknown
+                 // policy must not silently become "none", because the run
+                 // would then report an affinity it did not apply.
+                 pc.affinity = guofish::affinity_policy_from_name(affinity);
+                 pc.collect_histograms = collect_histograms;
+                 return pc;
+             }),
+             py::arg("workers") = 4, py::arg("in_flight") = 8,
+             py::arg("max_batch") = static_cast<std::size_t>(128),
+             py::arg("affinity") = "pcore_physical",
+             py::arg("collect_histograms") = true)
+        .def_readwrite("workers", &guofish::ParallelConfig::workers, "W: search threads.")
+        .def_readwrite("in_flight", &guofish::ParallelConfig::in_flight,
+                       "K: paths in flight per search thread. Every one of them holds virtual "
+                       "loss on 10-30 nodes, which is the quality cost of parallelism and the "
+                       "reason to minimise W*K rather than maximise it.")
+        .def_readwrite("max_batch", &guofish::ParallelConfig::max_batch,
+                       "The most leaves the dispatcher expands in one drain. A ceiling, not a "
+                       "floor: there is no minimum-batch rule and no straggler timeout, which "
+                       "is what removes both of the Python collector's measured pathologies.")
+        .def_property(
+            "affinity",
+            [](const guofish::ParallelConfig &pc) {
+                return std::string(guofish::affinity_policy_name(pc.affinity));
+            },
+            [](guofish::ParallelConfig &pc, const std::string &name) {
+                pc.affinity = guofish::affinity_policy_from_name(name);
+            },
+            "One of guofish_core.AFFINITY_POLICIES. Reads back as the same string "
+            "parallel_stats()['affinity'] reports, so a benchmark row and the configuration "
+            "that produced it cannot disagree about what was asked for.")
+        .def_readwrite("collect_histograms", &guofish::ParallelConfig::collect_histograms,
+                       "Record every batch size and outstanding-leaf count at drain time "
+                       "(scope §6.2). On by default; a few thousand int64s per search.")
+        .def_property_readonly("max_outstanding", &guofish::ParallelConfig::max_outstanding,
+                               "W * K — the leaf count the whole engine throttles on, and the "
+                               "quantity scope §2.2 makes the batch-governing knob in place of "
+                               "the worker count.");
+
+    m.def(
+        "race_probe",
+        [](int iterations, int threads) {
+            // A DELIBERATE DATA RACE. Nothing in the engine calls this and
+            // nothing may: it exists so that "ThreadSanitizer reported nothing"
+            // can be distinguished from "ThreadSanitizer was not looking".
+            //
+            // A clean sanitizer run is evidence only if the sanitizer is
+            // demonstrably able to fail, which is the same argument the mutation
+            // drill makes about golden data — a test that cannot fail is not a
+            // test. So this is the positive control for the C9 acceptance run:
+            // under a TSan build it must produce a report, and if it does not,
+            // the clean run above proves nothing about the search.
+            //
+            // Plain `int`, no atomics, no lock, incremented from several
+            // threads. That is undefined behaviour by construction and is the
+            // point; it is quarantined behind an explicit call that only a test
+            // makes.
+            int counter = 0;
+            std::vector<std::thread> pool;
+            pool.reserve(static_cast<std::size_t>(threads));
+            {
+                py::gil_scoped_release release;
+                for (int t = 0; t < threads; ++t) {
+                    pool.emplace_back([&counter, iterations] {
+                        for (int i = 0; i < iterations; ++i) {
+                            counter = counter + 1;
+                        }
+                    });
+                }
+                for (std::thread &thread : pool) {
+                    thread.join();
+                }
+            }
+            return counter;
+        },
+        py::arg("iterations") = 10000, py::arg("threads") = 4,
+        "SANITIZER SELF-TEST. Increments a plain int from several threads with no "
+        "synchronisation, which is a data race by construction.\n\n"
+        "Never called by the engine. It exists because a clean ThreadSanitizer run is "
+        "evidence only if the sanitizer can be shown to fail — the same argument the "
+        "mutation drill makes about golden data. Under a TSan build this must produce a "
+        "report; if it does not, the clean C9 acceptance run proves nothing. The return "
+        "value is the racy counter, which is also usually wrong, and that is expected.");
+
+    py::class_<GilProbe>(
+        m, "GilProbe",
+        "Measures how long the dispatcher waits to acquire the GIL, once per batch.\n\n"
+        "This tests a PREDICTION rather than collecting a number. C0b established that the "
+        "pybind11 boundary itself costs ~60 ns uncontended, so all of the GIL cost scope §2.1 "
+        "projects is contention. Under §2.1's discipline the only Python-relevant threads "
+        "during a search are the dispatcher and a main thread blocked on stdin — which "
+        "releases the GIL while blocked — so acquisition should stay near the uncontended "
+        "floor. An excursion toward milliseconds means Python bytecode is running during the "
+        "search that should not be, and the answer is to move it to C++ rather than to tune "
+        "around it.\n\n"
+        "Install with search.set_batch_hook(probe); read the per-batch waits out of "
+        "parallel_stats()['hook_wait_ns_samples'].")
+        .def(py::init<>())
+        .def_property_readonly("acquisitions", &GilProbe::acquisitions)
+        .def_property_readonly("rows", &GilProbe::rows,
+                               "Total leaves across every batch the probe saw.");
 
     // -----------------------------------------------------------------------
     // C7 — cache and tablebase
