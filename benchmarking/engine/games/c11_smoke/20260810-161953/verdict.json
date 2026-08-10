@@ -1,0 +1,77 @@
+{
+ "checks": [
+  {
+   "check": "the engine's stderr was captured",
+   "ok": true,
+   "detail": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\benchmarking\\engine\\games\\c11_smoke\\20260810-161953\\guofish.stderr.log"
+  },
+  {
+   "check": "20 games completed",
+   "ok": true,
+   "detail": "20 finished"
+  },
+  {
+   "check": "zero illegal moves (cutechess)",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "zero null bestmoves",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "the engine mirrored its bestmoves to stderr",
+   "ok": true,
+   "detail": "538 move(s) recorded"
+  },
+  {
+   "check": "zero engine crashes / stalls",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "zero Python tracebacks in the engine's output",
+   "ok": true,
+   "detail": "0 traceback(s)"
+  },
+  {
+   "check": "zero timeouts",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "every PGN game replays legally under python-chess",
+   "ok": true,
+   "detail": "20 games, 0 with an illegal move"
+  },
+  {
+   "check": "no abnormal PGN termination",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "the engine logged delivered-sims telemetry during the match",
+   "ok": true,
+   "detail": "538 move telemetry line(s)"
+  },
+  {
+   "check": "the engine logged its resolved configuration during the match",
+   "ok": true,
+   "detail": "577 config line(s)"
+  }
+ ],
+ "evidence": {
+  "pgn_games": 20,
+  "finished_games": 20,
+  "illegal": [],
+  "nulls": [],
+  "crashes": [],
+  "timeouts": [],
+  "tracebacks": 0,
+  "telemetry_lines": 538,
+  "config_lines": 577
+ },
+ "ok": true,
+ "cutechess_exit": 0
+}

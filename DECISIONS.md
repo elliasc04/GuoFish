@@ -5729,3 +5729,296 @@ above.
 * **The knee above batch 128.** `graph-forward` peaks at 21,018 pos/s at 128 and
   falls to 19,736 at 256, so the graphed knee is still 128 and nothing was
   measured beyond it. `max_batch` above 128 has no measurement behind it.
+
+# C11 — The Python surface: uci_wrapper_v6.py and playv6.py (2026-08-10)
+
+## `policy_temperature` and Dirichlet noise are REFUSED, not accepted-and-ignored
+
+**This is the chunk's one blocked requirement and it is reported as blocked.**
+
+The brief requires `policy_temperature` on the UCI surface and requires Dirichlet
+root noise to be derived from a preserved `base_prior`. Neither mechanism exists
+in `cpp/`:
+
+* `guofish::SearchConfig` has no temperature field, and
+  `gather_softmax_canonical` (cpp/evaluator.hpp) raises the gathered logits to no
+  power. `grep -i temperature cpp/` finds one comment and no code.
+* `grep -ri dirichlet cpp/` finds **nothing**. The arena stores one `prior` per
+  child and there is no second slot; the reference's `MCTSNode.base_prior` — the
+  field the C3b fix added precisely so noise could be re-derived rather than
+  compounded — was never ported.
+
+The brief also says, in the same document, that modifying the C++ MCTS search
+core is out of scope. Both cannot hold. The options were:
+
+1. **Add the fields to `cpp/`.** Refused: explicitly out of scope, and a
+   hot-path change to prior storage with no measurement behind it is how C10b's
+   NaN-prior finding got its "not in this chunk" note.
+2. **Advertise the options and ignore them.** Refused, and this one is the point:
+   it is *defect 1 of the two this chunk exists to close*. A benchmark row
+   reading `PolicyTemperature 0.8` on an engine that cannot sharpen priors
+   describes a search nobody ran.
+3. **Advertise them and refuse anything but the identity value.** Chosen.
+
+`playv6.UNSUPPORTED_IN_CORE` maps each field to the only value accepted and a
+sentence naming the missing mechanism. `EngineConfig.validate` raises
+`ConfigError`; `handle_setoption` catches it, logs `REFUSED` with the reason, and
+keeps the previous value; the configuration log's last line names the set. So the
+option is discoverable, its absence is discoverable, and a run that tried to use
+it has that attempt in its own logs.
+
+**Consequence for later chunks.** C13 cannot sweep policy temperature and no
+self-play chunk can add exploration noise until a chunk with the mandate adds
+`base_prior` to the arena and a temperature to `SearchConfig`. That is a real
+capability the port does not have, and it is stated here rather than discovered
+by a sweep that returns twelve identical rows.
+
+## `nominal` is optional, and a timed search reports `n/a` rather than a ratio
+
+The first correction was the easy half: report DELIVERED simulations
+(`parallel_stats()["delivered"]`, counted with a `fetch_add` by whichever thread
+performed the backup) instead of the requested budget. v5 printed
+`nodes {num_simulations}` and every `nps` derived from it was the nominal rate.
+
+The first C11 smoke run then reported `inflation=19.56x` on timed moves, and that
+number was **my own artifact, not v5's defect**. A `go wtime ... btime ...` asks
+for a duration; there is no requested simulation count. The budget the engine
+runs under is a CEILING it picked (`root_visits + sim_cap`), and dividing a
+ceiling by the wall clock produces a large number that describes nothing — the
+same species of dishonest numerator the chunk exists to remove, one layer over.
+
+So `SearchOutcome.nominal` is `Optional[int]`:
+
+| `go` line | `nominal` | `budget_source` |
+|---|---|---|
+| `go nodes N` | N (after the SimCap clamp) | `nodes` |
+| `FixedSims` set | the fixed count | `fixed` |
+| no clock, no nodes | `DefaultSims` | `default` |
+| `go wtime/btime/movetime` | **None** | `time` |
+| `go infinite` / `go ponder` | **None** | `infinite` / `ponder` |
+
+`nominal_sims_per_s` and `inflation` are None with it, and print as `n/a`.
+`budget_source` is logged so a reader knows why one line has a number and the
+next does not. Measured over the two 20-game acceptance runs:
+
+* fixed-node (800 sims/move, 645 moves): nominal on 645/645 moves, aggregate
+  inflation **1.16x**, individual moves to **2.77x**, delivered 8,815 sims/s
+  against a nominal 10,213;
+* real clock (10+0.1, 499 moves): nominal on **0** moves, delivered 12,373
+  sims/s, no inflation claimed anywhere.
+
+A delivered-zero move (a reused root that already met the budget) reports
+`inf`, not `1.0`. 1.0 would say the two counts agreed when in fact the full
+request was reported against no work at all.
+
+## The search is SLICED, because the core has no stop flag and no clock
+
+`ReplaySearch::search_parallel(N)` runs to N root visits and returns. `aborted_`
+is set by `record_error` and by nothing else, and the dispatcher has no clock —
+both by C9's design, and C11 may not change the core. UCI requires `stop` and a
+move time.
+
+So `Engine.search_move` calls `search_parallel` repeatedly at a rising ABSOLUTE
+target and reads the stop flag and the clock between calls. The core already does
+the arithmetic (`target_ = num_simulations - existing`), which is the same path
+tree reuse takes, so a slice is not a special case of anything. Slice size is
+`rate * slice_seconds`, floored at `min_slice_sims`, with `rate` measured from
+this search's own delivered count and seeded at the shipping configuration's
+13-14k sims/s; a slice is additionally shrunk so it cannot overrun a deadline.
+
+Alternatives rejected:
+
+* **A stop flag in `cpp/`.** Out of scope, and it would want a test at the
+  concurrency layer that C9 owns.
+* **Search on a worker thread and join it on `stop`.** Same problem — nothing to
+  interrupt — plus a second Python thread running during the search, which is
+  exactly what scope §2.1 spends its discipline avoiding.
+
+**Cost, measured.** W+1 thread spawns per slice; at the shipping W=1 and a 50 ms
+slice that is two threads every 50 ms. A 4,000-sim search took 6-7 slices and
+delivered 13,256-13,530 sims/s against BENCH.md C10b-3e's 13,912 for the same
+configuration unsliced — under 5%, and the acceptance runs sustained 12,373
+sims/s under a real clock. `stop` is answered in **7-109 ms** across the
+conformance harness's four measurements.
+
+Two consequences that had to be handled rather than assumed:
+
+* `eval_stats()` is reset at the start of every `search_parallel`, so a sliced
+  search must SUM them or it reports the last slice as the move. The first
+  version did not, and reported 525 evaluation rows for a 4,000-sim search.
+* `mating_move_` is also reset per call, so the depth-1 mate short-circuit has to
+  be checked after every slice. Without that the next slice clears it and the
+  loop never terminates, because the hack keeps re-firing and the root never
+  reaches the target.
+
+## `import torch` deadlocks against a thread blocked in `sys.stdin.readline()`
+
+The UCI reader thread spends its life blocked in `sys.stdin.readline()`. With
+stdin a pipe and the parent holding it open, `import torch` on the main thread
+**never returns**. Not slowly — the child sat for 300 s with the import not
+completed, and a watchdog thread scheduled to fire at 20 s never ran either.
+
+Reproduced minimally, on Windows / Python 3.13.7 / torch 2.8.0:
+
+| child | result |
+|---|---|
+| reader thread on `sys.stdin.readline()`, then `import torch` | **hangs** |
+| same, without `sys.setswitchinterval(0.0005)` | **hangs** (not our setting) |
+| second thread on `time.sleep(3600)`, then `import torch` | 1.4 s |
+| second thread reading an ordinary FILE, then `import torch` | 1.4 s |
+| no second thread at all | 1.9 s |
+| `import torch` FIRST, then the reader thread, then CUDA + checkpoint + capture | **all fine** |
+
+The mechanism is not fully characterised and is not claimed here; the last row is
+what the fix rests on, and it is unambiguous. `playv6.preimport_torch()` is
+called from `uci_wrapper_v6.main()` before `UCIEngine.run()` starts the reader,
+and everything expensive after it — CUDA init, `load_model`, the CUDA graph
+capture — runs normally with the reader blocked.
+
+**It only bites through a pipe**, which is to say only under Cutechess,
+lichess-bot and `tools/uci_conform_c11.py`, and never at an interactive terminal.
+`printf 'uci\nisready\n' | python playing/uci_wrapper_v6.py` also works, because
+stdin reaches EOF and the reader thread exits before the import. The
+configuration that fails is exactly the production one, and the two that pass are
+the two anyone would test by hand. That is why it is written up at this length.
+
+## `max_outstanding` is the knob; K is derived and floored
+
+Scope §2.2 makes W*K the governing quantity and C9c measured the two
+independently. So `EngineConfig` exposes `threads` (W) and `max_outstanding`
+(W*K), and `in_flight` is `max_outstanding // threads`, floored at 1.
+
+FLOORED, not rounded: the outstanding count is the virtual-loss exposure and the
+batch ceiling at once, so rounding up would search a wider configuration than the
+one a benchmark row names. `effective_outstanding` (W times the floored K) is
+logged alongside the requested figure, so `threads=5, max_outstanding=24` reports
+`max_outstanding=24 in_flight=4 effective_outstanding=20` and cannot claim to
+have run at 24.
+
+`max_outstanding < threads` is refused outright rather than floored to K=1: it
+means the caller asked for fewer in-flight leaves than it has threads, and
+silently giving every thread one anyway would run at W, not at what was asked.
+
+## The configuration log: the kv line every time, the block only on change
+
+The brief requires the full resolved configuration on `isready`. A GUI sends
+`isready` before every move, and eleven grouped lines per move measured **660
+stderr lines for two games**.
+
+`describe()`'s first line is `as_kv()` — every declared field plus the two derived
+ones, `key=value`, on ONE line — and that is emitted on every `isready`. The
+grouped human-readable block that follows is emitted only when the configuration
+CHANGED. Nothing is dropped: the kv line carries the same fields, and
+`tests/test_c11_uci.py::test_every_config_field_appears_in_the_one_line_record`
+asserts that against `fields(EngineConfig)` rather than against a written list.
+
+## No opening book and no Syzygy bypass in v6
+
+v5's wrapper carried both. Neither is in C11's implementation scope, and a config
+field that is logged but does nothing is the defect this chunk removes. Cutechess
+supplies openings with `-openings file=...`, which needs nothing from the engine,
+and the core's tablebase backend is attached through `Search::set_tablebase` by
+whichever chunk decides to ship one. The fields are absent from `EngineConfig`
+entirely rather than present and unused, so `missing_options()` cannot be
+satisfied by a knob that goes nowhere.
+
+## cutechess-cli 1.4's `-debug` is rejected by this build, so the engine mirrors
+
+`-debug` would transcribe every UCI line, which is where a null-bestmove check
+would naturally read. This build refuses it in every form tested:
+
+    -debug            Warning: Empty value for option "-debug"   (run abandoned)
+    -debug true       Warning: Invalid value for option "-debug": "true"
+    -debug 1          Warning: Invalid value for option "-debug": "1"
+
+— in leading, middle and trailing positions. So `_emit_bestmove` mirrors every
+emitted move to stderr as `[bestmove] bestmove e2e4 fen=...`, and cutechess
+forwards engine stderr into the per-engine `stderr=` log (the house convention
+from `run_15k_ab.ps1`). That is strictly BETTER than the transcript would have
+been: the mirror carries the FEN, so a legitimate `bestmove 0000` at a finished
+position is distinguishable from one that ended a live game.
+
+## `searchmoves` is not implemented, and says so
+
+Neither the core nor this layer can restrict the root move list. A `go
+searchmoves ...` logs that it is not implemented and names the moves it ignored,
+then searches everything. Silently searching everything is the alternative and it
+is the same defect class as a dropped `setoption`.
+
+## Rule compliance
+
+* **Rule 1.** No file under `tests/` or `golden/` was modified.
+  `tests/test_c11_uci.py` is a NEW file. `git status` shows only additions.
+* **Rule 2.** No golden data produced. `tools/smoke_c11.py` writes only under
+  `benchmarking/engine/games/c11_smoke/`; `tools/uci_conform_c11.py` writes only
+  what `--keep-log` / `--json-out` name.
+* **Rule 3.** Full suite run and pasted. **1,341 passed, 49 skipped, 1 failed.**
+  The failure is `test_c10_gate2b.py::test_every_disagreement_is_a_near_tie` —
+  **C10's, pre-existing, and untouched by this chunk**: DECISIONS.md C10 Rule 10
+  reports Gate 2b's second criterion as failed, and BENCH.md C10b's "What is not
+  done" carries it forward. C11 adds no C++ and modifies no existing file, so it
+  cannot have caused it and does not claim to have fixed it. See "What is not
+  done" below.
+* **Rule 4 / 5 / 6 / 8.** No C++ added or changed, so no build, no warnings, no
+  sanitizer surface and no portability surface are affected by this chunk.
+  `playv6.py` imports `guofish_core` only; the wrapper adds `python-chess`.
+* **Rule 7.** No new dependencies. `argparse`, `queue`, `threading`, `dataclasses`
+  from the standard library; `python-chess` and `torch` were already required by
+  the v5 surface and by `playing/v6/evaluator.py`.
+* **Rule 9.** This file.
+* **Rule 10.** The `policy_temperature` / Dirichlet requirement is reported
+  **blocked**, with the greps that establish the mechanism is absent and the
+  reason the workaround was refused. The pre-existing Gate 2b failure is reported
+  rather than filtered out of the run.
+
+## Amendment compliance
+
+* **A.** No golden data read or written by this chunk.
+* **B.** No drill; nothing under `golden/` is touched, and the acceptance runs
+  write only to `benchmarking/engine/games/c11_smoke/`.
+* **C.** No `reinterpret_cast` — no C++ in this chunk.
+* **D.** No module-scope skip. `tests/test_c11_uci.py` uses a guarded import plus
+  a per-test `skipif` naming the missing prerequisite. Counts below.
+* **E.** No `.gitattributes` change needed; all new files are `.py` and written
+  with `newline="\n"`.
+
+## Cross-platform test counts, itemised
+
+Windows, this machine: **69 collected, 69 passed, 0 skipped** from
+`tests/test_c11_uci.py`.
+
+| group | count | needs | Linux (no-torch venv) |
+|---|--:|---|---|
+| configuration, refusals, sim accounting, startup | 45 | `guofish_core` only | 45 pass |
+| option table, `go` parsing, time management | 24 | `+ python-chess` | 24 pass if `python-chess` is installed; otherwise 24 skips each naming `python-chess is not importable` |
+
+None of the 69 needs `torch` or a CUDA device — the two acceptance criteria that
+do are scripts, not tests, for exactly that reason. So C11's contribution to the
+Linux delta is either **0** or **24 named skips**, and which one depends on a
+single dependency rather than on a device.
+
+Whole-suite figures on Windows: 1,341 passed, 49 skipped, 1 failed in 445 s. The
+49 skips and the 1 failure all predate this chunk.
+
+## What is not done
+
+* **Gate 2b's second criterion.** Still failed, still C10's finding, untouched.
+  Two of 500 differential positions disagree by a decisive margin
+  (`2R5/7p/P3k3/1PK2p1p/5P1P/8/8/2r5 w - - 1 49`, reference `c5b6` at 40.8% vs
+  engine `c5b4` at 38.8%; and `5rn1/Pk2p3/1p1p4/1NpP2r1/2P5/7K/8/4R3 b - - 1 43`,
+  reference `g5g6` at 62.1% vs engine `f8a8` at 47.4%). C11 adds no C++.
+* **`policy_temperature` and Dirichlet noise.** Blocked; see the first entry.
+* **`searchmoves`.** Not implemented; reported per `go` that asks for it.
+* **Pondering beyond the UCI handshake.** `go ponder` / `ponderhit` / `stop` work
+  and are covered by the conformance harness. v5's `--ponder` background
+  pondering between turns — which is NOT the UCI handshake — is not ported.
+  `SearchConfig.ponder_decay` is exposed and reaches the core, but nothing in v6
+  passes `from_ponder=True` to `apply_move`, so it is a knob with no live caller
+  yet. It is logged as itself and is not claimed to do anything.
+* **Multi-PV `info` output.** One PV, from the most-visited path through the
+  visited subtree. The v5 student is a multi-PV student, but nothing in the
+  acceptance criteria reads a second line.
+* **A strength number.** C13's job. The 20-game smoke runs went 20-0-0 against
+  Stockfish at `UCI_Elo=1800`, which says the wrapper works and says nothing
+  about strength: the anchor is weak, the sample is tiny, and it was chosen so
+  the games would last rather than to measure anything.
