@@ -290,6 +290,8 @@ implementations (Global Rule 2). Results are transcribed into `BENCH.md`.
 | `python tools/bench_c9.py --markdown` | C9b–C9f: the W × K grid with its W=1 control rows, the affinity comparison, and the dispatcher GIL histogram. Replay evaluator only, no GPU |
 | `python tools/bench_c9.py --affinity-only --sims 20000` | the affinity table alone, at a budget long enough for the effect to appear — at 2,000 sims pinning measures as noise |
 | `python tools/bench_c10.py` | **C10: the live evaluation boundary.** Needs torch, a CUDA device and the v5 checkpoint. Real search throughput at `sys.setswitchinterval` 0.005 vs 0.0005, with and without a competing pure-Python thread, plus the dispatcher's acquire-wait histogram against C10's 200 µs / 1%-of-wall triggers |
+| `python tools/bench_c10b_knee.py --markdown` | **C10b: the knee, re-measured on the graphed forward.** Imports C9a's timing discipline rather than restating it, and adds three graphed paths plus the shipped one (full 4096-wide D2H). Prints the acceptance-criterion-3 verdict |
+| `python tools/bench_c10b.py --markdown` | **C10b: the whole decision surface, live and graphed.** The W × K grid with its W=1 control rows, the crossings/rows-per-crossing/padding histogram, Gate 4 in both regimes, and the C10d acquire-wait histogram re-run graphed *and* eager. `--sections` runs one part at a time |
 
 On Linux, prefix with the build directory as usual:
 
@@ -414,6 +416,7 @@ python tools/drill_c5_gate1.py
 python tools/drill_c6_gate1.py
 python tools/drill_c8_reuse.py
 python tools/drill_c10_gate2.py
+python tools/drill_c10b_graphs.py
 ```
 
 The C5 drill corrupts the quiet Gate 1 data four ways; the C6 drill corrupts the
@@ -435,6 +438,27 @@ against it. Configure re-uses the already-fetched dependency sources under
 `build/msvc-release` to exist first. The remaining three mutations are the
 classic golden-copy form and need no rebuild. Run it against a Release build;
 each source mutation costs one ~40 s compile.
+
+**The C10b drill is a third shape and mutates CODE, not data.** C10b's
+properties — "a padded row's prior cannot reach an expansion", "the callback
+allocates nothing", "capture did not change the forward" — are claims about the
+evaluator rather than comparisons against golden data, so there is no file to
+corrupt. It writes five one-property mutations into a scratch pytest *plugin*
+(loaded with `-p`, so the patch lands before any fixture builds an evaluator),
+runs `tests/test_c10b_graphs.py` against each, and reports which tests caught
+it. `golden/` is never written to and its digests are printed before and after
+anyway. It needs a GPU, torch and the checkpoint, takes ~40 s, and refuses to
+run at all if the unmutated suite does not pass first.
+
+One mutation is caught by a **crash** rather than an assertion — a leaked
+padding row carries the NaN the test poisons it with, and nothing in the Release
+hot path guards a non-finite prior — so the drill re-runs the expected test
+alone to attribute the crash. "Caught" never means "the process died somewhere".
+
+```bat
+python tools/drill_c10b_graphs.py
+python tools/drill_c10b_graphs.py --only pad-leak --keep
+```
 
 **The C10 drill is the classic golden-copy form and takes seconds** — it needs no
 GPU, no torch and no rebuild, because Gate 2 compares a pure function of a FEN

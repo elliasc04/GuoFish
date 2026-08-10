@@ -5369,3 +5369,363 @@ loop plus docstring text. No assertion changed.
   inside a ±22-39% run-to-run spread on this host, so the honest statement is
   "not resolvable", not "zero". A quieter machine would settle it; the contention
   it prevents is a factor of 436, so the trade is not close either way.
+
+---
+
+# C10b — Dispatch elimination: the forward as a CUDA graph (2026-08-10)
+
+C9a proved the small-batch cost was ~110 host ATen submissions per forward, not
+GPU work. This chunk deletes those submissions. Everything below is a judgment
+call the brief did not settle, in the order a reader meets it.
+
+## Manual `torch.cuda.CUDAGraph`, not `torch.compile(mode="reduce-overhead")`
+
+The brief says to try `torch.compile` FIRST, measure it against manual capture,
+and keep whichever wins *and is shape-stable*. It was tried, it is faster, and it
+is rejected. Both halves are measured (BENCH.md C10b-1b):
+
+| | batch 8 | 32 | 128 | 256 | policy words differing from eager |
+|---|---:|---:|---:|---:|---:|
+| manual capture | 0.747 ms | 1.814 | 6.350 | 13.269 | **0 of 2,048,000** |
+| `torch.compile` | 0.507 ms | 1.478 | 4.931 | 10.474 | **1,773,671 of ~2.6M (68%)** |
+
+`torch.compile` is 20-27% faster because Inductor fuses the epilogues — and
+fusing them changes the reduction, so 68% of the bf16 policy words come out
+different. The brief is explicit that *"a graphed forward that fails Gate 2 is
+rejected regardless of speed"*, and a forward whose logits move by a bf16 ulp
+moves priors by ~1e-3, three orders over the 1e-6 bound.
+
+Two frictions are recorded because they are reasons and not grumbles. On this
+machine every compiled launch raises `OverflowError: Python int too large to
+convert to C long` from Inductor's static CUDA launcher until
+`torch._inductor.config.use_static_cuda_launcher = False` is set — reaching into
+a private config to make a dependency work is not something to ship silently.
+And warmup costs ~35 s of compilation at engine start against ~0.6 s of capture,
+which a UCI host paying it on every `ucinewgame` would notice.
+
+`CompiledForward` is kept in `playing/v6/graphs.py` behind `graph_method=`, so
+the comparison stays reproducible rather than becoming this paragraph.
+
+## Every graph gets a PRIVATE memory pool
+
+`torch.cuda.graph(g, pool=...)` lets graphs share one pool, which is what the
+memory numbers want: the shared-pool version of {8, 32, 128, 256} and the
+private-pool version measured the same replay times, and sharing saves a few
+hundred MiB.
+
+It is not used, because sharing is only sound when the graphs are always
+replayed in the order they were captured. This dispatcher replays whichever
+shape the next batch rounds up to, in whatever order the search produces. The
+failure mode is not a crash — it is one graph's replay landing on another's
+intermediates, i.e. occasional wrong priors under load, which is the worst class
+of bug this codebase could acquire. ~1.9 MiB of device memory per captured row
+is the price and `CaptureReport` publishes it (730 MiB at max_batch 128).
+
+## The int32 to int64 widening moved INSIDE the graph
+
+C++ writes int32 tokens; `nn.Embedding` indexes with int64. C10's callback did
+`device_int64.copy_(host_int32)`, a cross-device cross-dtype copy that allocates
+a temporary on every batch — which is exactly what capture forbids. So the
+static input buffer is int32, the H2D is a straight byte move from pinned
+memory, and `tokens.to(torch.int64)` is captured as part of the graph. The
+conversion kernel is then baked in and the callback allocates nothing, which
+`test_the_callback_allocates_no_device_memory` measures against
+`torch.cuda.max_memory_allocated` rather than asserting by review.
+
+## The capture ladder is nine shapes, not the brief's two
+
+The brief proposed {32, 128} and said to add 64 only if the re-measured knee
+asked for it. The knee asked for much more than that, and the evidence is a
+whole grid: on {1, 8, 32, 128} the live W x K sweep shows `pad waste` swinging
+between 1.09x and 2.87x across cells, and throughput tracking it inversely.
+W=1/K=48 measured **6,888 sims/s** on that ladder and **15,551** on the dense
+one — a 2.15x difference from padding alone, larger than the effect of W and K
+put together.
+
+The cause is that a graphed forward costs ~0.55 ms fixed plus ~44 us per row, so
+a 42-row batch evaluated at shape 128 pays 6.2 ms for 2.4 ms of work. The ladder
+{1, 8, 16, 24, 32, 48, 64, 96, 128} bounds every gap at ~1.4x and the measured
+spread falls to 1.08-1.29x.
+
+Two entries are there for reasons the ladder shape does not explain. **8**,
+because C10h measured 3.2 rows per crossing in the reuse-heavy regime. **1**,
+because W=1/K=1 is an acceptance configuration — Gate 2b's differential and the
+grid's serial reference row both run `max_batch=1` — and see the next two
+entries for why that matters.
+
+## Padding changes the cuBLAS tile, and that is torch's, not capture's
+
+Measured over the Gate 2 corpus on the EAGER forward, with no graph involved:
+evaluating the same rows at width n against width m produces identical bf16
+logits at every pair tested **except n in {4, 5, 6}**, where 66% of words differ
+by exactly one bf16 ulp (max |dlogit| 0.0625), worth up to 7.8e-3 on a prior and
+21-31 prior-ordering inversions per sweep.
+
+So padding is not numerically free, and it matters where the cost comes from:
+cuBLAS picks a different kernel at those widths, and eager torch did the same
+thing before C10b existed. What C10b changes is that the engine now evaluates at
+`len(sizes)` distinct widths instead of up to `max_batch` of them — it makes the
+engine MORE shape-stable, not less.
+
+`test_the_shape_term_belongs_to_torch_and_not_to_the_graph` reports both terms
+side by side so the two can never be conflated: graph-at-shape-N against
+eager-at-shape-N (must be zero, and is) and eager-at-N against eager-at-M (may
+be nonzero, and is at 4-6).
+
+## Gate 2b is NOT re-run, and the reason is bit-identity rather than budget
+
+Gate 2b's 500-position differential costs ~2 hours. It is not re-run, and that
+is a decision rather than an omission.
+
+Gate 2b runs `ParallelConfig(max_batch=1)`, so every batch it produces is
+exactly one row. `1` is a captured shape, and
+`test_the_graphed_forward_is_bit_identical_to_the_eager_one` verifies over all
+500 corpus positions at shape 1 that the graph's policy words and values are
+**identical** to the eager forward's — 0 of 2,048,000 words differ. The graphed
+engine therefore evaluates every batch of that gate through exactly the kernels
+C10 measured it through, and a re-run would reproduce C10's 497/500 by
+construction.
+
+This is the reason `1` is in the capture ladder. Without it a batch of one would
+pad to 8, which is one of the three widths where the shape term is nonzero, and
+the recorded Gate 2b evidence would have had to be re-earned.
+
+The cheap live tests in that file — both smoke searches, the buffer checks, the
+switch-interval assertion and the acquire-wait histogram — DO run on the graphed
+evaluator and are in the suite result below.
+
+## STAGE 2 IS NOT SHIPPED, and here is the measurement that decided it
+
+The brief makes Stage 2 conditional twice: *"only where GPU time now dominates"*
+and *"if the sharpness cost exceeds the throughput gain's worth, ship graphs
+without the pipeline"*. Both conditions were measured rather than judged.
+
+**The ceiling.** The callback is the whole of the GPU wait — H2D, replay, D2H —
+and the dispatcher is blocked inside it, so `call_ns / wall_ns` is the fraction
+of the cycle already spent on the device. Across every cell of the live grid it
+is **80-96%** (BENCH.md C10b-3b, `GPU share`), and 87% at the chosen
+configuration. Pipelining can hide at most the remainder, so its throughput
+ceiling is **1.04x-1.24x**, and 1.13x where it would ship.
+
+**The price.** Pipelining adds one batch of staleness to every evaluation, i.e.
+the tree carries a second batch's worth of unresolved virtual loss. The control
+table prices that directly, because it is the same axis: at 24 outstanding the
+top-move share is 64.2%, and at 48 — one extra batch in flight — it is 57.5%.
+**6.7 points of top-move share for at most 1.13x.**
+
+**And the lever already exists.** Raising K from 24 to 48 buys 1.13x
+(13,944 -> 15,813 sims/s) for the same 6.7 points, with no second static buffer,
+no CUDA events, and no restructuring of a dispatcher whose race-freedom rests on
+a clean TSan run. Pipelining is dominated by a config change on both axes.
+
+The one regime where the ceiling is large is the reuse-heavy endgame, where GPU
+share falls to ~48% (ceiling 2.1x) because 85% of leaves are answered by the
+transposition cache. That regime already delivers **92,639 sims/s**, 11.6x Gate
+4's floor. Optimising it is not a use of the chunk.
+
+So Stage 1 shipped and Stage 2 did not. The brief calls that outcome acceptable
+and it is recorded here with both numbers rather than as a preference.
+
+## W x K CHANGES from C9's provisional W=4/K=8 to **W=1, K=24**
+
+C9's selection was explicitly provisional, taken on the replay evaluator with a
+stand-in answering 24-37% of expansions and an ungraphed forward. Re-measured
+live and graphed, the ordering changes.
+
+| config | outstanding | sims/s (20k, fresh root) | top share | TV vs serial | run-to-run TV |
+|---|---:|---:|---:|---:|---:|
+| W=4, K=8 (C9's pick) | 32 | 13,123 | 64.3% | 24.7% | 2.8% / 6.5% |
+| W=8, K=4 | 32 | 13,820 | 65.7% | 23.3% | 2.9% / 6.0% |
+| **W=1, K=24** | **24** | **13,912** | **64.2%** | **24.7%** | **0.0% / 0.0%** |
+| W=1, K=32 | 32 | 14,372 | 61.8% | 26.6% | 0.0% / 0.0% |
+
+W=1/K=24 matches W=4/K=8 on both axes — same throughput inside noise, same
+top-move share to a tenth of a point — and is **deterministic**: run-to-run TV
+is 0.0% across 8 positions x 4 repeats, because there is one descent thread and
+nothing for scheduling to reorder.
+
+The reason W>1 stopped paying is that the GPU became the bottleneck. At 87% GPU
+share one descent thread keeps the device fed, and extra workers buy nothing
+while costing two things the table shows: select collisions (0.05-0.09 per
+simulation against 0.0004 at W=1) and batch fragmentation — workers reach the
+drain condition at different moments, so `mean batch` falls to 19.9 at W=4/K=8
+against 23.8 at W=1/K=24 for the same leaves in flight.
+
+W=1/K=32 is 3.3% faster for 2.4 points of top-move share. Declined on C9's own
+principle: throughput is not the binding constraint, Gate 4's floor is cleared
+1.74x at K=24, and a configuration faster and visibly flatter at the root is the
+wrong trade.
+
+## Pinning is OFF at W=1, and that inverts C9d
+
+C9d measured one-thread-per-P-core worth +14.9% at W=4 and +24.5% at W=6. At
+W=1 it measures **-9%** (13,923 unpinned against 12,661 pinned, median of 4 runs
+at 20,000 simulations). C9d's own mechanism explains its absence: pinning helps
+because a worker parked on an E-core holds the root's contended atomics longer,
+and at W=1 there is no contention on the root to hold. What pinning does instead
+is constrain the one worker to a core the dispatcher also wants.
+
+`affinity_for(workers)` in tools/bench_c10b.py is the rule — `none` at W=1,
+`pcore_physical` above it — so the policy is one function rather than a constant
+repeated at four call sites.
+
+## C9's deferred absolute root-stability tolerance, closed
+
+C9 deferred it because `run-to-run TV` on the replay evaluator tracked the
+stand-in evaluator's share rather than the engine's own variation, and could
+only be used as a ratio. The live evaluator removes the confound —
+`stats["synthetic_evaluations"] == 0` is asserted in every cell — so the column
+is now the engine's number:
+
+* **At the shipping configuration (W=1, K=24): 0.0%.** The search is
+  reproducible run to run.
+* **Across every concurrent cell measured: <= 4.0% mean, <= 8.2% worst** over 8
+  positions x 4 repeats, against C9b's contaminated 5-11% mean and 62.8% worst.
+
+The absolute tolerance is therefore set at **10% run-to-run TV** for any
+concurrent configuration — above every measured worst case with room for
+scheduling variance, and far below the 24.7% that same configuration differs
+from the serial reference by, so the two cannot be confused.
+`test_layer3_root_visit_distribution_is_stable_across_runs` measures 0.15
+against a 0.75 tolerance on the replay evaluator and is untouched; this is the
+live number C9 asked for.
+
+## The poison had to be written on BOTH sides of the boundary, and the drill found it
+
+`poison_unused_rows` originally stamped only the host policy buffer's rows
+[count, max_batch), which catches C++ reading a row it was not given. The C10b
+drill's `pad-leak` mutation — hand leaf i the answer to leaf i+1, so the last
+leaf of every batch gets a padding row — **survived that test**, because the
+leak happens on the Python side before the copy-out: whatever `outputs()`
+selects lands in host rows [0, count) and looks entirely legitimate.
+
+So the poison now also stamps the graph's own output rows [count, padded) after
+the replay. With both, the mutation is caught. This is the drill doing the job
+Amendment B exists for; the test as first written would have passed a real
+version of the bug it was named after.
+
+Two notes on how it is caught. A NaN prior does not produce a different tree —
+it **segfaults the Release build**, because nothing in the hot path guards
+against a non-finite prior. That is an observation about the search, not a
+defect C10b introduces: the network cannot emit NaN, and adding a check to
+`gather_softmax_canonical` is a hot-path change this chunk has no measurement to
+justify. The drill therefore attributes crashes by re-running the expected test
+alone, so "caught" never means "the process died somewhere".
+
+## C10b adds NO C++, and that is the design rather than an accident
+
+Graphs live entirely on the Python side of the evaluation boundary.
+`cpp/evaluator.hpp`'s contract is unchanged — write rows [0, count), call
+`run(count)` once, read rows [0, count) — and padding happens where the tensors
+are, in `playing/v6/graphs.py`.
+
+Three things follow, and the third is an acceptance criterion. The C++ build,
+its warning cleanliness and its sanitizer runs are untouched by this chunk. The
+Linux/Clang toolchain, which has no torch, is unaffected. And *"the replay
+evaluator path must not route through graphs"* becomes structural rather than a
+discipline: there is no capture, no shape and no padding on the C++ surface to
+route through, which is what
+`test_the_replay_evaluator_never_routes_through_a_graph` asserts — on every
+platform, with no GPU.
+
+## Rule compliance
+
+* **Rule 1.** No existing test file was modified. One was added,
+  `tests/test_c10b_graphs.py`. `git status` shows no change to any pre-existing
+  file under `tests/`.
+* **Rule 2.** No golden data was produced or regenerated. C10b compares against
+  `golden/c10_gate2.npz` exactly as C10 recorded it; the drill records its
+  SHA-256 before and after and reports both.
+* **Rules 4, 5, 6, 8.** C10b adds no C++, so the warning cleanliness, the
+  sanitizer builds, the `#pragma pack` / `reinterpret_cast` prohibitions and the
+  two-toolchain requirement are all inherited unchanged from C10.
+* **Rule 7.** No new dependency. `torch.cuda.CUDAGraph` is torch, which the
+  Python side of the boundary already required.
+
+## Rule 3 — the suite, and the Amendment D itemization
+
+Same deselection C10 used: the four tests that consume `test_c10_gate2b.py`'s
+`differential` fixture, i.e. the 500-position sweep. Everything else in that file
+runs, including both smoke searches and the acquire-wait assertion, so the live
+evaluator is exercised through the graphed callback on every platform that has
+torch.
+
+| build | result | wall |
+|---|---|---:|
+| Windows / MSVC 19.51, **Release** | 1,269 passed, 49 skipped, 4 deselected | 2m 09s |
+| Windows / MSVC 19.51, **Debug + ASan + asserts** | **1,270 passed, 48 skipped, 4 deselected** | 19m 05s |
+| Linux / Clang 18.1.3, Release (WSL2) | 1,242 passed, 72 skipped, 4 deselected | 55s |
+
+The ASan row is the Rule 5 acceptance run: AddressSanitizer on, `assert()` live,
+zero errors. C10b adds no C++, so this row is the C10 module re-run against the
+new Python-side path plus the 14 new tests; the graphed callback, the capture,
+the pad refill and the poison drill all run under it.
+
+**Windows Release -> Windows ASan: one test moves from skipped to passed.**
+`test_c8_reuse.py`'s `debug_total_vloss` audit is compiled only when
+`GUOFISH_DEBUG_VL` is on, which is the default for `Debug` and off for
+`Release`. That is a build difference, not a platform one, and C8 asserts both
+halves deliberately.
+
+**Windows -> Linux: 27 fewer passed, 23 more skipped, 4 fewer collected.** Every
+item accounted for:
+
+| item | count | reason |
+|---|---:|---|
+| `test_reference_defects.py` | **4 fewer collected** | The standing Amendment D exception. Its module-scope `importorskip` collapses 5 collected tests into 1 skip entry where `core.mctsv4` cannot be imported. Windows collects 5; Linux reports 1 skip. |
+| `test_c10b_graphs.py` | **13 skipped** | `torch is not importable` — the Linux venv has no torch, by choice (it exists for TSan). Each of the 13 is individually marked and names the reason; there is no module-scope skip in the file. |
+| `test_c10_gate2b.py` | **9 skipped** | Same reason, C10's existing per-test marks. |
+| `test_reference_defects.py` | **1 skipped** | The module-skip entry itself. |
+| | **23 skipped, 4 uncollected** | 1,269 − 27 = 1,242 passed; 49 + 23 = 72 skipped. Reconciles exactly. |
+
+**C10b's own contribution is 14 tests: 14 pass on Windows, 1 passes and 13 skip
+on Linux.** The one that runs everywhere is
+`test_the_replay_evaluator_never_routes_through_a_graph`, and it runs everywhere
+on purpose — it is the assertion that Gate 1's path cannot acquire a graph, and
+a version of it that needed a GPU would be checking the wrong build.
+
+`test_c6_gate1_full.py`'s 48 skips ("this corpus predates the census columns")
+are identical on both platforms and predate this chunk.
+
+## The mutation drill
+
+`python tools/drill_c10b_graphs.py`, Release build, ~40 s.
+
+| mutation | caught by | how |
+|---|---|---|
+| `pad-leak` | `test_a_padded_rows_prior_cannot_reach_an_expansion` | crash (0xC0000005), attributed by re-running that test alone |
+| `no-pad-refill` | `test_the_padding_rows_hold_the_pad_position_and_not_the_previous_batch` | assertion |
+| `round-down` | `test_the_captured_shapes_cover_every_batch_the_dispatcher_can_hand_over` + 3 others | assertion |
+| `stale-replay` | `test_the_graphed_forward_is_bit_identical_to_the_eager_one` + all 3 Gate 2 columns | assertion |
+| `allocating-call` | `test_the_callback_allocates_no_device_memory` | assertion |
+
+**5/5 caught. `golden/` SHA-256 unchanged** for `c10_gate2.npz`,
+`c10_gate2_manifest.json` and `c10_corpus.json`, printed before and after
+(Amendment B). The drill refuses to run at all if the unmutated suite does not
+pass first, because a mutation that "fails" against an already-red suite proves
+nothing.
+
+`pad-leak` is the one that earned its place: it survived the first version of
+the leak test, which is what led to poisoning both sides of the boundary. See
+above.
+
+## What is not done
+
+* **Stage 2, the pipeline.** Measured, priced, and declined. See above. If a
+  future chunk wants it, the number to beat is 1.13x and the number to pay is
+  6.7 points of top-move share.
+* **A guard against non-finite priors.** The drill showed a NaN prior segfaults
+  Release. Out of scope here: a hot-path change with no measurement behind it,
+  and the network cannot produce one.
+* **Gate 2b's second criterion.** Still failed, still C10's finding, untouched
+  by this chunk. C10b changes how the forward executes and not what it computes,
+  and the bit-identity measurement above is why that sentence is checkable.
+* **Trimming the capture ladder for the shipping configuration.** W=1/K=24 uses
+  shapes 1, 8, 16 and 24 in practice (BENCH.md C10b-3d: 827 of 835 crossings at
+  shape 24), so ~500 MiB of the 730 MiB ladder serves other configurations only.
+  Left dense because `max_batch` is a caller's choice, and a ladder that is
+  wrong for the caller's configuration is the failure mode this chunk spent its
+  first grid run discovering.
+* **The knee above batch 128.** `graph-forward` peaks at 21,018 pos/s at 128 and
+  falls to 19,736 at 256, so the graphed knee is still 128 and nothing was
+  measured beyond it. `max_batch` above 128 has no measurement behind it.

@@ -1364,3 +1364,408 @@ counts is the batch-of-one cost stated above, isolated.
   4-8x high.
 * The quiet-interpreter rows are short (1.3-1.7 s) and are not a comparison; C10f
   is. The contended rows are long enough that their difference is not in doubt.
+
+---
+
+## C10b — The forward as a CUDA graph, and the decision surface re-measured
+
+Reproduce with `python tools/bench_c10b_knee.py --markdown` (the GPU curve) and
+`python tools/bench_c10b.py --markdown` (the live grid, Gate 4, padding and the
+acquire-wait histogram). Both need torch, a CUDA device and the v5 checkpoint,
+and `bench_c10b.py` refuses to publish from a sanitizer build.
+
+Same machine and model as C10 throughout: `models/guofish5_20M/v5_10.9M_best.pt`
+(10.9M v5 student, 6 layers, d_model 384, bf16 autocast), RTX 5070, torch
+2.8.0+cu129, MSVC 19.51 Release, `asan=False`.
+
+**Every absolute figure in C9a and C9b is superseded here.** C9a measured an
+ungraphed forward — i.e. ~4 ms of host dispatch per batch — and C9b ran on the
+replay evaluator with a stand-in answering 24-37% of expansions. Both confounds
+are gone.
+
+### C10b-1a — Capture fidelity: the graphed forward is the eager forward
+
+The claim every other number rests on. For each captured shape, the whole
+500-position Gate 2 corpus is run through the graph and through the un-captured
+forward **at the same shape**, and the raw bf16 policy bit patterns are
+compared. From `pytest tests/test_c10b_graphs.py -s`:
+
+| shape | policy words compared | differing | values differing |
+|---:|---:|---:|---:|
+| 1 | 2,048,000 | **0** | 0 |
+| 8 | 2,031,616 | **0** | 0 |
+| 16 | 2,031,616 | **0** | 0 |
+| 24 | 1,966,080 | **0** | 0 |
+| 32 | 1,966,080 | **0** | 0 |
+| 48 | 1,966,080 | **0** | 0 |
+| 64 | 1,835,008 | **0** | 0 |
+| 96 | 1,966,080 | **0** | 0 |
+| 128 | 1,572,864 | **0** | 0 |
+
+Graph capture did not change kernel selection on this model. That is not a
+property to assume — it is exactly what the C10b brief required be checked — and
+it is what makes Gate 2's re-pass below reproduce C10a cell for cell.
+
+### C10b-1b — Why `torch.compile(mode="reduce-overhead")` is rejected
+
+The brief asks for it to be tried first and measured against manual capture.
+Both were built.
+
+| batch | manual capture | `torch.compile` | compile speedup |
+|---:|---:|---:|---:|
+| 8 | 0.747 ms | 0.507 ms | 1.47x |
+| 32 | 1.814 ms | 1.478 ms | 1.23x |
+| 128 | 6.350 ms | 4.931 ms | 1.29x |
+| 256 | 13.269 ms | 10.474 ms | 1.27x |
+
+| | policy words differing from the eager forward |
+|---|---:|
+| manual capture | **0** of 2,048,000 |
+| `torch.compile` | **1,773,671** of ~2,621,440 (68%) |
+
+Inductor fuses the epilogues, which is where the speed comes from and why the
+numbers move: a bf16 logit shifted by one ulp moves a prior by ~1e-3, three
+orders over Gate 2's 1e-6 bound. The brief's own rule settles it — *"a graphed
+forward that fails Gate 2 is rejected regardless of speed."* Two further costs,
+recorded in DECISIONS.md: it needs
+`torch._inductor.config.use_static_cuda_launcher = False` on this machine or
+every launch raises `OverflowError`, and warmup is ~35 s of compilation against
+~0.6 s of capture.
+
+### C10b-1c — The shape term: padding is not free, and it is not the graph's
+
+Same rows, two batch widths, **eager torch only — no graph anywhere near it.**
+Sweeps over the Gate 2 corpus, comparing width n against the width it would pad
+up to:
+
+| n | padded to | words differing | max abs delta on a logit | max abs delta on a prior | prior-ordering inversions |
+|---:|---:|---:|---:|---:|---:|
+| 1, 2, 3, 7, 8 | 1 / 8 | **0%** | 0 | 0 | 0 |
+| 4 | 8 | 66.3% | 0.0625 | 6.2e-03 | 21 |
+| 5 | 8 | 66.5% | 0.0625 | 5.8e-03 | 31 |
+| 6 | 8 | 66.1% | 0.0625 | 7.8e-03 | 28 |
+| 9-31 | 32 | **0%** | 0 | 0 | 0 |
+| 33-127 | 128 | **0%** | 0 | 0 | 0 |
+| 129-255 | 256 | **0%** | 0 | 0 | 0 |
+
+cuBLAS selects a different kernel at widths 4-6 and nowhere else on this device.
+The effect is one bf16 ulp, and eager torch had it before C10b existed — the
+pre-C10b engine evaluated at whatever width the dispatcher happened to drain, so
+it saw up to `max_batch` distinct widths. C10b reduces that to nine. **Padding
+makes the engine more shape-stable, not less**, and the residual cost is
+confined to three batch widths.
+
+### C10b-2 — Gate 2, re-run on the graphed forward
+
+Same corpus, same criterion, same C++ gather — logits from the graph instead of
+from the eager forward. 384 positions (the ones the golden generator evaluated
+at a captured shape), 11,481 priors.
+
+| comparison | max abs delta | p99 | exact | over 1e-6 | inversions |
+|---|---:|---:|---:|---:|---:|
+| graphed vs reference interior (ATen CPU, python-chess order) | 2.384e-07 | 5.364e-08 | 3,986 | **0** | **0** |
+| graphed vs reference root (ATen CUDA, python-chess order) | 2.384e-07 | 4.470e-08 | 3,341 | **0** | **0** |
+| graphed vs ATen CPU in chess-library order | 2.682e-07 | 5.960e-08 | 3,865 | **0** | **0** |
+
+**Gate 2 re-passed: max 2.682e-07 against the 1e-6 bound, zero inversions.**
+Every maximum reproduces C10a's exactly, which is the expected consequence of
+C10b-1a and the reason the table is worth printing rather than asserting.
+
+### C10b-3a — The knee, graphed
+
+`python tools/bench_c10b_knee.py --markdown`. C9a's methodology imported rather
+than restated — `torch.cuda.synchronize()` around every timed iteration, SM
+clock reported per row. `best pos/s` is the minimum saturated per-batch time, as
+in C9a. Every swept batch size is captured, so this table has no padding in it.
+
+**`graph-gathered`** — C9a's `gathered` path with the forward graphed, and the
+row acceptance criterion 3 is denominated in:
+
+| batch | isolated ms | best ms | best pos/s | C9a `gathered` | speedup | SM MHz |
+|------:|------------:|--------:|-----------:|---------------:|--------:|-------:|
+| 8 | 0.851 | 0.848 | 9,430 | 1,951 | 4.83x | 2917 |
+| 16 | 1.193 | 1.130 | 14,164 | 4,252 | 3.33x | 2880 |
+| 32 | 1.957 | 1.902 | **16,821** | 8,374 | **2.01x** | 2887 |
+| 64 | 3.576 | 3.374 | 18,971 | 15,965 | 1.19x | 2880 |
+| 128 | 6.440 | 6.187 | 20,689 | 18,166 | 1.14x | 2857 |
+| 256 | 14.247 | 13.394 | 19,113 | 18,356 | 1.04x | 2880 |
+
+**`graph-production`** — what `playing/v6/evaluator.py` actually does. C10 put
+the gather in C++, so the full 4096-wide bf16 row crosses the bus, not scope
+§2.5's 64-wide one. Quoted separately because `gathered` is the comparable row
+and this is the true one:
+
+| batch | isolated ms | best ms | best pos/s |
+|------:|------------:|--------:|-----------:|
+| 8 | 0.862 | 0.836 | 9,568 |
+| 16 | 1.178 | 1.150 | 13,917 |
+| 32 | 1.956 | 1.921 | **16,662** |
+| 64 | 3.528 | 3.451 | 18,546 |
+| 128 | 6.490 | 6.254 | 20,468 |
+| 256 | 14.103 | 13.101 | 19,541 |
+
+The 4096-wide D2H costs 1% at batch 32 and nothing at all at 128. It is not
+worth moving the gather to the GPU.
+
+**`graph-forward`**, and the ungraphed paths re-run in the same session so the
+comparison is not across two days of driver state:
+
+| batch | graph-forward | forward (eager) | reference (eager) | gathered (eager) |
+|------:|--------------:|----------------:|------------------:|-----------------:|
+| 8 | 11,223 | 2,234 | 2,099 | 2,076 |
+| 16 | 15,901 | 4,454 | 4,175 | 4,080 |
+| 32 | 18,407 | 9,433 | 8,996 | 9,322 |
+| 64 | 19,998 | 17,719 | 15,383 | 16,246 |
+| 128 | **21,018** | 19,564 | 17,907 | 18,630 |
+| 256 | 19,736 | 19,100 | 18,016 | 18,333 |
+
+**Acceptance criterion 3: MET.** Batch-32 `gathered` is 16,821 pos/s against
+C9a's published 8,374 — **2.01x**, target 16,748. Stated honestly alongside it:
+the same-session re-measurement of the ungraphed path is 9,322 rather than
+8,374, so the in-session speedup is **1.80x**. The criterion names the published
+figure and is met against it; the smaller number is the one to believe about
+this machine today, and it is still within 8% of the brief's prediction.
+
+**The prediction landed.** The brief predicted "post-graph batch-32 forward ≈ 2
+ms → ~16k pos/s, batch 64 ≈ 17k". Measured: 1.90 ms and 16,821 at batch 32,
+18,971 at batch 64.
+
+**The knee is still 128** — `graph-forward` peaks there at 21,018 pos/s and
+falls at 256 — but the shape below it has changed completely. Batch 32 is now
+80% of peak throughput against 46% before, because the flat ~4 ms host-dispatch
+segment C9a found from batch 8 to 64 is gone. Per-batch cost is now ~0.55 ms
+fixed plus ~44 us per row, and the fixed term is kernel *execution* overhead
+inside the graph, not submission.
+
+### C10b-3b — The W x K grid, live and graphed
+
+`python tools/bench_c10b.py --sections grid`. 8 quiet positions x 4 repeats,
+2,000 sims, virtual loss 2.5, `max_batch` 128, Q32 accumulator. Every cell
+asserts `delivered == requested`, `vloss_total == 0`, zero conservation failures
+and — new here — `synthetic_evaluations == 0`, so the stand-in that contaminated
+C9b cannot contribute.
+
+`GPU share` is `call_ns / wall_ns`: the dispatcher is blocked inside the
+callback for the whole GPU wait, so this is the fraction of the cycle already on
+the device, and `pipeline ceiling` is its reciprocal — the most Stage 2 could
+ever buy.
+
+| W | K | outstanding | sims/s | mean batch | rows/crossing | pad waste | GPU share | pipeline ceiling | collisions/sim | TV vs serial | run-to-run TV (mean / worst) | top share |
+|--:|--:|------------:|-------:|-----------:|--------------:|----------:|----------:|-----------------:|---------------:|-------------:|----------------------------:|----------:|
+| 1 | 1 | 1 | 1,827 | 1.0 | 1.0 | 1.00x | 92% | 1.08x | 0.0000 | 0.0% | 0.0% / 0.0% | 78.4% |
+| 2 | 4 | 8 | 4,506 | 4.5 | 4.1 | 1.96x | 96% | 1.05x | 0.0063 | 14.5% | 1.1% / 2.9% | 78.8% |
+| 4 | 4 | 16 | 8,526 | 10.9 | 9.9 | 1.30x | 93% | 1.08x | 0.0517 | 17.3% | 1.5% / 4.5% | 73.2% |
+| 6 | 4 | 24 | 10,172 | 16.3 | 14.9 | 1.23x | 90% | 1.11x | 0.0810 | 20.8% | 2.3% / 6.5% | 68.6% |
+| 8 | 4 | 32 | 9,874 | 18.8 | 17.2 | 1.19x | 82% | 1.21x | 0.0610 | 23.3% | 2.9% / 6.0% | 65.7% |
+| 2 | 8 | 16 | 8,181 | 8.9 | 8.1 | 1.11x | 93% | 1.07x | 0.0074 | 18.4% | 2.4% / 5.2% | 71.8% |
+| 4 | 8 | 32 | 11,859 | 19.9 | 18.3 | 1.15x | 92% | 1.09x | 0.0545 | 24.7% | 2.8% / 6.5% | 64.3% |
+| 6 | 8 | 48 | 12,854 | 29.0 | 26.5 | 1.18x | 92% | 1.09x | 0.0867 | 26.9% | 2.9% / 7.4% | 62.3% |
+| 8 | 8 | 64 | 13,532 | 37.9 | 34.5 | 1.19x | 91% | 1.10x | 0.0867 | 29.3% | 2.7% / 5.6% | 59.1% |
+| 2 | 16 | 32 | 12,108 | 17.7 | 16.3 | 1.10x | 94% | 1.06x | 0.0073 | 25.9% | 3.0% / 8.2% | 62.3% |
+| 4 | 16 | 64 | 13,366 | 34.4 | 31.3 | 1.18x | 92% | 1.09x | 0.0509 | 29.5% | 3.2% / 7.8% | 59.4% |
+| 6 | 16 | 96 | 13,805 | 44.5 | 40.4 | 1.19x | 91% | 1.10x | 0.0798 | 31.0% | 4.0% / 6.7% | 57.4% |
+| 8 | 16 | 128 | 14,774 | 56.9 | 51.5 | 1.19x | 92% | 1.09x | 0.0800 | 34.1% | 3.9% / 7.6% | 53.5% |
+
+**`stand-in%` is gone and `run-to-run TV` is now the engine's own number.** That
+is C9's deferred acceptance debt, closed: see C10b-3g.
+
+### C10b-3c — The control: W=1 at the same outstanding-leaf counts
+
+Same virtual-loss exposure, no concurrency, deterministic by construction.
+
+| W | K | outstanding | sims/s | mean batch | rows/crossing | pad waste | GPU share | collisions/sim | TV vs serial | run-to-run TV | top share |
+|--:|--:|------------:|-------:|-----------:|--------------:|----------:|----------:|---------------:|-------------:|--------------:|----------:|
+| 1 | 1 | 1 | 1,827 | 1.0 | 1.0 | 1.00x | 92% | 0.0000 | 0.0% | 0.0% | 78.4% |
+| 1 | 8 | 8 | 8,203 | 8.0 | 7.3 | 1.09x | 91% | 0.0001 | 15.3% | 0.0% | 78.0% |
+| 1 | 16 | 16 | 11,900 | 15.9 | 14.5 | 1.09x | 90% | 0.0003 | 19.9% | 0.0% | 70.3% |
+| **1** | **24** | **24** | **13,944** | **23.8** | **21.7** | **1.08x** | **89%** | **0.0004** | **24.7%** | **0.0%** | **64.2%** |
+| 1 | 32 | 32 | 14,413 | 31.4 | 28.6 | 1.08x | 89% | 0.0004 | 26.6% | 0.0% | 61.8% |
+| 1 | 48 | 48 | 15,813 | 46.8 | 42.3 | 1.09x | 89% | 0.0006 | 31.1% | 0.0% | 57.5% |
+| 1 | 64 | 64 | 15,847 | 61.0 | 55.0 | 1.08x | 89% | 0.0009 | 33.7% | 0.0% | 53.9% |
+| 1 | 96 | 96 | 16,392 | 88.4 | 78.8 | 1.09x | 89% | 0.0010 | 37.3% | 0.0% | 47.8% |
+| 1 | 128 | 128 | 17,640 | 113.5 | 100.3 | 1.08x | 89% | 0.0011 | 40.4% | 0.0% | 44.1% |
+
+**C9c's finding survives the change of evaluator, and is now the reason the
+selection moves.** Root flattening still tracks the outstanding-leaf count and
+nothing else — compare at equal counts: 24 outstanding gives 64.2% (W=1/K=24)
+against 68.6% (W=6/K=4); 32 gives 61.8% (W=1) against 64.3-65.7% concurrent; 64
+gives 53.9% against 59.1-59.4%. The concurrent rows remain slightly *sharper*
+at equal exposure, exactly as C9c measured.
+
+What changed is throughput. On the replay evaluator W=1 was the slow control
+row; on the live graphed evaluator it is the fastest row at every outstanding
+count, because the GPU is the bottleneck and W=1 produces whole batches instead
+of fragments (mean batch 23.8 against 19.9 at the same 24-32 leaves in flight).
+
+### C10b-3d — Crossings, rows per crossing, and what padding costs
+
+One move at W=1/K=24. `pad waste` is padded rows divided by real rows.
+
+| regime | budget | crossings | rows | rows/crossing | cache-answered | pad waste | shape 1 | 8 | 16 | 24 | 32+ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fresh midgame root | 20,000 | 835 | 17,740 | 21.25 | 2,260 | 1.12x | 1 | 1 | 6 | 827 | 0 |
+| endgame root (the C10h regime) | 7,000 | 248 | 1,811 | 7.30 | 4,284 | 1.46x | 13 | 160 | 57 | 18 | 0 |
+| endgame after 6 plies of reuse | 20,000 | 1 | 2 | 2.00 | 11 | 4.00x | 0 | 1 | 0 | 0 | 0 |
+
+The brief asked whether padding waste dominates in the reuse regime and whether
+a batch-8 graph is needed. **It is, and it is captured** — 160 of 248 crossings
+in the endgame land on shape 8, and without it they would land on 32 and pay
+1.9 ms each instead of 0.85 ms.
+
+The third row is where the network stops mattering: after six plies of reuse,
+20,000 simulations produce **one** boundary crossing of two rows, because the
+tree is fully expanded and the transposition cache and terminal fast paths
+answer everything else. Its 4.00x pad waste is 2 rows evaluated at shape 8, i.e.
+6 wasted rows in a whole move — the ratio is alarming and the absolute cost is
+0.4 ms. Ratios need denominators.
+
+### C10b-3e — Gate 4 margin, both regimes
+
+20,000 simulations, `max_batch` 128, 5 repeats (median), **delivered** sims
+asserted equal to the budget. The reuse-heavy rows play 6 plies of the engine's
+own moves first, so the tree, the arena and the cache are in the state a real
+game leaves them in.
+
+| config | regime | delivered sims/s | min | max | rows/crossing | pad waste | cache hit | GPU share | vs floor (8k) | vs stretch (15k) | vs Python (838) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **W=1, K=24** | **fresh root** | **13,912** | 13,769 | 14,138 | 21.2 | 1.12x | 11.3% | 87% | **1.74x** | 0.93x | **17x** |
+| **W=1, K=24** | **reuse-heavy** | **92,639** | 88,531 | 94,901 | 2.0 | 4.00x | 84.6% | 48% | **11.58x** | 6.18x | **111x** |
+| W=1, K=32 | fresh root | 14,372 | 14,180 | 14,535 | 28.1 | 1.13x | 12.1% | 87% | 1.80x | 0.96x | 17x |
+| W=1, K=32 | reuse-heavy | 86,839 | 63,717 | 92,762 | 4.0 | 2.00x | 69.2% | 51% | 10.85x | 5.79x | 104x |
+| W=1, K=64 | fresh root | 15,945 | 15,789 | 16,034 | 56.1 | 1.14x | 11.9% | 87% | 1.99x | 1.06x | 19x |
+| W=1, K=64 | reuse-heavy | 90,399 | 87,254 | 96,472 | 6.0 | 1.33x | 79.3% | 48% | 11.30x | 6.03x | 108x |
+| W=4, K=8 | fresh root | 13,123 | 13,007 | 13,186 | 17.2 | 1.17x | 11.2% | 93% | 1.64x | 0.87x | 16x |
+| W=4, K=8 | reuse-heavy | 104,230 | 87,739 | 169,765 | 2.0 | 2.87x | 86.1% | 40% | 13.03x | 6.95x | 124x |
+| W=8, K=4 | fresh root | 13,820 | 13,763 | 14,346 | 21.1 | 1.16x | 11.2% | 92% | 1.73x | 0.92x | 16x |
+| W=8, K=4 | reuse-heavy | 65,859 | 22,924 | 177,657 | 1.3 | 1.73x | 80.4% | 26% | 8.23x | 4.39x | 79x |
+| W=8, K=16 | fresh root | 15,767 | 15,677 | 16,494 | 57.4 | 1.19x | 12.2% | 91% | 1.97x | 1.05x | 19x |
+| W=8, K=16 | reuse-heavy | 70,156 | 60,954 | 86,851 | 3.0 | 1.91x | 79.7% | 48% | 8.77x | 4.68x | 84x |
+
+**Gate 4 clears at every candidate**, on a fresh midgame root, at 1.64-1.99x the
+8,000 floor. The stretch target of 15,000 is reached only at 64+ outstanding
+leaves, which costs ~10 points of top-move share; see the selection below.
+
+The multi-worker configurations are visibly less stable in the reuse regime —
+W=8/K=4 spans 22,924 to 177,657 across five repeats — because eight threads
+descending a fully-expanded endgame tree collide constantly and produce batches
+of 1.3 rows. W=1 spans 88,531 to 94,901 on the same position.
+
+### C10b-3f — Pinning, at W=1
+
+W=1/K=24, 20,000 simulations, median of 4.
+
+| affinity | delivered sims/s | min | max |
+|---|---:|---:|---:|
+| **none** | **13,923** | 13,828 | 14,089 |
+| one thread per P-core | 12,661 | 11,318 | 13,287 |
+| both SMT siblings | 12,160 | 10,810 | 13,337 |
+
+**Pinning is a 9% LOSS at W=1**, inverting C9d's +14.9%/+24.5% at W=4/W=6 — and
+by C9d's own mechanism. Pinning helps because a worker on an E-core holds the
+root's contended atomics longer; at one worker there is no contention on the
+root, and all pinning does is put the single worker on a core the dispatcher
+also wants.
+
+### C10b-3g — THE SELECTION, and C9's deferred root-stability tolerance
+
+**Shipping: W = 1, K = 24, `max_batch` 128, affinity `none`, capture ladder
+{1, 8, 16, 24, 32, 48, 64, 96, 128}. No longer provisional.**
+
+| | W=4/K=8 (C9's pick) | **W=1/K=24** | W=1/K=32 |
+|---|---:|---:|---:|
+| delivered sims/s, 20k fresh root | 13,123 | **13,912** | 14,372 |
+| top-move share | 64.3% | **64.2%** | 61.8% |
+| TV vs serial | 24.7% | **24.7%** | 26.6% |
+| run-to-run TV (mean / worst) | 2.8% / 6.5% | **0.0% / 0.0%** | 0.0% / 0.0% |
+| select collisions per simulation | 0.0545 | **0.0004** | 0.0004 |
+| Gate 4 margin | 1.64x | **1.74x** | 1.80x |
+
+W=1/K=24 matches C9's provisional pick on both axes and is deterministic.
+W=1/K=32 is 3.3% faster for 2.4 points of top-move share and is declined on
+C9's own principle: throughput is not the binding constraint at a 1.74x Gate 4
+margin, and a configuration faster and visibly flatter at the root is the wrong
+trade.
+
+**C9's deferred absolute root-stability tolerance, now measurable and now
+measured.** With the live evaluator answering every leaf, `run-to-run TV` is the
+engine's own variation rather than the stand-in's share:
+
+* at the shipping configuration: **0.0%** — reproducible run to run;
+* across every concurrent cell measured: **<= 4.0% mean, <= 8.2% worst** of 8
+  positions x 4 repeats, against C9b's contaminated 5-11% / 62.8%.
+
+**The absolute tolerance is set at 10% run-to-run TV** for any concurrent
+configuration: above every measured worst case with room for scheduling
+variance, and far enough below the 24.7% that separates the shipping
+configuration from the serial reference that the two cannot be confused.
+
+### C10b-4 — Dispatcher GIL acquire wait, re-run (microseconds)
+
+W=1/K=24, 20,000 simulations, `sys.setswitchinterval(0.0005)`. Sampled from
+outside the `gil_scoped_acquire` scope, so it contains waiting and nothing else.
+The competitor is `UciFormatterLoad` from `tests/test_c0b_contention.py` —
+imported, not reimplemented.
+
+| forward | competing | batches | rows/batch | sims/s | p50 | p90 | p99 | max | total (ms) | share of wall | C10 trigger |
+|:--|:--|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--|
+| graphed | no | 736 | 21.0 | 15,502 | 1.50 | 2.40 | 3.70 | 95.30 | 1.38 | 0.107% | clear |
+| **graphed** | **yes** | 736 | 21.0 | **15,126** | 5.00 | 6.40 | **61.90** | 106.10 | 4.90 | **0.371%** | **clear** |
+| eager | no | 736 | 21.0 | 5,383 | 2.10 | 3.00 | 3.90 | 75.90 | 1.83 | 0.049% | clear |
+| eager | yes | 736 | 21.0 | 3,509 | 5.40 | 6.60 | 11.90 | 89.30 | 4.34 | 0.076% | clear |
+
+**Acceptance criterion 4: the trigger stays clear with the adversarial formatter
+running.** p99 is 61.9 us against the 200 us threshold (3.2x under) and the
+share of wall is 0.371% against 1% (2.7x under). A second run of the same cell
+measured p99 21.8 us and 0.371% — the p99 of a 736-sample tail moves by a factor
+of three between runs on this host, and both are clear, which is the honest way
+to state it.
+
+The row that is not about the trigger: **graphed is 4.3x faster than eager with
+the competitor running** (15,126 against 3,509) and 2.9x without. The eager
+callback loses more to contention because it holds the interpreter across ~110
+op submissions; the graphed one has four calls to be interrupted between.
+
+### C10b-4b — Callback duration, and what actually shrank
+
+Not a contention metric (C10e), but it is where the GIL-held window lives.
+
+| forward | competing | p50 | p90 | p99 | max |
+|:--|:--|---:|---:|---:|---:|
+| graphed | no | 1,496 | 1,689 | 1,940 | 2,077 |
+| graphed | yes | 1,533 | 1,647 | 1,822 | 3,474 |
+| eager | no | 4,331 | 6,970 | 7,638 | 8,398 |
+| eager | yes | 7,230 | 9,005 | 10,297 | 12,666 |
+
+**The brief predicted the held window would fall from ~4 ms to "the copy plus
+replay-launch (~tens of us)". It fell to ~1.5 ms, and the prediction was wrong
+for an instructive reason.** The callback does not return when the launch is
+submitted; it returns when the D2H copy has completed, so it contains the GPU
+wait — 1.90 ms of graph replay at shape 24 is most of the 1.5 ms p50 here at
+21 rows. What the brief was actually predicting is the *GIL-held* window, and
+that did collapse: torch releases the interpreter across the blocking copy,
+which is why the competing thread's acquire wait in C10b-4 is 5-62 us rather
+than 1,500. The two columns measure different things and C10e already said so;
+this is the case that makes the distinction load-bearing.
+
+Note also that the graphed callback is nearly **immune to contention** — p50
+1,496 -> 1,533 us with the formatter running, against eager's 4,331 -> 7,230.
+Fewer torch calls means fewer places for a handoff to land inside one.
+
+### Measurement notes
+
+* Every C10b table reports **delivered** simulations, asserted equal to the
+  requested budget before the row is allowed in. Grid cells additionally assert
+  `vloss_total == 0`, zero conservation failures and `synthetic_evaluations ==
+  0` — the last one is what makes this grid's `run-to-run TV` mean something
+  C9b's could not.
+* `tools/bench_c10b.py` refuses to run on a sanitizer build without
+  `--allow-instrumented`, for the reason recorded in DECISIONS.md, C10.
+* The first live grid was run on the brief's proposed {1, 8, 32, 128} ladder and
+  is not published, because it measures padding rather than W and K: `pad waste`
+  swings 1.09x-2.87x across cells and W=1/K=48 comes out at 6,888 sims/s against
+  15,813 on the shipping ladder. It is described in DECISIONS.md because
+  discarding a measurement is itself a decision.
+* GPU memory: the shipping ladder reserves ~730 MiB of graph pools at
+  `max_batch` 128 and ~1.2 GiB at 256 (Gate 2b's fixture). ~1.9 MiB per captured
+  row, reported by `CaptureReport.describe()` at construction.
+* Capture costs ~0.6 s at engine start and is one-time.

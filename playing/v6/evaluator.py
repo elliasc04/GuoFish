@@ -1,4 +1,4 @@
-"""C10 — the Python half of the evaluation boundary.
+"""C10 — the Python half of the evaluation boundary. C10b — through a CUDA graph.
 
 WHAT THIS FILE IS ALLOWED TO DO
 ===============================
@@ -8,6 +8,18 @@ microsecond spent here is a microsecond no other Python thread can run and — m
 to the point — a microsecond the dispatcher is not launching kernels. Scope §2.1:
 "keep the callback minimal; a handful of torch calls on pre-allocated tensors, no
 Python loops."
+
+C10b MADE THAT LITERAL. C9a found the callback's ~4 ms was ~110 host ATen
+submissions, not GPU work, so the forward is now captured as a CUDA graph
+(playing/v6/graphs.py) and the callback is four calls with no allocation:
+
+    H2D copy of `count` pinned int32 rows  ->  one graph replay  ->  two D2H copies
+
+The GIL-held window drops with it, from the ~4 ms of kernel launching C9a
+predicted to the copies plus one `cudaGraphLaunch`; BENCH.md C10b-4 re-runs
+C10d's histogram to say by how much. The model, the autocast context and the
+buffers are unchanged — `graphs=False` restores the eager callback exactly, and
+Gate 2 is re-run on the graphed one because capture can change kernel selection.
 
 The measured thing it replaces is the reference's `BatchedEvaluator._evaluate_batch`,
 whose per-item `policy_cpu[i].clone()` + `req.event.set()` is 3.84 µs of real work
@@ -68,6 +80,11 @@ DEFAULT_MODEL = REPO_ROOT / "models" / "guofish5_20M" / "v5_10.9M_best.pt"
 # margin is an artifact that must not be spent.
 DEFAULT_SWITCH_INTERVAL = guofish_core.DEFAULT_SWITCH_INTERVAL
 
+# A bf16 signalling-NaN-adjacent pattern: 0x7FC0 is bf16 quiet NaN. Written into
+# the policy rows a batch did not use when `poison_unused_rows` is on, so that a
+# leak shows up as a NaN prior rather than as a plausible number nobody notices.
+POISON_BITS = 0x7FC0
+
 
 def load_default_model(model_path: Path | None = None,
                        device: torch.device | None = None) -> tuple[torch.nn.Module,
@@ -99,7 +116,9 @@ class TorchEvaluator:
     """
 
     def __init__(self, model: torch.nn.Module, device: torch.device, max_batch: int,
-                 *, switch_interval: float = DEFAULT_SWITCH_INTERVAL, pin: bool = True):
+                 *, switch_interval: float = DEFAULT_SWITCH_INTERVAL, pin: bool = True,
+                 graphs: bool = True, graph_method: str = "cudagraph",
+                 graph_sizes=None):
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
         require_v5_config(model)
@@ -131,12 +150,43 @@ class TorchEvaluator:
         self._value_t = torch.from_numpy(self._value_np)
         assert self._policy_t.data_ptr() == torch.from_numpy(self._policy_np).data_ptr()
 
-        # The device-side token block, int64 because nn.Embedding indexes with
-        # int64 and the alternative is a conversion inside the callback. One
-        # `copy_` does the widening and the host-to-device transfer together.
-        self._device_tokens = torch.empty((self.max_batch, SEQ_LENGTH), dtype=torch.long,
-                                          device=device)
         self._use_autocast = device.type == "cuda"
+
+        # C10b. The graphed forward, or None for the eager callback. Built
+        # BEFORE the buffers are page-locked and before any search thread
+        # exists: capture must own the device while it runs, and it allocates
+        # (each shape's private pool), which is exactly what the callback may
+        # not do afterwards.
+        self.graph = None
+        if graphs and device.type == "cuda":
+            from playing.v6 import graphs as graph_module
+
+            self.graph = graph_module.build(graph_method, model, device, self.max_batch,
+                                            sizes=graph_sizes)
+            self.graph_report = self.graph.report
+            self.graph_sizes = self.graph.sizes
+        else:
+            self.graph_report = None
+            self.graph_sizes = ()
+            # The eager path's device-side token block, int64 because
+            # nn.Embedding indexes with int64. The graphed path has no
+            # equivalent: it stages int32 and the widening is inside the graph.
+            self._device_tokens = torch.empty((self.max_batch, SEQ_LENGTH), dtype=torch.long,
+                                              device=device)
+
+        # Test-only, and it stamps BOTH sides of the boundary because a padded
+        # row can leak in two independent ways:
+        #
+        #   host   rows [count, max_batch) of the policy buffer get bf16 NaN,
+        #          which catches C++ reading a row it was not given;
+        #   device rows [count, padded) of the graph's own output get NaN,
+        #          which catches THIS side narrowing wrongly and handing a
+        #          padding row's priors out as if they belonged to a leaf.
+        #
+        # The second was added because the C10b drill's `pad-leak` mutation
+        # survived a suite that only had the first. Off in production: together
+        # they are a 2 MiB store per batch at max_batch 256.
+        self.poison_unused_rows = False
 
         self.pinned = self._pin_buffers() if (pin and device.type == "cuda") else False
 
@@ -146,13 +196,27 @@ class TorchEvaluator:
         """Rows [0, count) of the input buffer -> the policy and value buffers.
 
         Called by the C++ dispatcher, once per batch, with the GIL held.
+
+        FOUR TORCH CALLS AND NO ALLOCATION on the graphed path. `graph.run`
+        copies the pinned int32 rows into the one static input, restores any
+        padding rows a larger previous batch dirtied, and replays the graph
+        captured for `pad_to(count)`; it hands back views already narrowed to
+        `count`, so the padded rows' outputs have no name here to be copied out
+        by accident.
         """
-        tokens = self._device_tokens[:count]
-        tokens.copy_(self._input_t[:count], non_blocking=self.pinned)
-        with torch.no_grad():
-            with torch.amp.autocast_mode.autocast(device_type="cuda", dtype=AUTOCAST_DTYPE,
-                                                  enabled=self._use_autocast):
-                policy, value = self.model(tokens)
+        if self.graph is not None:
+            policy, value = self.graph.run(count, self._input_t[:count],
+                                           poison=self.poison_unused_rows)
+        else:
+            tokens = self._device_tokens[:count]
+            tokens.copy_(self._input_t[:count], non_blocking=self.pinned)
+            with torch.no_grad():
+                with torch.amp.autocast_mode.autocast(device_type="cuda",
+                                                      dtype=AUTOCAST_DTYPE,
+                                                      enabled=self._use_autocast):
+                    policy, value = self.model(tokens)
+        if self.poison_unused_rows:
+            self._policy_np[count:] = POISON_BITS
         # bf16 -> bf16, exactly the reference's `policy_logits.cpu()`. The copy is
         # the D2H sync point, so nothing below needs an explicit synchronize.
         self._policy_t[:count].copy_(policy)
@@ -160,6 +224,28 @@ class TorchEvaluator:
         # `values_cpu[i].item()` produces the same number through the same
         # promotion, just one element at a time.
         self._value_t[:count].copy_(value)
+
+    def padded_batch(self, count: int) -> int:
+        """The shape `count` rows are actually evaluated at. `count` if ungraphed."""
+        return count if self.graph is None else self.graph.pad_to(count)
+
+    def graph_counters_reset(self) -> None:
+        """Zero the replay/rows/padding counters. No-op on the eager path."""
+        if self.graph is not None:
+            self.graph.reset_counters()
+
+    def graph_pad_ratio(self) -> float:
+        """Padded rows divided by real rows since the last reset.
+
+        1.0 is a batch that always landed exactly on a captured shape; 2.7x is
+        what the reuse regime pays for evaluating 3-row batches at shape 8. The
+        eager path reports 1.0 because it has no padding, which keeps the
+        benchmark's column meaningful in both configurations rather than blank
+        in one.
+        """
+        if self.graph is None or self.graph.rows == 0:
+            return 1.0
+        return self.graph.padded_rows / self.graph.rows
 
     # --- page-locking ----------------------------------------------------
 
@@ -225,6 +311,12 @@ class TorchEvaluator:
         if self._closed:
             return
         self._closed = True
+        # Before the buffers, because the captured graphs hold device memory
+        # whose pools are only returned when the last graph referencing them
+        # dies. Dropping it here rather than at interpreter shutdown is what
+        # lets a bench build a second evaluator without capturing on top of the
+        # first one's ~560 MiB.
+        self.graph = None
         self._input_t = None
         self._policy_t = None
         self._value_t = None
@@ -243,15 +335,19 @@ class TorchEvaluator:
 def build(max_batch: int, *, model_path: Path | None = None,
           device: torch.device | None = None,
           switch_interval: float = DEFAULT_SWITCH_INTERVAL,
-          pin: bool = True) -> TorchEvaluator:
+          pin: bool = True, graphs: bool = True, graph_method: str = "cudagraph",
+          graph_sizes=None) -> TorchEvaluator:
     """Load the default checkpoint and wrap it. The one-liner every caller wants."""
     model, resolved = load_default_model(model_path, device)
-    return TorchEvaluator(model, resolved, max_batch, switch_interval=switch_interval, pin=pin)
+    return TorchEvaluator(model, resolved, max_batch, switch_interval=switch_interval,
+                          pin=pin, graphs=graphs, graph_method=graph_method,
+                          graph_sizes=graph_sizes)
 
 
 __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_SWITCH_INTERVAL",
+    "POISON_BITS",
     "POLICY_SIZE",
     "SEQ_LENGTH",
     "TorchEvaluator",
