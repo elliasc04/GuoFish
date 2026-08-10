@@ -859,7 +859,7 @@ class ParallelMCTS:
         # hardware default; None falls back to auto-tuning below.
         if device.type == 'cuda':
             auto_min_batch_size = max(32, num_workers)
-            batch_timeout_ms = 100.0
+            batch_timeout_ms = 10.0
         else:
             auto_min_batch_size = 1  # Process immediately on CPU
             batch_timeout_ms = 5.0  # Short timeout - don't block workers

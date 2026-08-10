@@ -1768,6 +1768,28 @@ py::dict parallel_stats_dict(const guofish::ParallelStats &stats) {
     return d;
 }
 
+// C10. The evaluation boundary's own counters, for the LAST search only.
+//
+// `acquire_wait_ns_samples` is the whole point and is returned raw: the C10
+// trigger is a p99 and a share of wall time, and both are properties of the
+// distribution. A mean is offered as a convenience and is the number NOT to
+// make a decision on — see EvalStats in cpp/search.hpp.
+py::dict eval_stats_dict(const guofish::EvalStats &stats) {
+    py::dict d;
+    d["batches"] = stats.batches;
+    d["rows"] = stats.rows;
+    d["cache_skipped"] = stats.cache_skipped;
+    d["acquire_wait_ns"] = stats.acquire_wait_ns;
+    d["call_ns"] = stats.call_ns;
+    d["max_acquire_wait_ns"] = stats.max_acquire_wait_ns;
+    d["acquire_wait_ns_samples"] = int64_array(stats.acquire_wait_ns_samples);
+    d["call_ns_samples"] = int64_array(stats.call_ns_samples);
+    d["mean_rows"] = stats.batches > 0 ? static_cast<double>(stats.rows) /
+                                             static_cast<double>(stats.batches)
+                                       : 0.0;
+    return d;
+}
+
 py::dict tree_audit_dict(const guofish::TreeAudit &audit) {
     py::dict d;
     d["nodes"] = audit.nodes;
@@ -1836,6 +1858,304 @@ private:
     std::int64_t acquisitions_ = 0;
     std::int64_t rows_ = 0;
 };
+
+// ---------------------------------------------------------------------------
+// C10 — the live evaluator
+// ---------------------------------------------------------------------------
+
+// A C++-owned, 64-byte-aligned array of anything. AlignedBuffer above is the
+// int32 matrix C0 built and every existing caller wants; the policy and value
+// buffers are uint16 and float, so the allocation discipline is factored rather
+// than the class copied. Same rationale as AlignedBuffer's: C++17 over-aligned
+// operator new is the one spelling portable across MSVC and clang with no
+// preprocessor branching.
+template <class T>
+class AlignedArray {
+public:
+    explicit AlignedArray(std::size_t count) : count_(count), data_(allocate(count)) {
+        std::fill_n(data_, count_, T{});
+        // reinterpret_cast: pointer -> integer solely to check alignment; the
+        // value is never dereferenced or converted back to a pointer.
+        assert(reinterpret_cast<std::uintptr_t>(data_) % kAlignment == 0);
+    }
+
+    ~AlignedArray() { ::operator delete(data_, std::align_val_t(kAlignment)); }
+
+    AlignedArray(const AlignedArray &) = delete;
+    AlignedArray &operator=(const AlignedArray &) = delete;
+    AlignedArray(AlignedArray &&) = delete;
+    AlignedArray &operator=(AlignedArray &&) = delete;
+
+    T *data() noexcept { return data_; }
+    const T *data() const noexcept { return data_; }
+    std::size_t size() const noexcept { return count_; }
+    std::size_t nbytes() const noexcept { return count_ * sizeof(T); }
+
+private:
+    static T *allocate(std::size_t count) {
+        constexpr std::size_t kMax = (std::numeric_limits<std::size_t>::max)();
+        if (count > kMax / sizeof(T)) {
+            throw std::overflow_error("guofish_core: buffer byte size overflows size_t");
+        }
+        return static_cast<T *>(::operator new(count * sizeof(T), std::align_val_t(kAlignment)));
+    }
+
+    std::size_t count_;
+    T *data_;
+};
+
+// A NumPy view over an AlignedArray, with the same capsule discipline make_view
+// uses: the capsule owns a shared_ptr copy, so either side may drop its
+// reference first. Requires the GIL.
+template <class T>
+py::array_t<T> make_array_view(const std::shared_ptr<AlignedArray<T>> &buffer,
+                               std::vector<py::ssize_t> shape) {
+    auto *owner = new std::shared_ptr<AlignedArray<T>>(buffer);
+    py::capsule base(owner,
+                     [](void *p) { delete static_cast<std::shared_ptr<AlignedArray<T>> *>(p); });
+
+    std::vector<py::ssize_t> strides(shape.size());
+    py::ssize_t stride = static_cast<py::ssize_t>(sizeof(T));
+    for (std::size_t i = shape.size(); i-- > 0;) {
+        strides[i] = stride;
+        stride *= shape[i];
+    }
+    return py::array_t<T>(shape, strides, buffer->data(), base);
+}
+
+// THE PRODUCTION EVALUATION BOUNDARY.
+//
+// Owns the three buffers of scope §2.1 and the one Python callable that turns
+// tokens into logits. `run` is called by the dispatcher — a C++-created thread
+// holding no GIL — once per batch.
+//
+// WHY THE SWITCH INTERVAL IS SET HERE AND NOT LEFT TO THE CALLER
+// --------------------------------------------------------------
+// Because "before any search thread spawns" is a requirement (scope §2.1,
+// settled by C0b's measurement) and a constructor is the only place in this
+// design that is guaranteed to run before one. Under the default 5 ms interval
+// C0b measured the dispatcher's contended acquire wait at a MEDIAN of 15.25 ms
+// on Windows against a competing pure-Python thread — a hard ceiling of ~60
+// batches per second, which at any real batch size reads as a slow network
+// rather than as a lock. At 0.0005 the same measurement is a p99 of 78 µs.
+//
+// It is a process-global interpreter setting, so setting it from a library
+// constructor is a real imposition on the host, and it is done anyway: an
+// engine that silently runs 250× slower because its host forgot a line is worse
+// than one that changed a setting and said so. `switch_interval_before` reports
+// what was overwritten.
+//
+// THE WINDOWS MARGIN IS AN ARTIFACT AND MUST NOT BE SPENT. CPython's Windows
+// condvar takes a DWORD of milliseconds by integer division, so 0.0005 s
+// truncates to a 0 ms timeout and the interval sweep is a step function with a
+// cliff at exactly 1 ms. Linux's ns-resolution wait shows the honest ~1.3×.
+class LiveEvaluator final : public guofish::BatchEvaluator {
+public:
+    LiveEvaluator(std::size_t max_batch, py::object callback, double switch_interval)
+        : max_batch_(max_batch),
+          input_(std::make_shared<AlignedBuffer>(max_batch, kTokenWidth)),
+          policy_(std::make_shared<AlignedArray<std::uint16_t>>(max_batch * guofish::kPolicySize)),
+          value_(std::make_shared<AlignedArray<float>>(max_batch)),
+          callback_(std::move(callback)) {
+        if (max_batch == 0) {
+            throw py::value_error("guofish_core.LiveEvaluator: max_batch must be > 0");
+        }
+        if (!PyCallable_Check(callback_.ptr())) {
+            throw py::type_error("guofish_core.LiveEvaluator: callback must be callable");
+        }
+        py::object sys = py::module_::import("sys");
+        switch_interval_before_ = sys.attr("getswitchinterval")().cast<double>();
+        if (switch_interval > 0.0) {
+            sys.attr("setswitchinterval")(switch_interval);
+            switch_interval_ = switch_interval;
+        } else {
+            switch_interval_ = switch_interval_before_;
+        }
+    }
+
+    ~LiveEvaluator() override {
+        // Runs with the GIL held: pybind11 destroys held objects from the
+        // interpreter's own teardown of the wrapper. The teardown hook is where
+        // a host that page-locked these buffers unregisters them, and it has to
+        // happen HERE — before the allocations below are freed — or CUDA keeps a
+        // mapping onto memory the allocator has handed back.
+        if (teardown_) {
+            try {
+                teardown_();
+            } catch (py::error_already_set &e) {
+                e.discard_as_unraisable("guofish_core.LiveEvaluator teardown");
+            }
+        }
+    }
+
+    LiveEvaluator(const LiveEvaluator &) = delete;
+    LiveEvaluator &operator=(const LiveEvaluator &) = delete;
+
+    std::size_t max_batch() const noexcept override { return max_batch_; }
+
+    std::int32_t *token_row(std::size_t i) noexcept override { return input_->row(i); }
+
+    const std::uint16_t *policy_row(std::size_t i) const noexcept override {
+        return policy_->data() + i * guofish::kPolicySize;
+    }
+
+    float value_at(std::size_t i) const noexcept override { return value_->data()[i]; }
+
+    guofish::EvalTiming run(std::size_t count) override {
+        guofish::EvalTiming timing;
+        // clock_type::now() needs no GIL, so t0 is sampled from OUTSIDE the
+        // acquire scope. That is what makes `acquire_wait_ns` the clean
+        // contention metric: everything between t0 and t1 is waiting for some
+        // other thread to let go, and nothing else.
+        const auto t0 = clock_type::now();
+        {
+            py::gil_scoped_acquire acquired;
+            const auto t1 = clock_type::now();
+            timing.acquire_wait_ns = nanos_between(t0, t1);
+            try {
+                callback_(count);
+            } catch (py::error_already_set &e) {
+                // Converted to a plain C++ exception WHILE THE GIL IS HELD. A
+                // py::error_already_set escaping from here would travel up
+                // through the dispatcher's std::exception_ptr, be rethrown on a
+                // thread that has released the GIL, and destroy its Python
+                // objects without one. The message survives; the exception type
+                // does not, which is the trade.
+                const std::string what = e.what();
+                e.discard_as_unraisable("guofish_core.LiveEvaluator callback");
+                throw std::runtime_error(
+                    "guofish: the evaluator callback raised, at batch size " +
+                    std::to_string(count) + "\n" + what);
+            }
+            timing.call_ns = nanos_between(t1, clock_type::now());
+        }
+        return timing;
+    }
+
+    py::array_t<std::int32_t> input_view() const { return make_view(input_); }
+
+    py::array_t<std::uint16_t> policy_view() const {
+        return make_array_view<std::uint16_t>(
+            policy_, {static_cast<py::ssize_t>(max_batch_),
+                      static_cast<py::ssize_t>(guofish::kPolicySize)});
+    }
+
+    py::array_t<float> value_view() const {
+        return make_array_view<float>(value_, {static_cast<py::ssize_t>(max_batch_)});
+    }
+
+    // (address, nbytes) per buffer, for a host that wants to page-lock them.
+    // Pinning C++-owned memory needs `cudaHostRegister`, and calling it from
+    // here would make the CUDA runtime a build dependency of a module that is
+    // deliberately torch-free (Global Rule 7) — torch already exposes cudart to
+    // Python, so the host does it and hands back an unregister via
+    // `set_teardown`.
+    py::dict buffer_spans() const {
+        py::dict out;
+        // reinterpret_cast: pointer -> integer, because cudaHostRegister's
+        // Python binding takes an address as an int. Nothing converts back to a
+        // pointer on this side, and the buffers outlive the registration by
+        // construction — the teardown hook runs in the destructor, before the
+        // allocations are released.
+        out["input"] = py::make_tuple(reinterpret_cast<std::uintptr_t>(input_->data()),
+                                      input_->size() * sizeof(std::int32_t));
+        // reinterpret_cast: as above.
+        out["policy"] = py::make_tuple(reinterpret_cast<std::uintptr_t>(policy_->data()),
+                                       policy_->nbytes());
+        // reinterpret_cast: as above.
+        out["value"] = py::make_tuple(reinterpret_cast<std::uintptr_t>(value_->data()),
+                                      value_->nbytes());
+        return out;
+    }
+
+    void set_teardown(py::object hook) { teardown_ = std::move(hook); }
+
+    double switch_interval() const noexcept { return switch_interval_; }
+    double switch_interval_before() const noexcept { return switch_interval_before_; }
+
+private:
+    static std::int64_t nanos_between(clock_type::time_point a, clock_type::time_point b) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+    }
+
+    std::size_t max_batch_;
+    std::shared_ptr<AlignedBuffer> input_;
+    std::shared_ptr<AlignedArray<std::uint16_t>> policy_;
+    std::shared_ptr<AlignedArray<float>> value_;
+    py::object callback_;
+    py::object teardown_;
+    double switch_interval_ = 0.0;
+    double switch_interval_before_ = 0.0;
+};
+
+// Gate 2's probe: one position, one recorded 4096-wide bf16 policy row, out come
+// the canonical move list and the priors the search would have stored.
+//
+// This is the PRODUCTION gather — the same `gather_softmax_canonical` the
+// dispatcher calls, over the same generation-order index — exposed so the test
+// can compare it against ATen without standing up a model, a GPU or a search.
+// If it were a reimplementation the gate would be measuring the wrong function.
+py::tuple gather_softmax(const std::string &fen,
+                         py::array_t<std::uint16_t, py::array::c_style | py::array::forcecast>
+                             policy_row) {
+    if (policy_row.ndim() != 1 ||
+        static_cast<std::size_t>(policy_row.shape(0)) != guofish::kPolicySize) {
+        throw py::value_error("guofish_core.gather_softmax: policy_row must be a 1-D array of " +
+                              std::to_string(guofish::kPolicySize) +
+                              " bf16 bit patterns (dtype uint16)");
+    }
+
+    chess::Board board;
+    guofish::set_fen_or_throw(board, fen);
+
+    std::vector<std::uint16_t> packed;
+    std::vector<std::uint16_t> raw;
+    std::vector<std::uint16_t> generation;
+    guofish::generate_canonical_moves(board, packed, raw, &generation);
+    if (packed.empty()) {
+        throw py::value_error("guofish_core.gather_softmax: the position has no legal moves");
+    }
+
+    std::vector<float> scratch;
+    std::vector<float> priors(packed.size());
+    guofish::gather_softmax_canonical(policy_row.data(), packed.data(), generation.data(),
+                                      packed.size(), scratch, priors.data());
+
+    std::vector<std::string> moves;
+    moves.reserve(packed.size());
+    for (const std::uint16_t p : packed) {
+        moves.push_back(move_to_uci(p));
+    }
+
+    py::array_t<float> out(static_cast<py::ssize_t>(priors.size()));
+    std::copy(priors.begin(), priors.end(), out.mutable_data());
+    return py::make_tuple(moves, out);
+}
+
+// The same position's legal moves in chess-library's GENERATION order, as
+// normalised UCI.
+//
+// Exposed for exactly one purpose: Gate 2 needs to reduce ATen's softmax in the
+// SAME order the C++ gather does, so that the permutation variance scope §2.6
+// measured (up to 3e-7 over 200 random permutations) can be separated from the
+// softmax-implementation difference. Reported as two distributions rather than
+// one, because they have different causes and only one of them is this port's
+// to answer for. Nothing in the search reads this.
+std::vector<std::string> generation_order(const std::string &fen) {
+    chess::Board board;
+    guofish::set_fen_or_throw(board, fen);
+
+    std::vector<std::uint16_t> packed;
+    std::vector<std::uint16_t> raw;
+    std::vector<std::uint16_t> generation;
+    guofish::generate_canonical_moves(board, packed, raw, &generation);
+
+    std::vector<std::string> out(packed.size());
+    for (std::size_t k = 0; k < packed.size(); ++k) {
+        out[generation[k]] = move_to_uci(packed[k]);
+    }
+    return out;
+}
 
 // The search() / search_parallel() return value. One builder so the two entry
 // points cannot drift into reporting different things about the same tree.
@@ -2032,6 +2352,42 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
             "C++-created thread holding no GIL — waits to acquire it, once per batch. That is "
             "the measurement scope §2.1's discipline rests on and C10 depends on being "
             "cheap; C9 takes it on the real thread topology first.")
+
+        // --- C10: the live evaluator ----------------------------------------
+
+        .def(
+            "set_evaluator",
+            [](Search &self, LiveEvaluator *evaluator) { self.set_evaluator(evaluator); },
+            py::arg("evaluator").none(true), py::keep_alive<1, 2>(),
+            "Install the live evaluator, or clear it with None.\n\n"
+            "Installing one takes the replay dump out of the evaluation path ENTIRELY, root "
+            "included, and there is no mode in which a search consults both. The dump's value "
+            "is that a miss is a hard failure proving a divergence; a live fallback would turn "
+            "every such proof into a silent 'the network answered instead'.\n\n"
+            "It also unifies the softmax. The reference evaluates root priors on the GPU "
+            "(`_expand_root` hands `expand()` a CUDA tensor) and interior priors on the CPU "
+            "(BatchedEvaluator's bulk `.cpu()`); those disagree by up to 1.9e-9 across 6 of 37 "
+            "priors, which is enough to flip a best move at 200 sims once the root position "
+            "recurs as an interior node. With an evaluator installed every node — root "
+            "included — goes down one path and through the same cache. That is a deliberate "
+            "divergence from the reference at roots, arbitrated by Gate 2b. See DECISIONS.md, "
+            "C10.")
+
+        .def(
+            "eval_stats", [](const Search &self) { return eval_stats_dict(self.eval_stats()); },
+            "The evaluation boundary's counters for the LAST search, reset at its start.\n\n"
+            "`acquire_wait_ns_samples` is one entry per boundary crossing and is the "
+            "measurement C10's contingency is decided on: implement C++-side `info` emission "
+            "if its p99 exceeds 200 us, or if `acquire_wait_ns` exceeds 1% of the move's wall "
+            "time. It is deliberately not summarised here — a mean hides the tail behind the "
+            "many fast acquisitions, and the tail is the entire cost.\n\n"
+            "`call_ns` is NOT a contention metric and must not be read as one: torch and numpy "
+            "re-acquire the GIL inside a call, so a handoff wait lands in the middle of it. "
+            "The ratio between the two is what says whether a slow batch was contention or "
+            "was just the model.\n\n"
+            "`rows` counts leaves actually sent to the network and `cache_skipped` those the "
+            "transposition cache answered before the batch was formed; `batches` counts "
+            "boundary crossings. rows/batches is the mean batch the model actually saw.")
 
         .def_static(
             "topology", [] { return topology_dict(Search::topology()); },
@@ -2808,6 +3164,90 @@ PYBIND11_MODULE(guofish_core, m) {
         .def_property_readonly("acquisitions", &GilProbe::acquisitions)
         .def_property_readonly("rows", &GilProbe::rows,
                                "Total leaves across every batch the probe saw.");
+
+    // -----------------------------------------------------------------------
+    // C10 — the live evaluator
+    // -----------------------------------------------------------------------
+
+    m.attr("POLICY_SIZE") = guofish::kPolicySize;
+    m.attr("DEFAULT_SWITCH_INTERVAL") = 0.0005;
+
+    py::class_<LiveEvaluator>(
+        m, "LiveEvaluator",
+        "The three zero-copy buffers of scope §2.1, plus the one Python callable that turns "
+        "tokens into logits.\n\n"
+        "    input_buffer   [max_batch, 68]    int32    C++ writes, Python reads\n"
+        "    policy_buffer  [max_batch, 4096]  bf16     Python writes, C++ reads\n"
+        "    value_buffer   [max_batch]        float32  Python writes, C++ reads\n\n"
+        "All three are C++-owned and exposed as NumPy views over the same memory; nothing is "
+        "copied at the boundary and no 4096-wide row is ever materialised per leaf — the "
+        "gather pulls only the ~26-38 legal logits it needs.\n\n"
+        "`policy_view()` has dtype uint16 because NumPy has no bfloat16. The values ARE bf16 "
+        "bit patterns: view it as `torch.bfloat16` (same 2-byte width) and copy the model's "
+        "bf16 logits straight in. Do not convert through float32 — matching Python's dtype is "
+        "what keeps the production gather numerically close to the reference's, which is what "
+        "Gate 2 measures.\n\n"
+        "CONSTRUCTING ONE SETS sys.setswitchinterval. That is a process-global interpreter "
+        "setting and it is done anyway, in the constructor, because 'before any search thread "
+        "spawns' is a requirement settled by measurement: at the default 5 ms interval C0b "
+        "clocked the dispatcher's contended acquire wait at a median of 15.25 ms on Windows — "
+        "a ceiling of ~60 batches/s that reads as a slow network rather than as a lock. At "
+        "0.0005 the same measurement is a p99 of 78 us. `switch_interval_before` reports what "
+        "was overwritten.")
+        .def(py::init<std::size_t, py::object, double>(), py::arg("max_batch"),
+             py::arg("callback"), py::arg("switch_interval") = 0.0005,
+             "`callback(count)` is called once per batch, with the GIL held, on a "
+             "C++-created thread. It must read rows [0, count) of input_buffer and write rows "
+             "[0, count) of policy_buffer and value_buffer.\n\n"
+             "KEEP IT MINIMAL — a handful of torch calls on pre-allocated tensors, no Python "
+             "loops. Torch releases the GIL inside CUDA dispatch, but tensor construction, "
+             "`.to()` and indexing hold it, and every microsecond held is a microsecond the "
+             "dispatcher is not launching kernels.\n\n"
+             "`switch_interval` <= 0 leaves the interpreter's setting alone. That exists for "
+             "the C10 measurement of the setting's own cost (BENCH.md) and for nothing else; "
+             "production takes the default.")
+        .def_property_readonly("max_batch", &LiveEvaluator::max_batch)
+        .def("input_view", &LiveEvaluator::input_view,
+             "int32 [max_batch, 68], zero-copy. C++ writes it; read it, do not write it.")
+        .def("policy_view", &LiveEvaluator::policy_view,
+             "uint16 [max_batch, 4096] holding bf16 bit patterns, zero-copy. Write it.")
+        .def("value_view", &LiveEvaluator::value_view,
+             "float32 [max_batch], zero-copy. Write it with the network's ABSOLUTE "
+             "(White-POV) value; the side-to-move flip is search's job.")
+        .def("buffer_spans", &LiveEvaluator::buffer_spans,
+             "{name: (address, nbytes)} for a host that wants to page-lock the buffers.\n\n"
+             "Pinning C++-owned memory needs cudaHostRegister, and calling it from this module "
+             "would make the CUDA runtime a build dependency of an extension that is "
+             "deliberately torch-free. Torch already exposes cudart to Python, so the host "
+             "registers and hands back the matching unregister via set_teardown().")
+        .def("set_teardown", &LiveEvaluator::set_teardown, py::arg("hook"),
+             "A callable invoked once, with the GIL held, immediately BEFORE the buffers are "
+             "freed. This is where a host that page-locked them unregisters; doing it later "
+             "leaves CUDA holding a mapping onto memory the allocator has taken back.")
+        .def_property_readonly("switch_interval", &LiveEvaluator::switch_interval,
+                               "The interpreter switch interval this evaluator set.")
+        .def_property_readonly("switch_interval_before", &LiveEvaluator::switch_interval_before,
+                               "What sys.getswitchinterval() returned before it did.");
+
+    m.def("gather_softmax", &gather_softmax, py::arg("fen"), py::arg("policy_row"),
+          "Gate 2's probe: (canonical UCI moves, priors) for one position and one recorded "
+          "4096-wide bf16 policy row (dtype uint16).\n\n"
+          "This is the PRODUCTION gather, not a restatement of it — the same function the "
+          "dispatcher calls, over the same generation-order index. Softmax over "
+          "GENERATION-order logits, then permute the probabilities into canonical order; never "
+          "gather in sorted order. `torch.softmax` is not permutation-invariant (scope §2.6 "
+          "measured 109/200 permutations reproducing bit-identical priors, max delta 3e-7), so "
+          "sorting before the softmax changes the priors on a large fraction of nodes.");
+
+    m.def("generation_order", &generation_order, py::arg("fen"),
+          "The position's legal moves as normalised UCI, in chess-library's GENERATION "
+          "order.\n\n"
+          "For Gate 2 only. Reducing ATen's softmax in this order isolates the "
+          "softmax-implementation difference from the permutation variance that comes of "
+          "python-chess and chess-library generating in different orders — two causes, only "
+          "one of which is this port's to answer for. Nothing in the search reads it: "
+          "reproducing a library's internal generation order is exactly the fragile dependency "
+          "canonical ordering was chosen to avoid.");
 
     // -----------------------------------------------------------------------
     // C7 — cache and tablebase

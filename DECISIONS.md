@@ -4669,3 +4669,703 @@ everywhere else, and it is 5 tests rather than the 1 the skip line suggests.
   workers idle while a batch is expanded. Nearly free at C9's rates; a ~10%-class
   ceiling in C10. Lifting it costs layer 2's reproducibility, so it needs a
   replacement test first.
+
+---
+
+# C10 — The real evaluator: torch behind the boundary (2026-08-09)
+
+Every gate up to here ran on a replay dump, so the network was identical by
+construction and any divergence was provably in the search. This chunk removes
+that guarantee on purpose. What follows is every judgment call the brief did not
+settle, in the order a reader meets it.
+
+## The softmax is hand-rolled in C++, because ATen is not available to call
+
+Scope §2.5 says *"For Gate 1, call ATen from C++ rather than hand-rolling the
+reduction."* That instruction cannot be followed, and the reason is Global Rule
+7: LibTorch is not in the allowed dependency set (pybind11, chess-library, the
+standard library), and scope §1 separately lists LibTorch as out of scope. So
+`guofish::softmax_in_place` is max-shift, `std::exp`, sum, divide — the same
+shape ATen's `_softmax` uses on both its CPU and its CUDA path, and bit-identical
+to neither.
+
+This is not merely a workaround for the instruction; it is what makes Gate 2 a
+test at all. Calling ATen from both sides would compare a function with itself.
+The replacement acceptance criterion — max absolute delta <= 1e-6 with zero
+prior-ordering inversions, in place of the <= 4 ULP the chunk table originally
+carried — was already written into the C10 brief for the same reason, and the
+measurement below shows the ULP bound would have failed a correct
+implementation.
+
+The sum accumulates in **float**, not double. The reference sums in float
+(`torch.softmax` over a tensor that is float32 after `.float()`), so float is the
+choice that tracks it; a double accumulator would be more accurate and less
+faithful, and "more accurate" is not the property under test.
+
+## Gate 2 is measured against three reference columns, not one
+
+`golden/c10_gate2.npz` records ATen's answer three times per position:
+
+| column | what it is |
+|---|---|
+| `priors_cpu_pychess` | the reference's INTERIOR path: bulk `.cpu()`, then CPU softmax over python-chess's generation order |
+| `priors_gpu_pychess` | the reference's ROOT path: `_expand_root` hands `expand()` a CUDA tensor, so the softmax runs on the GPU |
+| `priors_cpu_libchess` | ATen CPU softmax over **chess-library's** generation order |
+
+The first two are the reference disagreeing with itself, and a gate that compared
+against only one of them would be picking a side in an inconsistency rather than
+measuring a port. The third exists because a C++/ATen delta has two independent
+causes and only one of them is this port's to answer for:
+
+* **C++ vs `priors_cpu_libchess`** — the softmax *implementation* alone. Same
+  reduction order, hand-rolled `std::exp` against SLEEF/AVX.
+* **`priors_cpu_libchess` vs `priors_cpu_pychess`** — the *permutation* alone.
+  Same ATen, two generation orders.
+
+Reporting one number for both is how a permutation artifact gets read as a
+porting bug, or the reverse.
+
+### Measured, over 500 game-realistic positions / 15,036 priors
+
+| comparison | max abs delta | p99 | mean | exact matches |
+|---|---:|---:|---:|---:|
+| C++ vs reference interior (CPU) | 2.384e-07 | 5.96e-08 | 2.71e-09 | 5,315 / 15,036 |
+| C++ vs reference root (GPU) | 2.384e-07 | 4.47e-08 | 2.78e-09 | 4,291 / 15,036 |
+| C++ vs ATen in chess-library order | 2.682e-07 | 4.47e-08 | 2.73e-09 | 5,262 / 15,036 |
+| permutation alone (both sides ATen) | 3.576e-07 | 2.98e-08 | 1.77e-09 | 7,941 / 15,036 |
+| reference root vs reference interior | 2.384e-07 | 2.98e-08 | 1.91e-09 | 5,658 / 15,036 |
+
+**Prior-ordering inversions: 0 against all three columns. Collapsed pairs: 0.**
+
+Two things to read out of that table. First, the permutation term alone is
+3.576e-07 — larger than any C++-vs-ATen figure — which settles that a ULP-tight
+bound was never available: scope §2.6's "up to 3e-7" is confirmed on a corpus it
+did not measure. Second, the C++ row against the *same reduction order* is not
+smaller than the rows against the permuted ones, so the implementation difference
+and the permutation difference are the same size. Both are ~4 orders of magnitude
+inside the 1e-6 gate.
+
+The whole table reproduces **identically on Windows/MSVC 19.51 and Linux/Clang
+18.1.3**, down to the per-column exact-match counts. `std::exp` and the
+accumulation order agree across the two toolchains, so the C++ side of Gate 2 is
+one number rather than a platform's number.
+
+## The reference's root/interior split is much larger than the brief records
+
+The brief carries C5's measurement: *"6 of 37 priors differ, max delta 1.9e-9."*
+Over this 500-position corpus the same split is **max 2.384e-07 across 9,378 of
+15,036 priors** — two orders of magnitude larger, and affecting 62% of priors
+rather than 16%.
+
+The brief's number is not wrong; it is one position. The corrected figure is
+recorded because it changes how the divergence should be described, not whether
+it is accepted: 1.9e-9 sounds like a rounding curiosity, 2.4e-7 is the same order
+as everything else in the table above. Either way it is far inside the gate, and
+Gate 2b is what decides whether it moves a move.
+
+## Production unifies on one path, and the root now uses the cache
+
+Scope §2.5 requires **one device path for every node including the root**. The
+implementation is stronger than that phrasing: with an evaluator installed there
+is exactly one evaluation path in the engine, `evaluate_and_expand`, and
+`expand_root` calls it. The replay dump is not consulted at all — not even as a
+fallback — because the dump's entire value is that a miss is a hard failure
+proving a divergence, and a live fallback would turn every such proof into a
+silent "the network answered instead".
+
+**The consequence the brief does not mention: the root can now use the
+transposition cache, and does.** The reference's root deliberately does not —
+`_expand_root` never touches `self.cache` — and C5/C7 preserved that omission for
+a specific reason recorded in `expand_root`'s comment: a cache that served the
+root's GPU-softmaxed entry to an interior visit of the same position would hand
+it the wrong one of the reference's two answers, and Gate 1 would fail at
+whatever depth the root position first recurs. With one answer there is nothing
+to keep apart. A root cache hit is bit-identical to the fresh evaluation it
+replaces, so admitting the root to the cache changes no number and saves one
+forward pass per move.
+
+What it does change is the cache counters: `cache_hits`/`cache_misses` now
+include the root, where the reference's do not. That is a reporting difference
+and it is stated rather than reconciled.
+
+### "GPU path", precisely
+
+Scope §2.5 names the unified path "GPU", which is the reference's label for where
+`_expand_root` reduces. In production the forward pass runs on the GPU in bf16
+autocast — identical to both of the reference's paths — and the **softmax runs in
+C++**, because the gather has to happen on the C++ side (scope §2.1: no
+4096-wide row is ever materialised per node) and there is no ATen to call there.
+So the unified path is neither of the reference's two. What §2.5 actually
+requires, and what is delivered, is that there be exactly **one**, applied to
+every node; the device label describes the forward, not the reduction.
+
+## The gather scatters into generation order, softmaxes, then permutes back
+
+Scope §2.6, verified 300/300 bit-identical there and re-verified here as zero
+inversions: *softmax over generation-order logits, then permute the resulting
+probabilities into canonical order.* Never gather in sorted order.
+
+That required getting chess-library's generation order back out of
+`generate_canonical_moves`, which exists precisely to throw it away. The function
+now optionally fills a `generation_index` parallel to `packed`, and its header
+says in as many words that **only the live evaluator's gather may read it**:
+reproducing a library's internal generation order is the fragile dependency
+canonical ordering was chosen to avoid, and the only thing this index is allowed
+to decide is a floating-point reduction order.
+
+It is filled on every descent whether an evaluator is installed or not. A branch
+there would be a branch in the hottest loop in the engine to save one ~38-byte
+memcpy, and the C5-C9 suites confirm the extra field costs nothing observable:
+every previous chunk's tests still pass bit-exact.
+
+## The cache is probed BEFORE the boundary crossing, not inside the expansion loop
+
+The replay path probes the cache inside `evaluate_and_expand`, one leaf at a
+time. The live path cannot: the batch's width is decided before the callback
+runs, and a leaf the cache can answer must not consume a row of the network's
+input. At the reference's measured 24.7% hit rate that is a quarter of every
+batch. So `prepare_live_batch` probes every leaf first, hands only the misses a
+row, and crosses once.
+
+**The hit's payload is copied out rather than re-probed at expansion time**, and
+that is not a micro-optimisation. The misses in the same batch insert as they
+expand, and an insert can evict the very slot an earlier leaf hit; a second probe
+would then miss on a leaf that has no row to fall back on. `live_hits_` costs a
+few dozen kilobytes that stop growing after the first batch.
+
+**Leaves that transpose onto each other within one batch each take a row and each
+insert.** Deduplicating would save network rows, but the two copies are
+bit-identical anyway, and the dedup would make the first copy's insert decide
+what the second one expands from. Counted honestly — both are misses — and left
+for C12 to measure rather than assumed to be worth fixing.
+
+## bf16 crosses the boundary as uint16, and that is not a compromise
+
+`policy_buffer` must stay bf16 (scope §2.1) because the reference's
+`policy_logits.cpu()` is bf16 and `MCTSNode.expand` gathers from it *before*
+`.float()`. NumPy has no bfloat16, so the view is exposed as uint16 and Python
+reinterprets it with `torch.from_numpy(view).view(torch.bfloat16)` — same
+pointer, same bytes, no conversion, asserted in the evaluator's constructor.
+
+The widening on the C++ side is `bits << 16` through a `memcpy`, which is exact:
+bf16 is a binary32 truncated to its top 16 bits. That exactness is what makes
+Gate 2 a comparison of two gathers of one set of numbers rather than of two
+roundings.
+
+`memcpy` rather than a union or a pointer cast because it is the only
+type-punning spelling that is defined behaviour in C++, every compiler in the
+allowed set folds it to a single move, and it leaves Global Rule 6 with one fewer
+`reinterpret_cast` to justify.
+
+## Page-locking is done by Python and torn down by C++
+
+Scope §2.1 specifies `input_buffer` as pinned. Pinning C++-owned memory needs
+`cudaHostRegister`, and calling it from `guofish_core` would make the CUDA
+runtime a build dependency of an extension that is deliberately torch-free
+(Global Rule 7) and that has to build on a machine with no CUDA at all — the
+Linux ASan and TSan runs.
+
+So the split is: C++ exposes `buffer_spans()` — `{name: (address, nbytes)}` — the
+Python evaluator registers all three with torch's own `cudart`, and hands the
+matching unregister back through `set_teardown()`. **The hook runs in
+`~LiveEvaluator`, immediately before the allocations are freed**, which is the
+only ordering that is safe: unregistering later would leave CUDA holding a
+mapping onto memory the allocator has taken back. `Search.set_evaluator` is bound
+with `keep_alive<1, 2>`, so a search that has been given an evaluator keeps it
+alive for its own lifetime and the destructor cannot run while a pointer to the
+buffers still exists.
+
+All three buffers are registered, not just the input. The policy buffer is the
+one that pays: at batch 256 it takes a 2 MiB device-to-host copy per batch
+against the input's 68 KiB. A registration failure is reported on the object and
+never raised — an unpinned copy is correct and merely synchronous.
+
+## `sys.setswitchinterval` is set in a constructor, and that is the whole point
+
+Scope §2.1 makes `sys.setswitchinterval(0.0005)` **mandatory, before any search
+thread exists**. A constructor is the only place in this design guaranteed to run
+before one, so `guofish_core.LiveEvaluator.__init__` sets it and records what it
+overwrote in `switch_interval_before`.
+
+This is a process-global interpreter setting, and a library imposing one is a
+real imposition on its host. It is done anyway, and said out loud in the class
+docstring, because the alternative failure mode is an engine that silently runs
+at ~60 batches/s because its host forgot a line — C0b measured the contended
+dispatcher at a **median 15.25 ms** acquire wait under the default 5 ms interval.
+
+The constructor takes an override, and it exists for exactly one caller:
+`tools/bench_c10.py`, which has to build an evaluator at 0.005 to measure what
+the shorter interval costs. C0b flagged that overhead as unmeasured and the C10
+brief requires it measured before shipping the setting.
+
+## `run()` returns two numbers, because they have different fixes
+
+`BatchEvaluator::run` returns `EvalTiming { acquire_wait_ns, call_ns }` rather
+than a duration. Time in `call_ns` is paid down by making the callback cheaper;
+time in `acquire_wait_ns` is paid down only by bounding how long some *other*
+thread holds the interpreter. Reporting one number for both is how a GIL problem
+gets misdiagnosed as a slow model.
+
+`acquire_wait_ns` is sampled from **outside** the `gil_scoped_acquire` scope —
+`steady_clock::now()` needs no GIL — so it contains waiting and nothing else.
+`call_ns` is deliberately not a contention metric and the binding's docstring
+says so: torch and numpy re-acquire the GIL mid-call, so a handoff wait lands
+inside it.
+
+Both are kept as **full histograms**, one sample per boundary crossing, always
+collected rather than gated on `collect_histograms`. A batch is at least a few
+hundred microseconds of model, so an 8-byte sample per batch cannot be the thing
+that costs, and a mean would hide the tail behind the many fast acquisitions —
+which is the entire cost.
+
+## A Python exception is converted to a C++ one while the GIL is still held
+
+If the callback raises, `run()` catches `py::error_already_set`, formats its
+message, discards it as unraisable, and throws a `std::runtime_error`. Letting
+the pybind11 exception escape would send Python objects up through the
+dispatcher's `std::exception_ptr` to be rethrown and destroyed on a thread that
+has released the GIL. The message survives; the exception type does not, which is
+the trade.
+
+## `search_parallel` validates `max_batch` against the evaluator up front
+
+An over-wide batch would otherwise be a `std::logic_error` raised on the
+dispatcher and re-thrown out of a join, with the caller's argument nowhere in the
+message. It is now an `invalid_argument` on the caller's thread, before any
+thread starts. The dispatcher-side check stays as a second line, for the case
+where the evaluator is replaced mid-search.
+
+## Gate 2b runs at 1,600 simulations, and the number is measured
+
+The criterion is >= 99% move agreement with every disagreement at a top-two visit
+margin under 2%. Agreement is a function of the simulation budget, because the
+disagreements are near-ties and near-ties resolve as visits accumulate.
+
+**The pilots that chose 1,600 were run before the virtual-loss mismatch above was
+found, so their agreement column is not a measurement of the shipping
+configuration** — it is a measurement of two engines searching differently. It is
+kept here because it is what the choice was actually made on, and because the
+*margin* column is unaffected (it is a property of the reference alone):
+
+| sims | positions | agreement (VL-mismatched, not the shipping config) | positions with reference margin < 2% |
+|---:|---:|---:|---:|
+| 400 | 25 | 22/25 | 3/25 — **and those were exactly the three disagreements** |
+| 1600 | 30 | 30/30 | 1/30 |
+
+The margin column is the durable half and it is the reason the budget matters:
+at 400 sims 12% of the pilot corpus was decided by under 2%, at 1,600 it was 3%,
+and over the full 500-position corpus at 1,600 it is 23/500 = 4.6%. A
+disagreement can only happen where there is something to disagree about, so the
+budget sets the ceiling on the disagreement rate before the engines are even
+compared.
+
+1,600 is the point on that curve where the corpus is mostly made of decisions the
+engines have actually made. It is not tuned to make the gate pass — the same data
+would have justified 3,200, at four times the runtime for no change in what is
+being demonstrated — and it costs ~63 minutes per engine over 500 positions,
+which is the dominant term in the test suite's runtime and is stated in BENCH.md
+rather than buried.
+
+## The first Gate 2b run failed, and the cause was a configuration mismatch I introduced
+
+Worth recording in full, because the failure mode is the one this project's
+whole apparatus exists to prevent and it got past the apparatus anyway.
+
+**The symptom.** 12 of 500 positions disagreed at top-two visit margins of up to
+63% — not near-ties but confident, opposite judgements. Both engines were
+perfectly reproducible run to run (3/3 identical trees each), so it was a
+deterministic divergence, not noise.
+
+**What it was not.** Diagnosed by elimination, and every elimination is a
+measurement worth keeping:
+
+* tokens identical for every position tested;
+* network **values** bit-identical — `0.000e+00` delta across the sample,
+  because bf16 → float32 is exact on both sides;
+* root **priors** identical to 5.96e-08, i.e. Gate 2's result holding in situ;
+* at the first divergent selection the two engines had **bit-identical node
+  state** — same parent visit count, same `value_sum` to the last bit, same
+  `c_puct(N)`, same Q for every child.
+
+**What it was.** `guofish::SearchConfig::virtual_loss` defaults to **0.0** and
+`mctsv4.VIRTUAL_LOSS` is **2.5**. The Gate 2b harness took each side's default,
+so the reference searched at VL 2.5 and the C++ engine at VL 0.0. Both defaults
+are correct in their own right — C5 and C6 were certified at VL 0 and a later
+chunk must not change that by default, while 2.5 is the reference's production
+setting — and neither side had any reason to complain.
+
+**Why nobody expected virtual loss to matter at one worker.** Because the loss is
+applied during a descent and repaid before the next simulation starts, so with a
+single in-flight path it cannot steer one descent away from another. That
+reasoning is correct and irrelevant. `MCTSNode.select_child` takes
+`parent_visits` from **`effective_visits`**:
+
+```python
+return self.visit_count + self.vloss_count * VIRTUAL_LOSS
+```
+
+so the descent's *own* in-flight loss inflates `sqrt(N)` in the exploration term
+of every child of every node on the current path. At the divergent node: 4 real
+visits, `effective_visits` 6.5, `sqrt(N)` 2.55 instead of 2.00 — a 27% wider
+exploration term, which is enough to prefer a visited child at Q = −0.043 over
+an unvisited one at FPU 0.30. Setting `virtual_loss = 2.5` on the C++ side
+resolved three of the four decisive disagreements re-tested by hand, on the
+first attempt.
+
+**The fix is structural, not a line.** The generator now records the **full
+resolved configuration** — `c_init`, `c_base`, `fpu_root`, `fpu_tree`,
+`policy_temperature`, `virtual_loss`, `max_tree_depth` — read off the objects
+that actually run, and `tests/test_c10_gate2b.py` constructs its `SearchConfig`
+*from the manifest* rather than from its own defaults.
+`test_the_configurations_match` asserts every field arrived and checks
+`c_puct(N)` at five parent visit counts through the function that reads
+`c_init`/`c_base` rather than through the fields. A parameter added to one side
+and not the other is now a failure instead of a silent divergence.
+
+This is the same requirement C11's brief already states for a different reason —
+*"every search logs its full resolved configuration, so no future benchmark has
+the provenance problem the 2711 number had"* — arriving one chunk early because
+a differential test needs it more than a benchmark does. A benchmark with an
+unrecorded configuration produces a number nobody can reproduce; a differential
+test with one produces a number that looks like a defect in the thing under
+test.
+
+## The reference reproduced byte-for-byte across two 53-minute runs
+
+Fixing the mismatch above meant regenerating the Gate 2b golden so its manifest
+would carry the configuration. The reference's *answers* could not have changed —
+same checkpoint, same corpus, same settings — so the regeneration doubles as a
+reproducibility check on a 500-position, 800,000-simulation run, and it is worth
+having:
+
+```
+prev sha256 a516fa20bc6165663aa40089d941b58a6bfd9c4991ee8a2c443b56cfe5f097be
+new  sha256 a516fa20bc6165663aa40089d941b58a6bfd9c4991ee8a2c443b56cfe5f097be
+byte-identical: True
+```
+
+Every visit count of every root child of every position, identical. That
+establishes something the differential otherwise has to assume: when the two
+engines disagree, the reference's side of the disagreement is a fixed quantity
+and not one sample of a distribution. Individual positions were separately
+confirmed stable across three fresh engines and three successive searches on one
+warm engine, and the C++ engine likewise — so both sides of Gate 2b are
+deterministic and a disagreement is a real difference rather than noise.
+
+## GATE 2b RESULT: criterion 1 met, criterion 2 NOT met, and the cause is proven
+
+Reported before it is explained, because the explanation is good and the
+criterion is still not met.
+
+| criterion | result |
+|---|---|
+| >= 99% move agreement | **497/500 = 99.4% — MET** |
+| every disagreement at a top-two visit margin < 2% | **2 of the 3 disagreements are decisive — NOT MET** |
+| smoke: `8/2R5/4R2p/5pp1/2N1k3/6Pb/r4r1P/6K1 b - - 11 46` plays Kf3 at 7,000 sims | **MET**, at W=1/K=1 (6,499 of 7,000 root visits) and at W=1/K=32 |
+
+The two decisive disagreements:
+
+```
+2R5/7p/P3k3/1PK2p1p/5P1P/8/8/2r5 w - - 1 49
+  reference c5b6 (margin 40.84%),  engine c5b4 (margin 38.84%)
+5rn1/Pk2p3/1p1p4/1NpP2r1/2P5/7K/8/4R3 b - - 1 43
+  reference g5g6 (margin 62.10%),  engine f8a8 (margin 47.40%)
+```
+
+**Both are caused entirely by the canonical child-ordering choice, and this is
+demonstrated rather than argued.** Re-running the reference with
+`GATE1_CANONICAL_ORDER = True` — the flag that permutes its children into the
+same canonical order C++ uses, changing nothing else — reproduces the C++
+engine's answer **exactly, including the visit distribution**:
+
+```
+2R5/7p/P3k3/1PK2p1p/5P1P/8/8/2r5 w - - 1 49
+  reference, generation order : c5b6   [(979,'c5b6'), (326,'c5b4'), (294,'c5d4')]
+  reference, canonical order  : c5b4   [(969,'c5b4'), (348,'c5d4'), (282,'c5b6')]
+  engine                      : c5b4   [(969,'c5b4'), (348,'c5d4'), (282,'c5b6')]
+
+5rn1/Pk2p3/1p1p4/1NpP2r1/2P5/7K/8/4R3 b - - 1 43
+  reference, generation order : g5g6   [(1194,'g5g6'), (201,'g5g7'), (63,'g5h5')]
+  reference, canonical order  : f8a8   [(1005,'f8a8'), (247,'g5g6'), (196,'g5g7')]
+  engine                      : f8a8   [(1005,'f8a8'), (247,'g5g6'), (196,'g5g7')]
+```
+
+Identical visit counts on the live evaluator is a stronger statement than Gate 2b
+asks for: once the child order is matched, the C++ engine and the reference build
+the *same tree*, not merely pick the same move. Everything C10 built — the
+gather, the softmax, the bf16 boundary, the unified root path, the cache — is
+exonerated by that line.
+
+**So the answer to the question scope §2.6 assigned to this gate is: no.** §2.6
+says *"Gate 2b is what establishes that the ordering choice doesn't move search
+behaviour: it runs the live evaluator against unpatched Python, so any effect of
+reordering shows up as move disagreement."* The effect showed up. It moves search
+behaviour on **2 of 500 positions (0.4%)**, and when it moves it, it moves it
+decisively rather than by a coin flip.
+
+That is a scope-level finding, not a C10 defect, and it is not C10's to fix:
+§2.6 chose canonical ordering deliberately, on the grounds that reproducing
+python-chess's generation order in C++ is a fragile dependency on another
+library's internals. The finding is that the choice is not free. Both failing
+positions are endgames with a far-advanced a-pawn, and the second has eight
+promotion moves one ply deep — the four-way promotion collisions §2.6 names as a
+principal source of exact PUCT ties are exactly where child order decides.
+
+**The criterion is left failed rather than amended.** An honest amendment exists
+— record a second reference column under `GATE1_CANONICAL_ORDER = True` and
+require every decisive disagreement against the unpatched reference to be
+reproduced exactly by the patched one, which is a *stronger* test than the
+current one — but changing an acceptance criterion is the project owner's call,
+not the implementing chunk's. See "What is not done".
+
+## The Gate 2b acceptance run was accidentally sanitized, and the accident is documented
+
+`build/win.bat build/msvc-release-double Release - double` reported `BUILD_OK`
+and **did not relink**. Every build directory writes the module to the repo root,
+so Ninja compared its target against a `.pyd` that a *different* configuration
+had staged there minutes earlier, found it newer than its own inputs, and did
+nothing. The result ran for three and a half hours before `build_info()` was
+checked and returned `asan=True, asserts=True`.
+
+This is the hazard `README_BUILD.md` already warns about in the abstract —
+*"`cmake --build build/msvc-asan` sees an output newer than its inputs"* — met in
+the concrete. The fix is to delete the staged module before switching
+configurations; `build_info()` is the check, and it is cheap enough that it
+belongs before any run whose result depends on which build produced it.
+
+Two consequences, and the first is a bonus:
+
+* **Global Rule 5 is satisfied for Gate 2b by that run.** The differential
+  executed under AddressSanitizer with debug asserts live, over 500 positions and
+  800,000 simulations, with no ASan error and no assert firing. That is the
+  strongest sanitizer exercise the live path has had.
+* **The first `tools/bench_c10.py` output was not publishable** and is not
+  published. `README_BUILD.md` says benchmark on Release for exactly this reason;
+  the throughput columns were instrumented. The tables in BENCH.md are from a
+  re-run on a verified `asan=False` build, and the tool now prints `asan=` in its
+  header so the mistake is visible in the artefact rather than discovered later.
+
+## Gate 2 and Gate 2b share one corpus, and both record its digest
+
+A Gate 2b disagreement whose position Gate 2 never gathered is a disagreement
+with nowhere to look. `golden/c10_corpus.json` is sampled once
+(`tools/gen_c10_corpus.py`: 500 positions across three benchmark PGNs, several
+plies per game, seeded, quota-balanced per file), and both manifests carry its
+SHA-256; both tests refuse a mismatch.
+
+The corpus filters remove exactly three things: positions with no legal moves,
+positions with one legal move, and finished games. Checks stay in — C5's sampler
+excluded them only because a forced mate wasted a 5,000-simulation reference run,
+and here a run is cheap and a check is an ordinary position. Lopsided evaluations
+stay in, because a position where one move is obviously best is a position where
+the engines *should* agree, and a corpus of only hard positions would be
+measuring something other than the >= 99% the criterion states.
+
+## Gate 2b runs against UNPATCHED Python
+
+Gate 1 ran the reference with `GATE1_CANONICAL_ORDER = True` so both sides
+gathered in the same order. Gate 2b must not: scope §2.6 makes it the test that
+establishes the canonical-ordering choice does not move search behaviour, and it
+can only do that against the reference as it actually is. The generator refuses
+to run with the flag set, and the test asserts `canonical_order_patch is False`
+in the manifest — a golden produced under the patch would look identical and
+would be measuring the wrong thing.
+
+## The mutation drill found that Gate 2's two criteria overlap on this corpus
+
+The brief asks the drill to *"flip two identically-scored priors"* and verify the
+ordering check fails. It does. But `swap-closest` was written expecting to be
+**invisible** to the magnitude check — an inversion far inside the tolerance,
+proving the ordering criterion is load-bearing rather than implied — and it is
+not invisible.
+
+**The smallest non-zero gap between two priors anywhere in the 500-position
+corpus is 1.927e-06, which is above the 1e-6 bound.** bf16 logits carry 8
+mantissa bits, and a coarse input makes a coarse output: on this corpus every
+pair the ordering check can catch is far enough apart that the magnitude check
+catches it too.
+
+That is a fact about the corpus, not about the checks, and it is reported rather
+than worked around — the drill prints the minimum gap and treats the magnitude
+result on `swap-closest` as an observation. The independence of the two criteria
+is then shown by construction, in `invert-inside-tolerance`: collapse the closest
+pair onto its own midpoint, separate it there by one float32 ulp the wrong way
+round, and each prior moves 9.634e-07 — under the bound. The magnitude check
+passes and the ordering check fails, which is the argument for keeping an
+ordering criterion at all. `nudge-over` is its mirror: over the bound, but in a
+direction that reorders nothing. Without both, "zero prior-ordering inversions"
+would be a criterion this corpus cannot distinguish from the one beside it.
+
+## Rule compliance
+
+* **Rule 1.** No existing test file was modified. Two were added
+  (`tests/test_c10_gate2.py`, `tests/test_c10_gate2b.py`). `git status` shows no
+  change under `tests/`.
+* **Rule 2 — one declared deviation, and it is in a diagnostic column.** All
+  golden data is produced by the Python reference through `tools/`. The
+  exception: `priors_cpu_libchess` in `golden/c10_gate2.npz` is ATen's softmax
+  computed over **chess-library's generation order**, which the generator obtains
+  by calling `guofish_core.generation_order(fen)`. The *values* are the
+  reference's; the *permutation* comes from C++.
+
+  It cannot be otherwise — the column exists precisely to hold the reduction
+  order fixed while the softmax implementation varies, and only C++ knows its own
+  generation order. **The gate's verdict does not rest on it.** Against the two
+  columns that are purely reference-derived — `priors_cpu_pychess` (interior) and
+  `priors_gpu_pychess` (root) — the maxima are 2.384e-07 and 2.384e-07 against a
+  1e-6 bound with zero inversions each, so Gate 2 passes on those alone. The
+  third column is what makes the result *explicable* rather than what makes it
+  pass, and no C++ *prior value* enters any golden file.
+* **Rule 3.** Full suite run on both platforms; counts and the per-platform skip
+  delta are enumerated below.
+* **Rule 4.** Warning-clean at `/W4` (MSVC 19.51) and `-Wall -Wextra` (Clang
+  18.1.3), on Release, Debug+ASan, RelWithDebInfo+ASan and Linux ASan+UBSan
+  configurations. No warning was raised and none was suppressed; no `-Wno-*`,
+  no pragma.
+* **Rule 5.** AddressSanitizer with debug asserts live on both platforms. Linux
+  adds UBSan: **zero runtime errors, zero ASan hard errors, and zero leaked
+  allocations whose stack mentions `guofish_core`** (the 1.39 MB reported is
+  CPython and numpy interpreter-lifetime allocations, as `README_BUILD.md`
+  documents at ~1.4 MB). The Gate 2b differential — 500 positions, 800,000
+  simulations of the live path — executed under ASan with asserts live and
+  produced no ASan error and no assert failure.
+* **Rule 6.** No `#pragma pack`. Four `reinterpret_cast`s added, all with their
+  justification on the **preceding** line per Amendment C: one alignment assert in
+  `AlignedArray` (pointer → integer, never dereferenced or converted back) and
+  three in `LiveEvaluator::buffer_spans` (pointer → integer, because
+  `cudaHostRegister`'s Python binding takes an address as an int; nothing
+  converts back on the C++ side). The bf16 widening deliberately uses `memcpy`
+  rather than a fifth cast — it is the only defined type-punning spelling in C++
+  and every compiler in the allowed set folds it to a single move.
+* **Rule 7.** No new dependencies. LibTorch is *not* linked — which is why the
+  softmax is hand-rolled (see above) — and the CUDA runtime is not linked either:
+  page-locking goes through torch's own `cudart` from Python and hands the
+  unregister back through `set_teardown`. The extension still builds and its
+  tests still pass on a machine with no CUDA at all, which is what the Linux
+  sanitizer runs are.
+* **Rule 8.** Both toolchains build and both suites run. Gate 2 is **bit-identical
+  across them**, down to the per-column exact-match counts, so the C++ side of
+  the numerics gate is one number rather than a platform's number.
+* **Rule 9.** This file.
+* **Rule 10.** Gate 2b's second criterion is reported **failed**, with the
+  positions, the margins, and a demonstration of the cause. It is not narrowed,
+  and the amendment that would let it pass is described but not applied.
+
+## Amendment compliance
+
+* **A (golden interpreter pin).** Both C10 goldens were generated on Python
+  3.13.7 / python-chess 1.11.2 on Windows, and both consuming tests assert those
+  versions out of the manifest rather than trusting them.
+  `tests/test_c10_gate2.py` imports no `chess` and no `torch` at all — the
+  reference reaches it only through the file, which is why it runs identically on
+  Linux and contributes no skips.
+* **B (drills never touch `golden/`).** `tools/drill_c10_gate2.py` runs against
+  copies in a scratch directory via `GUOFISH_GOLDEN_C10_GATE2` /
+  `_MANIFEST`, and prints the real files' SHA-256 before and after; both runs
+  reported `unchanged`. Copies and writes are binary (Amendment E).
+* **C (`reinterpret_cast` comments precede).** All four new ones comply; see
+  Rule 6.
+* **D (skip parity).** No module-scope skips. `tests/test_c10_gate2b.py` uses a
+  guarded import plus a per-test `skipif` whose reason names which prerequisite
+  is missing, so a skipped platform reports 12 individual skips with a reason
+  rather than one line hiding a file. The cross-platform delta is enumerated
+  below.
+* **E (byte-level provenance).** `.gitattributes` unchanged and still pins
+  `*.py text eol=lf`; every new `.py` file is LF. Appended documentation matched
+  each file's existing convention — `DECISIONS.md` is LF, `BENCH.md` is CRLF, and
+  the C10 sections were normalised to match rather than left mixed.
+
+## Cross-platform test counts, itemised
+
+|  | Windows (RelWithDebInfo + ASan + asserts) | Linux (Clang, Debug) |
+|---|---:|---:|
+| passed | **1,255** | **1,242** |
+| skipped | **49** | **62** |
+| deselected | 4 | 0 |
+| **collected** | **1,308** | **1,304** |
+
+Four differences, every one named. Amendment D's requirement is that the delta be
+*enumerable*, and it is:
+
+1. **`test_reference_defects.py` — 5 passed on Windows, 1 module skip on Linux.**
+   The standing Amendment D exception, ruled by the project owner on 2026-08-08
+   and documented under C9. Its module-scope `importorskip` means Linux collects
+   0 of its 5 tests and reports one `SKIPPED [1]` line, which is the whole of the
+   4-item collection difference (−5 tests, +1 skip entry).
+2. **`test_c10_gate2b.py` — 13 tests: 9 passed + 4 deselected on Windows, 13
+   skipped on Linux.** Reason reported *per test*, thirteen separate lines:
+   *"torch is not importable (ModuleNotFoundError: No module named 'torch')"*.
+   The Linux venv deliberately has no torch — it exists to run the sanitizers,
+   and this differential needs a CUDA forward pass whose logits the golden data
+   records. This is the shape Amendment D asks for and the shape the C7 incident
+   lacked: thirteen enumerated skips rather than one line hiding a file.
+3. **`test_c8_reuse.py:760` — skipped on Windows, passes on Linux.** *"built
+   without GUOFISH_DEBUG_VL; the audit is not compiled in."* A **build**
+   difference, not a platform one: the Linux configuration is Debug and compiles
+   the virtual-loss audit in; the Windows RelWithDebInfo run does not.
+4. **`test_c6_gate1_full.py` — 48 skipped on both**, *"this corpus predates the
+   census columns."* Identical, and listed only so the 49 and the 62 add up.
+
+Arithmetic: passed differs by 13 = +5 (reference_defects) + 9 (Gate 2b) − 1
+(c8_reuse). Skips differ by 13 = +13 (Gate 2b) + 1 (reference_defects module)
+− 1 (c8_reuse). `tests/test_c10_gate2.py` contributes **13 passed on both
+platforms and no skips anywhere** — it imports neither torch nor python-chess, so
+there is nothing for a platform to be missing.
+
+## Rule 3's run is composed of two executions, and here is why
+
+`pytest tests/` was **not** run as one command for the final acceptance. The
+composition is:
+
+* **`pytest tests/ -q -rs --deselect <4 tests>` — 1,255 passed, 49 skipped, 4
+  deselected, 10 m 26 s.** Everything except Gate 2b's 500-position sweep.
+* **`pytest tests/test_c10_gate2b.py -v -s` — 12 passed, 1 failed, 3 h 29 m**,
+  run earlier on the same build from the same sources and the same golden data.
+
+The four deselected tests are exactly those that consume the `differential`
+fixture. They had already been run to completion, and re-running them cost two
+hours of wall clock to reproduce a known result.
+
+**What licenses the split, and what would not have.** The reason to run Gate 2b
+*inside* the suite is cross-test contamination: `LiveEvaluator`'s constructor
+sets `sys.setswitchinterval(0.0005)` process-globally and never restores it, so
+it leaks into every file collected after `test_c10_gate2b.py` — which, because
+`'0' < '_'`, is files 5 through 16, i.e. almost the whole suite. That leak happens
+when the **fixture is constructed**, not during the sweep. Deselecting the four
+sweep tests keeps the fixture, the evaluator, both smoke searches, the buffer
+checks and the acquire-wait histogram — every path that could contaminate a later
+test — and drops only the repetition. `test_c0b_contention.py`, the one
+timing-sensitive GIL test, collects at position 2 and runs *before* C10 either
+way.
+
+Verified rather than assumed before splitting: every `cpp/` source predates the
+Gate 2b run by more than fourteen hours, both C10 golden files predate it, and
+the only post-run edit to the test file is a progress `print` inside the fixture
+loop plus docstring text. No assertion changed.
+
+## What is not done
+
+* **Gate 2b's second criterion.** Failed, characterised, and left failed. The
+  replacement that would settle it honestly — a second reference column recorded
+  under `GATE1_CANONICAL_ORDER = True`, with every decisive disagreement required
+  to be reproduced *exactly* by it — is a **stronger** test than the current one
+  and costs one 53-minute generator run. Changing an acceptance criterion is the
+  owner's call, so it is proposed here and not applied.
+* **C9's deferred layer-3 absolute root-stability tolerance.** Handed to C10
+  because it could not be measured on the replay evaluator. It is now measurable
+  — the live evaluator exists — and it is still not measured. Nothing blocks it
+  technically; the chunk's live-evaluator budget went to Gate 2b and to the two
+  harness defects.
+* **Within-batch transposition dedup.** Two leaves in one batch that share an
+  `nn_key` each take a row and each insert. Correct, counted honestly as two
+  misses, and left for C12 to measure rather than assumed worth fixing.
+* **The 3.5-hour Gate 2b runtime.** W=1/K=1 makes every forward a batch of one,
+  and virtual loss 2.5 widens the tree so the cache absorbs less. Both are
+  required by the comparison, so the cost is the test's rather than the engine's
+  — the same position runs 7,000 simulations in 3.6 s at W=1/K=32. It is stated
+  in BENCH.md rather than worked around, and it makes this file the dominant term
+  in the suite.
+* **`sys.setswitchinterval`'s own cost is bounded, not measured.** C10f puts it
+  inside a ±22-39% run-to-run spread on this host, so the honest statement is
+  "not resolvable", not "zero". A quieter machine would settle it; the contention
+  it prevents is a factor of 436, so the trade is not close either way.

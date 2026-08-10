@@ -1135,3 +1135,232 @@ DECISIONS.md, C9, on why `py::enum_` was removed from the Python surface.
   floor.
 * The knee sweep needs a GPU and torch; the grid does not. Everything in C9b–C9f
   runs on the replay evaluator and belongs in CI.
+
+---
+
+## C10 — The live evaluation boundary
+
+Reproduce with `python tools/bench_c10.py` (needs torch, a CUDA device and the v5
+checkpoint). The Gate 2 numbers come from `pytest tests/test_c10_gate2.py -s`,
+which prints the full distribution rather than the maximum alone; the corpus
+figures come from `python tools/gen_c10_corpus.py`.
+
+Model for every C10 number: `models/guofish5_20M/v5_10.9M_best.pt` — the 10.9M v5
+student, 6 layers, d_model 384, bf16 autocast — on an RTX 5070, torch 2.8.0+cu129.
+
+### C10a — Gate 2: the C++ gather+softmax against ATen
+
+500 game-realistic positions, 15,036 priors. The input to both sides is one set
+of numbers: the model's full 4096-wide **bf16** policy row per position, recorded
+once by the Python reference and read by both. So this is two gathers of one
+tensor, not two forward passes.
+
+| comparison | max abs delta | p99.9 | p99 | p90 | p50 | mean | exact |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| C++ vs reference interior (ATen CPU, python-chess order) | 2.384e-07 | 1.192e-07 | 5.960e-08 | 7.451e-09 | 1.164e-10 | 2.707e-09 | 5,315 |
+| C++ vs reference root (ATen CUDA, python-chess order) | 2.384e-07 | 1.192e-07 | 4.470e-08 | 7.451e-09 | 1.164e-10 | 2.781e-09 | 4,291 |
+| C++ vs ATen CPU in **chess-library** order | 2.682e-07 | 8.941e-08 | 4.470e-08 | 7.451e-09 | 1.164e-10 | 2.734e-09 | 5,262 |
+| *permutation alone* (both sides ATen, two orders) | 3.576e-07 | 8.941e-08 | 2.980e-08 | 3.725e-09 | 0 | 1.772e-09 | 7,941 |
+| *reference root vs reference interior* | 2.384e-07 | 5.960e-08 | 2.980e-08 | 3.725e-09 | 1.164e-10 | 1.914e-09 | 5,658 |
+
+**Gate: max <= 1e-6 and zero prior-ordering inversions. Both met, with ~4 orders
+of margin on the first.** Priors over 1e-6: **0 of 15,036** in every row.
+Inversions: **0** against all three reference columns. Collapsed pairs (reference
+separates, C++ ties): **0**.
+
+Read the italic rows first, because they are what makes the others
+interpretable. Neither involves C++:
+
+* **Permutation alone is 3.576e-07** — larger than any C++-vs-ATen figure in the
+  table. `torch.softmax` is not permutation-invariant, python-chess and
+  chess-library generate in different orders, and that difference is unavoidable
+  for a correct implementation. This is the measurement that retires the <= 4 ULP
+  bound the chunk table originally carried; scope §2.6's "up to 3e-7" is
+  confirmed on a corpus it did not measure.
+* **The reference disagrees with itself by 2.384e-07 across 9,378 of 15,036
+  priors** — the root/interior device split. The brief records C5's
+  single-position figure of "6 of 37 priors, max 1.9e-9"; over 500 positions it
+  is two orders of magnitude larger and touches 62% of priors. C10 unifies on one
+  path, so this is the divergence it accepts at roots, and Gate 2b is what
+  arbitrates it.
+
+The C++ row against the *same reduction order* (2.682e-07) is not smaller than
+the rows against permuted ones, so the softmax-implementation term and the
+permutation term are the same size. Neither dominates and both are noise against
+the gate.
+
+**Identical on both toolchains.** Every cell above reproduces bit-for-bit on
+Windows/MSVC 19.51 and Linux/Clang 18.1.3, down to the per-row `exact` counts.
+`std::exp` and the accumulation order agree across the two, so the C++ side of
+Gate 2 is one number rather than a platform's number.
+
+### C10b — The corpus, and one number that changed the mutation drill
+
+`golden/c10_corpus.json`: 500 positions, seeded, sampled several plies per game
+across three benchmark PGNs with a per-file quota.
+
+| property | value |
+|---|---|
+| positions | 500 (167 / 167 / 166 across the three PGNs) |
+| ply | min 8, median 49, max 238 |
+| legal moves | min 2, mean 30.1, max 63 |
+| priors recorded | 15,036 |
+| **smallest non-zero gap between two priors** | **1.927e-06** |
+
+That last row is the finding, and it is above the 1e-6 Gate 2 bound. bf16 logits
+carry 8 mantissa bits, so the priors they produce are coarse: on this corpus,
+every pair the ordering criterion could catch is far enough apart that the
+magnitude criterion catches it too. The mutation drill reports it and constructs
+its way around it — see DECISIONS.md, C10, and `tools/drill_c10_gate2.py`'s
+`invert-inside-tolerance`.
+
+### C10c — The switch interval, against a real search
+
+`python tools/bench_c10.py --sims 4000`. Release, `asan=False` — the tool now
+*refuses* to print these tables from a sanitizer build, because it published one
+set of instrumented numbers before that check existed (DECISIONS.md, C10).
+
+W=1, K=32, max_batch 256, on a quiet midgame; 294 boundary crossings at 11.3
+rows/batch in every row, so the four cells differ only in the interpreter
+setting and in whether a pure-Python thread is competing. The competitor is
+`UciFormatterLoad` from `tests/test_c0b_contention.py` — imported, not
+reimplemented, so the published numbers and the asserted ones cannot drift.
+
+| interval | competing Python thread | delivered | wall (s) | **delivered sims/s** |
+|---:|:--|---:|---:|---:|
+| 0.005 | no | 3999 | 1.67 | 2,401 |
+| 0.005 | **yes** | 3999 | 971.14 | **4** |
+| 0.0005 | no | 3999 | 1.31 | 3,060 |
+| 0.0005 | **yes** | 3999 | 2.23 | **1,797** |
+
+**436x.** That is the whole argument for `sys.setswitchinterval(0.0005)` being
+mandatory rather than advisory, on a real search rather than on C0b's synthetic
+loop. Four simulations per second is not a slow engine; it is an engine that has
+stopped. And the competing thread is not a stress test — it is a UCI `info`
+formatter, which is what the host does while the engine thinks.
+
+### C10d — Dispatcher GIL acquire wait, per batch (microseconds)
+
+The histogram, never a mean. Sampled from *outside* the `gil_scoped_acquire`
+scope, so it contains waiting and nothing else.
+
+| interval | competing | batches | p50 | p90 | p99 | max | total (ms) | share of wall | C10 trigger |
+|---:|:--|---:|---:|---:|---:|---:|---:|---:|:--|
+| 0.005 | no | 294 | 2.30 | 3.10 | 5.90 | 140.40 | 0.82 | 0.049% | clear |
+| 0.005 | yes | 294 | 15,376.00 | 15,915.10 | 16,393.10 | 17,671.00 | 4,352.36 | 0.448% | **FIRED** |
+| 0.0005 | no | 294 | 2.20 | 3.70 | 5.70 | 6.10 | 0.71 | 0.055% | clear |
+| **0.0005** | **yes** | 294 | 5.40 | 6.90 | **20.70** | 70.30 | 1.77 | **0.079%** | **clear** |
+
+**The C10 contingency does not fire, and this is the row it is decided on.** The
+brief makes C++-side `info` emission mandatory if the acquire-wait p99 exceeds
+**200 µs** or if the total exceeds **1% of the move's wall time**. In the
+shipping configuration *with the adversarial competitor running*, p99 is
+**20.7 µs (9.7x under)** and the share is **0.079% (12.6x under)**. C++ stdout
+emission is therefore recorded and deferred, per the brief, with a measurement
+behind the deferral rather than an assumption.
+
+The FIRED row is not a shipping configuration — nothing sets 0.005 — but it is
+kept because it shows the trigger works. A threshold no measurement ever crosses
+is not a threshold.
+
+Note the `max` column at 0.005/no-competitor: **140 µs against a p99 of 5.9 µs**.
+One excursion, 24x the p99, on an idle interpreter. That is the tail C9's brief
+insisted be kept as a histogram, and a mean of 2.79 µs would have hidden it
+completely.
+
+### C10e — Callback duration, and why it is NOT the contention metric
+
+| interval | competing | p50 | p90 | p99 | max |
+|---:|:--|---:|---:|---:|---:|
+| 0.005 | no | 5,036 | 7,401 | 8,836 | 10,409 |
+| 0.005 | yes | **3,266,800** | 3,713,389 | 4,300,416 | 4,673,716 |
+| 0.0005 | no | 3,903 | 5,166 | 7,795 | 7,870 |
+| 0.0005 | yes | 6,457 | 8,331 | 10,563 | 11,189 |
+
+Scope §2.1 warns that torch and numpy re-acquire the GIL mid-call, so a handoff
+wait can land *inside* the callback. Row two is that warning as a number: the
+callback "takes" **3.27 seconds** at p50 while the acquire wait that preceded it
+was 15 ms. The model did not get slower by a factor of 650; the callback spent
+its time handing the interpreter back and forth with the competing thread. Anyone
+optimising against `call_us` here would be optimising the wrong thing, which is
+exactly why `run()` returns two numbers.
+
+### C10f — What the shorter interval costs on a quiet interpreter
+
+C0b flagged this as unmeasured: the shorter interval raises context-switch
+frequency interpreter-wide, and nobody had checked what that costs when there is
+nothing to contend with. Five repeats per interval at 20,000 simulations:
+
+| interval | n | median sims/s | min | max | spread |
+|---:|---:|---:|---:|---:|---:|
+| 0.005 | 5 | 3,257 | 2,622 | 3,353 | 22.4% |
+| 0.0005 | 5 | 2,829 | 2,355 | 3,468 | 39.4% |
+
+**No measurable cost.** The medians differ by 13% and the run-to-run spread is
+22-39%, so the difference is inside the noise — and the sign is not even stable:
+the single-shot 4,000-simulation run in C10c had 0.0005 *faster* by 27%. The
+honest statement is that on this host the setting's own overhead cannot be
+resolved against scheduling variance, while the contention it prevents is a
+factor of 436. Nothing about that trade is close.
+
+This is also a caution about C10c's quiet rows: at 4,000 simulations they run for
+1.3-1.7 seconds and should be read as "both around 2,400-3,000 sims/s", not as a
+comparison.
+
+### C10g — Gate 2b, and what it costs to run
+
+500 positions x 1,600 simulations, W=1/K=1, both engines on the live evaluator.
+
+| side | build | wall | rate |
+|---|---|---:|---:|
+| Python reference (`tools/gen_c10_gate2b_golden.py`) | CPython 3.13.7 | 3,157 s (53 min) | 0.16 pos/s |
+| C++ engine (`tests/test_c10_gate2b.py`) | RelWithDebInfo + **ASan** + asserts | 12,531 s (3 h 29 m) | 0.04 pos/s |
+
+**This file is the dominant term in the suite's runtime**, and the C++ figure is
+a sanitizer figure — see DECISIONS.md on the build that reported `BUILD_OK` and
+relinked nothing. It is reported rather than re-run on Release because that run
+*is* the Global Rule 5 acceptance evidence: 800,000 simulations of the live path
+under AddressSanitizer with debug asserts live, no ASan error, no assert.
+
+Two things drive the cost and neither is the network:
+
+* **W=1/K=1 means every forward is a batch of one.** C9 measured host ATen
+  dispatch at ~4 ms flat to batch 64, so a batch-of-one search is dispatch-bound.
+  The configuration is required — it is what removes leaf parallelism from the
+  comparison — so this is a cost of the *test*, not of the engine. The same
+  position at W=1/K=32 runs 7,000 simulations in 3.6 s (C10h).
+* **Virtual loss 2.5 widens the tree**, so more distinct positions are expanded
+  and fewer probes hit the cache. The pilots that sized this test were run at VL
+  0 and were ~2.5x faster per position; that is why the original runtime estimate
+  was wrong by a factor of three.
+
+### C10h — The smoke position, both configurations
+
+`8/2R5/4R2p/5pp1/2N1k3/6Pb/r4r1P/6K1 b - - 11 46`, 7,000 simulations, live
+evaluator, sanitizer build.
+
+| config | wall | best move | root visits on the answer |
+|---|---:|---|---:|
+| W=1, K=1 | 27.6 s | **Kf3** (`e4f3`) | 6,499 / 7,000 |
+| W=1, K=32 | 3.6 s | **Kf3** (`e4f3`) | — |
+
+The K=32 run crossed the boundary **145 times for 460 rows** (3.2 rows/batch)
+while the transposition cache answered **5,617** leaves — 92% of the 6,077 leaves
+that needed an answer never reached the network. That is `prepare_live_batch`
+doing its job: probing before the crossing rather than inside the expansion loop,
+so a cached leaf costs no row of the batch.
+
+The 7.7x wall-clock difference between the two rows at identical simulation
+counts is the batch-of-one cost stated above, isolated.
+
+### Measurement notes
+
+* Every C10 table is **delivered** simulations, asserted equal to the requested
+  budget before the row is allowed into the table.
+* `tools/bench_c10.py` prints `asan=` in its header and **refuses to run** on a
+  sanitizer build without `--allow-instrumented`. That check exists because the
+  first version of C10c was measured on an instrumented build and looked
+  plausible; the throughput columns were 2-4x low and the acquire-wait columns
+  4-8x high.
+* The quiet-interpreter rows are short (1.3-1.7 s) and are not a comparison; C10f
+  is. The contended rows are long enough that their difference is not in doubt.

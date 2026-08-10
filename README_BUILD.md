@@ -289,6 +289,7 @@ implementations (Global Rule 2). Results are transcribed into `BENCH.md`.
 | `python tools/bench_c9_knee.py --markdown` | **C9a: the GPU evaluation knee.** Needs torch and a CUDA device. Synchronizes around every timed iteration — see BENCH.md on why an un-synchronized measurement produces a different and wrong curve |
 | `python tools/bench_c9.py --markdown` | C9b–C9f: the W × K grid with its W=1 control rows, the affinity comparison, and the dispatcher GIL histogram. Replay evaluator only, no GPU |
 | `python tools/bench_c9.py --affinity-only --sims 20000` | the affinity table alone, at a budget long enough for the effect to appear — at 2,000 sims pinning measures as noise |
+| `python tools/bench_c10.py` | **C10: the live evaluation boundary.** Needs torch, a CUDA device and the v5 checkpoint. Real search throughput at `sys.setswitchinterval` 0.005 vs 0.0005, with and without a competing pure-Python thread, plus the dispatcher's acquire-wait histogram against C10's 200 µs / 1%-of-wall triggers |
 
 On Linux, prefix with the build directory as usual:
 
@@ -329,6 +330,9 @@ regenerated to make a test pass (Global Rules 1 and 2).
 | `keys.jsonl`, `keys_adversarial.jsonl` | `tools/gen_key_golden.py` | 13 MB |
 | `gate1_dump.npz`, `gate1_trees.npz`, `gate1_manifest.json` | `tools/gen_gate1_golden.py` | 19 MB |
 | `gate1_terminal_dump.npz`, `gate1_terminal_trees.npz`, `gate1_terminal_manifest.json` | `tools/gen_gate1_golden.py --corpus terminal` | 9 MB |
+| `c10_corpus.json` | `tools/gen_c10_corpus.py` | 90 KB |
+| `c10_gate2.npz`, `c10_gate2_manifest.json` | `tools/gen_c10_gate2_golden.py` | 3 MB |
+| `c10_gate2b.json`, `c10_gate2b_manifest.json` | `tools/gen_c10_gate2b_golden.py --sims 1600` | 1 MB |
 
 The Gate 1 files are the only ones whose generation needs a GPU and the v5
 checkpoint. The quiet corpus takes ~35 minutes, the terminal corpus ~25:
@@ -365,6 +369,40 @@ is the pre-root game the repetition rule is evaluated against, and it is passed
 to the C++ side through `set_position(fen, history)`; without it a threefold is
 essentially unreachable inside search range.
 
+### The C10 files: one corpus, two gates
+
+`c10_corpus.json` is 500 game-realistic positions sampled from three benchmark
+PGNs with a seeded generator, several plies per game, quota-balanced across the
+files. Both C10 gates read it and both manifests record its SHA-256, because a
+Gate 2b disagreement whose position Gate 2 never gathered is a disagreement with
+nowhere to look. Regenerating the corpus invalidates both goldens, and the tests
+say so rather than comparing across a mismatch:
+
+```bat
+python tools/gen_c10_corpus.py --force
+python tools/gen_c10_gate2_golden.py --force
+python tools/gen_c10_gate2b_golden.py --sims 1600 --force
+```
+
+**Gate 2 (`c10_gate2.npz`)** takes ~1 minute and needs a GPU: it records the
+model's full 4096-wide bf16 policy row per position, plus ATen's priors computed
+three different ways — the reference's interior path (CPU softmax, python-chess
+generation order), its root path (CUDA softmax, same order), and ATen's CPU
+softmax over *chess-library's* generation order. The third column is what
+separates the softmax-implementation difference from the permutation variance;
+see DECISIONS.md, C10.
+
+**Gate 2b (`c10_gate2b.json`)** takes ~65 minutes and is the reference actually
+playing: one worker, 1,600 simulations, cache on, tablebase off, Dirichlet off,
+and **no canonical-ordering patch**. That last one is the point — Gate 1 ran the
+reference patched so both sides gathered in the same order, and Gate 2b exists to
+establish that the ordering choice does not move search behaviour, which it can
+only do against unpatched Python. The generator refuses to run with
+`mctsv4.GATE1_CANONICAL_ORDER` set, and the test asserts the manifest says so.
+
+Useful while iterating: `--limit N --out <scratch> --manifest <scratch>` runs a
+pilot without touching `golden/`.
+
 ### The mutation drills
 
 Amendment B: drills never touch `golden/`. Each parity test reads an optional
@@ -375,6 +413,7 @@ the real file's SHA-256 is recorded unchanged before and after.
 python tools/drill_c5_gate1.py
 python tools/drill_c6_gate1.py
 python tools/drill_c8_reuse.py
+python tools/drill_c10_gate2.py
 ```
 
 The C5 drill corrupts the quiet Gate 1 data four ways; the C6 drill corrupts the
@@ -396,6 +435,17 @@ against it. Configure re-uses the already-fetched dependency sources under
 `build/msvc-release` to exist first. The remaining three mutations are the
 classic golden-copy form and need no rebuild. Run it against a Release build;
 each source mutation costs one ~40 s compile.
+
+**The C10 drill is the classic golden-copy form and takes seconds** — it needs no
+GPU, no torch and no rebuild, because Gate 2 compares a pure function of a FEN
+and a recorded logit row. Its five mutations exist in two pairs plus a control:
+`swap-closest` and `swap-adjacent` must be caught by the ordering check,
+`nudge-over` by the magnitude check *and not* by the ordering one, and
+`invert-inside-tolerance` by the ordering check *and not* by the magnitude one.
+The last pair is what establishes that the two halves of Gate 2 are independent;
+without it, "zero prior-ordering inversions" is a criterion the corpus cannot
+distinguish from the bound beside it. See DECISIONS.md, C10, for why the corpus
+forced that construction.
 
 ---
 

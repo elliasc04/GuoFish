@@ -115,6 +115,7 @@
 
 #include "arena.hpp"
 #include "cache.hpp"
+#include "evaluator.hpp"
 #include "keys.hpp"
 #include "movegen.hpp"
 #include "parallel.hpp"
@@ -320,22 +321,35 @@ inline std::uint16_t packed_of(const chess::Board &board, chess::Move move) {
 // ties by child order, so two orderings that agree "almost always" are the kind
 // of divergence Gate 1 exists to prevent.
 //
-// Sorting a small vector of triples rather than the Movelist itself keeps
-// chess-library's generation order out of the answer entirely.
+// Sorting a small vector of tuples rather than the Movelist itself keeps
+// chess-library's generation order out of the answer entirely — except where
+// C10 needs it back, which is the fourth field.
+//
+// `generation_index`, when asked for, comes out parallel to `packed`:
+// `(*generation_index)[k]` is the position move k held in chess-library's
+// generation order. It exists for exactly one caller — the live evaluator's
+// gather, which must softmax in generation order and only then permute into
+// canonical order (scope §2.6, cpp/evaluator.hpp's header). Nothing else may
+// read it: reproducing a library's internal generation order is the fragile
+// dependency canonical ordering was chosen to avoid, and the ONLY thing this
+// index is allowed to decide is a floating-point reduction order.
 inline void generate_canonical_moves(const chess::Board &board, std::vector<std::uint16_t> &packed,
-                                     std::vector<std::uint16_t> &raw) {
+                                     std::vector<std::uint16_t> &raw,
+                                     std::vector<std::uint16_t> *generation_index = nullptr) {
     chess::Movelist movelist;
     chess::movegen::legalmoves(movelist, board);
 
-    // (canonical key, packed move, raw library move).
-    std::vector<std::array<std::uint16_t, 3>> entries;
+    // (canonical key, packed move, raw library move, generation index).
+    std::vector<std::array<std::uint16_t, 4>> entries;
     entries.reserve(static_cast<std::size_t>(movelist.size()));
-    for (const auto &move : movelist) {
+    for (int i = 0; i < movelist.size(); ++i) {
+        const chess::Move move = movelist[i];
         const std::uint16_t p = packed_of(board, move);
-        entries.push_back({canonical_move_key(p), p, move.move()});
+        entries.push_back({canonical_move_key(p), p, move.move(),
+                           static_cast<std::uint16_t>(i)});
     }
     std::sort(entries.begin(), entries.end(),
-              [](const std::array<std::uint16_t, 3> &a, const std::array<std::uint16_t, 3> &b) {
+              [](const std::array<std::uint16_t, 4> &a, const std::array<std::uint16_t, 4> &b) {
                   return a[0] < b[0];
               });
 
@@ -343,9 +357,16 @@ inline void generate_canonical_moves(const chess::Board &board, std::vector<std:
     raw.clear();
     packed.reserve(entries.size());
     raw.reserve(entries.size());
+    if (generation_index != nullptr) {
+        generation_index->clear();
+        generation_index->reserve(entries.size());
+    }
     for (const auto &entry : entries) {
         packed.push_back(entry[1]);
         raw.push_back(entry[2]);
+        if (generation_index != nullptr) {
+            generation_index->push_back(entry[3]);
+        }
     }
 }
 
@@ -1138,6 +1159,49 @@ struct ParallelStats {
     std::vector<std::int64_t> hook_wait_ns_samples;
 };
 
+// C10 — the live evaluator's contention instrumentation, and why it is a
+// HISTOGRAM and not a mean.
+//
+// A mean acquire wait hides the tail behind the many fast acquisitions, and the
+// tail is the entire cost: C0b measured a contended dispatcher at a median
+// 15.25 ms under the default switch interval, which is a hard ceiling of ~60
+// batches per second, while the same run's cheap acquisitions were sub-microsecond.
+// Averaging those together produces a number that is neither. So every batch's
+// wait is kept, and the C10 trigger — implement C++-side `info` emission if p99
+// exceeds 200 µs, or if the total exceeds 1% of the move's wall time — is
+// evaluated against the distribution.
+//
+// `total_ns` is deliberately NOT the callback's duration. torch and numpy
+// re-acquire the GIL inside a call, so a handoff wait lands in the middle of
+// `call_ns` and inflates it with something that is not contention; only the
+// wait measured from OUTSIDE the acquire scope is clean (scope §2.1).
+// `call_ns` is kept anyway, because the ratio between the two is what says
+// whether a slow batch was contention or was just the model.
+struct EvalStats {
+    std::int64_t batches = 0;      // boundary crossings
+    std::int64_t rows = 0;         // leaves actually sent to the network
+    std::int64_t cache_skipped = 0;  // leaves that never needed a row
+    std::int64_t acquire_wait_ns = 0;
+    std::int64_t call_ns = 0;
+    std::int64_t max_acquire_wait_ns = 0;
+    // One entry per boundary crossing. Always collected: a batch is at least a
+    // few hundred microseconds of model, so an 8-byte sample per batch cannot
+    // be the thing that costs.
+    std::vector<std::int64_t> acquire_wait_ns_samples;
+    std::vector<std::int64_t> call_ns_samples;
+
+    void reset() {
+        batches = 0;
+        rows = 0;
+        cache_skipped = 0;
+        acquire_wait_ns = 0;
+        call_ns = 0;
+        max_acquire_wait_ns = 0;
+        acquire_wait_ns_samples.clear();
+        call_ns_samples.clear();
+    }
+};
+
 // The exact conservation invariants acceptance layer 3 is made of.
 //
 // These are ASSERTIONS ABOUT INTEGERS, with no epsilon anywhere, and that is
@@ -1348,9 +1412,8 @@ public:
     // the same by setting its completion_event.
     SearchStats search(int num_simulations) {
         require_position();
-        if (dump_.empty()) {
-            throw std::logic_error("guofish::ReplaySearch::search: no replay dump loaded");
-        }
+        require_evaluation_source("search");
+        eval_stats_.reset();
         // The reference builds a fresh `stats` defaultdict per search() call, so
         // a mating move found by a previous call does not stop this one before
         // it starts.
@@ -1423,8 +1486,17 @@ public:
     // make layer 1 a test of code layer 3 does not use.
     SearchStats search_parallel(int num_simulations, const ParallelConfig &pc) {
         require_position();
-        if (dump_.empty()) {
-            throw std::logic_error("guofish::ReplaySearch::search_parallel: no replay dump loaded");
+        require_evaluation_source("search_parallel");
+        eval_stats_.reset();
+        // Checked BEFORE any thread starts, so an over-wide batch is a named
+        // argument error on the caller's thread rather than a logic_error raised
+        // on the dispatcher and re-thrown from a join.
+        if (evaluator_ != nullptr && pc.max_batch > evaluator_->max_batch()) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch::search_parallel: max_batch is " +
+                std::to_string(pc.max_batch) + " but the evaluator's buffers hold " +
+                std::to_string(evaluator_->max_batch()) +
+                " rows. Allocate the evaluator with at least max_batch rows.");
         }
         if (pc.workers < 1) {
             throw std::invalid_argument(
@@ -1468,6 +1540,20 @@ public:
     // implementation is the GIL probe, which exists to test scope 2.1's
     // prediction on the real C9 thread topology.
     void set_batch_hook(BatchHook *hook) noexcept { hook_ = hook; }
+
+    // C10. Install the live evaluator, or clear it with nullptr. Borrowed, not
+    // owned — it holds the three buffers Python has numpy views onto, and their
+    // lifetime is the caller's problem for the same reason the tablebase
+    // prober's is.
+    //
+    // Installing one takes the replay dump OUT of the evaluation path entirely,
+    // root included. There is deliberately no mode in which a search consults
+    // both: the dump's whole value is that a miss is a hard failure proving a
+    // divergence, and a live fallback would turn every such proof into a silent
+    // "the network answered instead".
+    void set_evaluator(BatchEvaluator *evaluator) noexcept { evaluator_ = evaluator; }
+    const BatchEvaluator *evaluator() const noexcept { return evaluator_; }
+    const EvalStats &eval_stats() const noexcept { return eval_stats_; }
 
     // The topology this build can see, whatever it is. Reported rather than
     // assumed so a benchmark table can say what it ran on and a machine that
@@ -1899,6 +1985,12 @@ private:
         // Scratch for the leaf's legal moves, reused across simulations.
         std::vector<std::uint16_t> packed;
         std::vector<std::uint16_t> raw;
+        // C10. Parallel to `packed`: where each move stood in chess-library's
+        // GENERATION order. Only the live evaluator's gather reads it, and only
+        // to fix a softmax reduction order (cpp/evaluator.hpp). Filled on every
+        // descent regardless, because a branch here would be a branch in the
+        // hottest loop in the engine to save one 38-byte memcpy.
+        std::vector<std::uint16_t> generation;
     };
 
     // Where a descent was standing, in the terms a failure message needs, and
@@ -2102,15 +2194,16 @@ private:
     // Generate, normalise and canonically order this position's legal moves.
     // The body moved to the free `generate_canonical_moves` in C7 so the
     // tablebase root probe shares it; behaviour is unchanged.
-    void generate_canonical(std::vector<std::uint16_t> &packed,
-                            std::vector<std::uint16_t> &raw) const {
-        generate_canonical_moves(board_.board(), packed, raw);
+    void generate_canonical(std::vector<std::uint16_t> &packed, std::vector<std::uint16_t> &raw,
+                            std::vector<std::uint16_t> *generation_index = nullptr) const {
+        generate_canonical_moves(board_.board(), packed, raw, generation_index);
     }
 
     // C9. The same, for a worker driving its own board.
     static void generate_canonical(const SearchBoard &source, std::vector<std::uint16_t> &packed,
-                                   std::vector<std::uint16_t> &raw) {
-        generate_canonical_moves(source.board(), packed, raw);
+                                   std::vector<std::uint16_t> &raw,
+                                   std::vector<std::uint16_t> *generation_index = nullptr) {
+        generate_canonical_moves(source.board(), packed, raw, generation_index);
     }
 
     // Look the current position up in the dump, or fail by name.
@@ -2220,7 +2313,8 @@ private:
     void expand_root() {
         std::vector<std::uint16_t> packed;
         std::vector<std::uint16_t> raw;
-        generate_canonical(packed, raw);
+        std::vector<std::uint16_t> generation;
+        generate_canonical(packed, raw, &generation);
         if (packed.empty()) {
             // The reference answers this with `bestmove 0000` — `expand()`
             // returns having set is_expanded on an empty children dict, and
@@ -2235,8 +2329,6 @@ private:
         }
         const LeafDiag diag{&root_parsed_, board_.halfmove_clock(),
                             static_cast<int>(board_.board().fullMoveNumber()), nullptr, 0};
-        const ReplayDump::Entry &entry =
-            lookup(EvalRow(root_parsed_).key(), /*at_root=*/true, diag);
 
         // C8. A PROMOTED root can arrive already marked terminal — that is what
         // C6's claimable draws are for: `draw_by_rule` marks the node and leaves
@@ -2257,8 +2349,37 @@ private:
             ++reuse_.terminal_marks_cleared;
         }
 
-        expand(root_, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
-               "golden   ", diag, stats_);
+        // C10. THE ROOT GOES DOWN THE SAME PATH AS EVERY OTHER NODE, and that is
+        // the whole of the softmax unification.
+        //
+        // The reference does not: `_expand_root` runs its own unbatched forward
+        // and hands `expand()` a CUDA tensor, so the root's softmax reduces on
+        // the GPU while `BatchedEvaluator`'s bulk `.cpu()` puts every interior
+        // node's on the CPU. Those disagree by up to 1.9e-9 across 6 of 37
+        // priors — enough to flip a best move at 200 sims once the root position
+        // recurs as an interior node, which a middlegame reaches in four plies.
+        // The replay path below preserves that split faithfully, keyed
+        // (nn_key, is_root), because Gate 1 is a bit-exactness claim about the
+        // reference as it is.
+        //
+        // Production is not allowed both answers. `evaluate_and_expand` is the
+        // one evaluation path, and the root now uses it — including the cache,
+        // which the reference's root deliberately avoided ONLY because the two
+        // tables must never meet. With one table there is nothing to keep apart:
+        // a root cache hit is bit-identical to the fresh evaluation it replaces.
+        // See DECISIONS.md, C10, for the divergence and its measured size.
+        NetworkValue root_value(0.0);
+        if (evaluator_ != nullptr) {
+            const EvalRow row(root_parsed_);
+            root_value = evaluate_and_expand(root_, row, packed, raw, generation, diag,
+                                             cache_hit_, stats_);
+        } else {
+            const ReplayDump::Entry &entry =
+                lookup(EvalRow(root_parsed_).key(), /*at_root=*/true, diag);
+            expand(root_, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
+                   "golden   ", diag, stats_);
+            root_value = NetworkValue(entry.value);
+        }
         // ASSIGNED, not accumulated. `_expand_root` writes `root.visit_count = 1`
         // and `root.value_sum = ...`, and until C8 the distinction could not be
         // observed: a fresh root came out of the arena cleared, so += and = were
@@ -2268,7 +2389,7 @@ private:
         // claiming the root had been searched 400 times when the reference says
         // once.
         arena_.set_visits(root_, 1);
-        arena_.set_value(root_, mover_value(NetworkValue(entry.value), root_parsed_.white_to_move));
+        arena_.set_value(root_, mover_value(root_value, root_parsed_.white_to_move));
         root_expanded_ = true;
     }
 
@@ -2558,7 +2679,7 @@ private:
         // be a second opportunity for the two to disagree about the position.
         std::vector<std::uint16_t> &packed = d.packed;
         std::vector<std::uint16_t> &raw = d.raw;
-        generate_canonical(*d.board, packed, raw);
+        generate_canonical(*d.board, packed, raw, &d.generation);
 
         const TerminalReason reason =
             outcome_of(parsed, d.board->in_check(), packed.size(), d.board->halfmove_clock(),
@@ -2582,7 +2703,7 @@ private:
         const EvalRow row(parsed);
         const LeafDiag diag = diag_of(d, parsed);
         const NetworkValue nn_value =
-            evaluate_and_expand(node, row, packed, raw, diag, cache_hit_, *d.stats);
+            evaluate_and_expand(node, row, packed, raw, d.generation, diag, cache_hit_, *d.stats);
 
         // === Mode 2: the tablebase value override ===
         //
@@ -2645,6 +2766,7 @@ private:
     NetworkValue evaluate_and_expand(std::uint32_t node, const EvalRow &row,
                                      const std::vector<std::uint16_t> &packed,
                                      const std::vector<std::uint16_t> &raw,
+                                     const std::vector<std::uint16_t> &generation,
                                      const LeafDiag &diag, CachedEval &scratch,
                                      SearchStats &stats) {
         if (cache_.has_value() && cache_->probe(row.key(), scratch)) {
@@ -2655,6 +2777,25 @@ private:
         }
         if (cache_.has_value()) {
             ++stats.cache_misses;
+        }
+
+        // C10. THE LIVE PATH, and it is the only one that reaches the network.
+        //
+        // This is the SERIAL entry — `search()`, and `expand_root()` through it —
+        // so the batch is one row wide. The parallel dispatcher does not come
+        // through here: it has a whole batch to send and calls
+        // `expand_from_live_row` directly after one crossing for all of them,
+        // which is the "ONE GIL acquisition per batch" the boundary exists for.
+        //
+        // The dump is not consulted at all when an evaluator is installed. That
+        // is deliberate and it is the softmax unification (scope §2.5): the
+        // reference has two answers for one position depending on whether it is
+        // the root, and production has one. See DECISIONS.md, C10.
+        if (evaluator_ != nullptr) {
+            std::memcpy(evaluator_->token_row(0), row.tokens(),
+                        sizeof(std::int32_t) * static_cast<std::size_t>(kSeqLength));
+            note_eval_timing(evaluator_->run(1), 1);
+            return expand_from_live_row(node, row.key(), 0, packed, raw, generation, diag, stats);
         }
 
         // C9. A leaf the SERIAL reference never reached, on a run that is
@@ -2704,6 +2845,78 @@ private:
             ++stats.cache_inserts;
         }
         return nn_value;
+    }
+
+    // C10. Turn one evaluated row into this node's children.
+    //
+    // The gather reads ~26-38 entries out of a 4096-wide bf16 row and never
+    // materialises the rest (scope §2.1); the softmax runs in the order
+    // chess-library GENERATED the moves and the probabilities are permuted into
+    // canonical order afterwards, never before (scope §2.6). Both are
+    // `gather_softmax_canonical`'s job — see cpp/evaluator.hpp for why they are
+    // two separate statements.
+    //
+    // `live_priors_` and `live_scratch_` are members rather than locals because
+    // this runs once per expansion; after the first few leaves they have grown
+    // to the widest move list the search will see and never allocate again.
+    // Single-threaded by construction: the dispatcher is the only expander
+    // (scope §2.2), and in a serial search the caller is the only thread.
+    NetworkValue expand_from_live_row(std::uint32_t node, NNKey key, std::size_t eval_row,
+                                      const std::vector<std::uint16_t> &packed,
+                                      const std::vector<std::uint16_t> &raw,
+                                      const std::vector<std::uint16_t> &generation,
+                                      const LeafDiag &diag, SearchStats &stats) {
+        assert(evaluator_ != nullptr);
+        assert(generation.size() == packed.size());
+        if (generation.size() != packed.size()) {
+            throw std::logic_error(
+                "guofish: the live evaluator was handed a leaf whose generation-order index "
+                "does not match its move list. The two are filled together by "
+                "generate_canonical_moves and cannot disagree unless a caller passed the "
+                "wrong leaf's scratch.");
+        }
+
+        live_priors_.resize(packed.size());
+        gather_softmax_canonical(evaluator_->policy_row(eval_row), packed.data(),
+                                 generation.data(), packed.size(), live_scratch_,
+                                 live_priors_.data());
+        const NetworkValue value(static_cast<double>(evaluator_->value_at(eval_row)));
+
+        expand(node, packed.data(), live_priors_.data(), packed.size(), packed, raw,
+               "the live evaluator", "network  ", diag, stats);
+
+        // The NETWORK's value, before any tablebase override — the same
+        // discipline the replay path documents at its own insert, and for the
+        // same reason: a Syzygy WDL is a function of the halfmove clock and the
+        // cache key is not.
+        if (cache_.has_value()) {
+            assert(packed.size() <= kMaxLegalMoves);
+            cache_->insert(key, value, packed.data(), live_priors_.data(),
+                           static_cast<std::uint16_t>(packed.size()));
+            ++stats.cache_inserts;
+        }
+        return value;
+    }
+
+    // A search needs exactly one source of network answers, and starting without
+    // one is a configuration mistake worth naming rather than a tree of zeros.
+    void require_evaluation_source(const char *entry) const {
+        if (evaluator_ == nullptr && dump_.empty()) {
+            throw std::logic_error(std::string("guofish::ReplaySearch::") + entry +
+                                   ": no replay dump loaded and no live evaluator installed");
+        }
+    }
+
+    void note_eval_timing(const EvalTiming &timing, std::size_t rows) {
+        ++eval_stats_.batches;
+        eval_stats_.rows += static_cast<std::int64_t>(rows);
+        eval_stats_.acquire_wait_ns += timing.acquire_wait_ns;
+        eval_stats_.call_ns += timing.call_ns;
+        if (timing.acquire_wait_ns > eval_stats_.max_acquire_wait_ns) {
+            eval_stats_.max_acquire_wait_ns = timing.acquire_wait_ns;
+        }
+        eval_stats_.acquire_wait_ns_samples.push_back(timing.acquire_wait_ns);
+        eval_stats_.call_ns_samples.push_back(timing.call_ns);
     }
 
     // === Mode 2: the tablebase value override ===
@@ -3175,6 +3388,8 @@ private:
         int fullmove_number = 1;
         std::vector<std::uint16_t> packed;
         std::vector<std::uint16_t> raw;
+        // C10. See Descent::generation.
+        std::vector<std::uint16_t> generation;
         std::vector<std::uint32_t> applied;
         std::vector<std::uint16_t> path_moves;
         // Produced by one worker, released by the dispatcher: SPSC per slot, so
@@ -3612,7 +3827,7 @@ private:
         }
 
         // We hold `node` as PENDING; nothing else can expand or mark it.
-        generate_canonical(*d.board, d.packed, d.raw);
+        generate_canonical(*d.board, d.packed, d.raw, &d.generation);
 
         const TerminalReason reason =
             outcome_of(parsed, d.board->in_check(), d.packed.size(), d.board->halfmove_clock(),
@@ -3640,6 +3855,7 @@ private:
         item->fullmove_number = static_cast<int>(d.board->board().fullMoveNumber());
         item->packed = d.packed;
         item->raw = d.raw;
+        item->generation = d.generation;
         item->path_moves = d.path_moves;
         // MOVED, not copied: the descent must not repay what the dispatcher is
         // now responsible for, and a swap makes that structural rather than
@@ -3742,20 +3958,107 @@ private:
             }
         }
 
+        // C10. ONE BOUNDARY CROSSING FOR THE WHOLE BATCH, which is the entire
+        // reason the queue exists. Everything before the crossing is bookkeeping
+        // that decides which leaves need a row; everything after it is the same
+        // sequential expansion the replay path does.
+        if (evaluator_ != nullptr) {
+            prepare_live_batch();
+        }
+
         // SEQUENTIALLY, on this thread. Expansion is single-threaded by
         // construction (scope 2.2), which is what leaves `set_children` with one
         // caller per node and the arena's bump allocator with one writer.
-        for (LeafNode *item : batch_) {
-            expand_and_backup(*item);
+        for (std::size_t i = 0; i < batch_.size(); ++i) {
+            expand_and_backup(*batch_[i], i);
         }
     }
 
-    void expand_and_backup(LeafNode &item) {
+    // C10. Probe the cache for every leaf in the batch, hand the misses a row of
+    // the token buffer, and cross the boundary once.
+    //
+    // THE PROBE HAS TO HAPPEN BEFORE THE CROSSING, not inside the expansion loop
+    // where the replay path does it, because the batch's width is decided here:
+    // a leaf the cache can answer must not consume a row of the network's input.
+    // At the reference's measured 24.7% hit rate that is a quarter of every
+    // batch.
+    //
+    // The hit's payload is COPIED OUT rather than re-probed at expansion time.
+    // It has to be: the misses in this same batch insert as they expand, and an
+    // insert can evict the very slot an earlier leaf hit — the second probe
+    // would then miss on a leaf that has no row to fall back on. `live_hits_`
+    // costs a few dozen kilobytes that stop growing after the first batch.
+    //
+    // Leaves that transpose onto each other WITHIN one batch each take a row and
+    // each insert. Deduplicating them would save network rows, but it would also
+    // mean the first copy's insert decides what the second one expands from, and
+    // the two are bit-identical anyway. Counted honestly (both are misses) and
+    // left for C12 to measure rather than assumed to be worth fixing.
+    void prepare_live_batch() {
+        const std::size_t count = batch_.size();
+        if (count > evaluator_->max_batch()) {
+            throw std::logic_error(
+                "guofish: the dispatcher drained " + std::to_string(count) +
+                " leaves but the evaluator's buffers hold " +
+                std::to_string(evaluator_->max_batch()) +
+                ". ParallelConfig.max_batch must not exceed the evaluator's max_batch; "
+                "search_parallel checks this before starting any thread, so reaching here "
+                "means the evaluator was replaced mid-search.");
+        }
+
+        live_slot_.assign(count, kNoEvalRow);
+        live_keys_.clear();
+        live_keys_.reserve(count);
+        if (live_hits_.size() < count) {
+            live_hits_.resize(count);
+        }
+
+        std::size_t next_row = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const LeafNode &item = *batch_[i];
+            const EvalRow row(item.parsed);
+            live_keys_.push_back(row.key());
+
+            if (cache_.has_value() && cache_->probe(row.key(), live_hits_[i])) {
+                ++eval_stats_.cache_skipped;
+                continue;
+            }
+            std::memcpy(evaluator_->token_row(next_row), row.tokens(),
+                        sizeof(std::int32_t) * static_cast<std::size_t>(kSeqLength));
+            live_slot_[i] = next_row;
+            ++next_row;
+        }
+
+        if (next_row > 0) {
+            note_eval_timing(evaluator_->run(next_row), next_row);
+        }
+    }
+
+    void expand_and_backup(LeafNode &item, std::size_t index) {
         const LeafDiag diag{&item.parsed, item.halfmove_clock, item.fullmove_number,
                             item.path_moves.data(), item.path_moves.size()};
-        const EvalRow row(item.parsed);
-        const NetworkValue nn_value = evaluate_and_expand(item.node, row, item.packed, item.raw,
-                                                          diag, dispatch_cache_, dispatch_stats_);
+        NetworkValue nn_value(0.0);
+        if (evaluator_ != nullptr) {
+            const std::size_t slot = live_slot_[index];
+            if (slot == kNoEvalRow) {
+                ++dispatch_stats_.cache_hits;
+                CachedEval &hit = live_hits_[index];
+                expand(item.node, hit.moves.data(), hit.priors.data(), hit.moves.size(),
+                       item.packed, item.raw, "the transposition cache", "cache    ", diag,
+                       dispatch_stats_);
+                nn_value = hit.value;
+            } else {
+                if (cache_.has_value()) {
+                    ++dispatch_stats_.cache_misses;
+                }
+                nn_value = expand_from_live_row(item.node, live_keys_[index], slot, item.packed,
+                                                item.raw, item.generation, diag, dispatch_stats_);
+            }
+        } else {
+            const EvalRow row(item.parsed);
+            nn_value = evaluate_and_expand(item.node, row, item.packed, item.raw, item.generation,
+                                           diag, dispatch_cache_, dispatch_stats_);
+        }
         const double backup_value =
             apply_tablebase(nn_value, item.parsed, item.halfmove_clock, dispatch_stats_);
 
@@ -3851,6 +4154,23 @@ private:
     CachedEval cache_hit_;
     // Borrowed. nullptr is tablebases off, which is the shipping default.
     const TablebaseProber *tablebase_ = nullptr;
+
+    // C10. The live evaluator, borrowed. nullptr is the replay build, which is
+    // what every Gate 1 test runs and therefore the default.
+    BatchEvaluator *evaluator_ = nullptr;
+    EvalStats eval_stats_;
+    // Per-batch, reused. `live_slot_[i]` is the evaluator row leaf i was given,
+    // or kNoEvalRow if the cache answered it; `live_keys_[i]` is the key that
+    // probe used, kept so the insert cannot re-derive it (cpp/keys.hpp's rule);
+    // `live_hits_[i]` is the payload a hit copied out. See prepare_live_batch.
+    std::vector<std::size_t> live_slot_;
+    std::vector<NNKey> live_keys_;
+    std::vector<CachedEval> live_hits_;
+    // The gather's working set: `live_scratch_` holds the legal logits in
+    // GENERATION order across the softmax, `live_priors_` the probabilities in
+    // canonical order. One expander at a time, by construction.
+    std::vector<float> live_scratch_;
+    std::vector<float> live_priors_;
 
     // C9. The stand-in evaluator and its scratch. `synthetic_priors_` is only
     // ever touched on the thread that expands — the dispatcher in a parallel

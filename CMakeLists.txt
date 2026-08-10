@@ -267,6 +267,7 @@ pybind11_add_module(guofish_core
         cpp/bindings.cpp
         cpp/arena.hpp
         cpp/cache.hpp
+        cpp/evaluator.hpp
         cpp/fathom.hpp
         cpp/keys.hpp
         cpp/movegen.hpp
