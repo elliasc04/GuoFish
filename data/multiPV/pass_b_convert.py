@@ -51,17 +51,12 @@ from labels import (  # noqa: E402
     VALUE_SCALE, build_policy_target, select_policy_block, select_value_block,
     value_cp_is_mate, value_from_raw_cp, value_raw_cp,
 )
+from feasibility_scan import (  # noqa: E402
+    BUCKETS, MAX_PIECES, bucket_availability, bucket_name, coverage_ceiling,
+    derive_rates, plan_totals,
+)
 from pass_a_index import INDEX_DTYPE, iter_lines  # noqa: E402
 from record_format import RECORD_DTYPE, shard_name  # noqa: E402
-
-BUCKETS = [("<=5", 0, 5), ("6-14", 6, 14), ("15-27", 15, 27), (">=28", 28, 32)]
-
-
-def bucket_name(piece_count: int) -> str:
-    for name, lo, hi in BUCKETS:
-        if lo <= piece_count <= hi:
-            return name
-    return ">32"
 
 # ---------------------------------------------------------------- worker side
 
@@ -225,31 +220,135 @@ def convert_batch(task):
 
 # ------------------------------------------------------------------ main side
 
-def build_selection(index_path: Path, cfg: dict, seed: int) -> np.ndarray:
-    """Sorted array of line numbers to convert, stratified on piece count."""
+# Source-order diagnostic resolution. 1024 bins over ~395M index rows is ~386k
+# rows per bin, i.e. quantiles good to ~0.1% of the file - far finer than the
+# effect being looked for.
+_ORDER_BINS = 1024
+
+
+def _quantiles_from_hist(hist: np.ndarray, n_rows: int, qs) -> list[float]:
+    """Quantiles of a line-number distribution held as a fixed-width histogram.
+
+    Returns positions as FRACTIONS of the file, linearly interpolated inside the
+    containing bin. Exact enough at 1024 bins and costs no extra pass.
+    """
+    total = hist.sum()
+    if total == 0:
+        return [float("nan")] * len(qs)
+    cum = np.cumsum(hist)
+    width = n_rows / len(hist)
+    out = []
+    for q in qs:
+        want = q * total
+        b = int(np.searchsorted(cum, want, side="left"))
+        b = min(b, len(hist) - 1)
+        before = cum[b - 1] if b else 0
+        frac_in_bin = (want - before) / hist[b] if hist[b] else 0.0
+        out.append(((b + frac_in_bin) * width) / n_rows)
+    return out
+
+
+def build_selection(index_path: Path, cfg: dict, seed: int,
+                    diag: dict | None = None) -> np.ndarray:
+    """Sorted array of line numbers to convert.
+
+    Stratified on piece count, and within each bucket split again on whether the
+    row is policy-bearing (`policy_depth >= policy_min_depth`), so the two halves
+    can be sampled at different rates.
+
+    The SAME uniform draw `u` feeds both branches. Drawing twice would break both
+    reproducibility and the nesting property, because nesting rests on
+    `keep = eligible & bucket & (u < r)` growing monotonically in r against a
+    fixed u.
+
+    `diag`, if given, is filled with the nesting check against `cfg["prior"]`
+    and the source-order histograms behind the §7 quantile report - both are
+    free here because the masks already exist.
+    """
     ix = np.memmap(index_path, dtype=INDEX_DTYPE, mode="r")
     n = len(ix)
-    rates = cfg["bucket_rates"]
+    r_pol = cfg["bucket_rates_policy"]
+    r_val = cfg["bucket_rates_value_only"]
+    prior = cfg.get("prior")
     rng = np.random.default_rng(seed)
     chunks = []
     step = 20_000_000
+
+    order_hist = {k: np.zeros(_ORDER_BINS, dtype=np.int64) for k in
+                  ("eligible_policy", "eligible_value_only",
+                   "selected_policy", "selected_value_only")}
+    bin_width = n / _ORDER_BINS
+    prior_lost = 0
+
     for start in range(0, n, step):
         stop = min(start + step, n)
         pc = np.asarray(ix["piece_count"][start:stop])
         md = np.asarray(ix["max_depth"][start:stop])
-        eligible = (pc <= 32) & (md >= cfg["value_min_depth"])
+        pdp = np.asarray(ix["policy_depth"][start:stop])
+        eligible = (pc <= MAX_PIECES) & (md >= cfg["value_min_depth"])
+        has_pol = pdp >= cfg["policy_min_depth"]
         keep = np.zeros(stop - start, dtype=bool)
         u = rng.random(stop - start)
         for name, lo, hi in BUCKETS:
-            r = rates.get(name, 0.0)
-            if r <= 0:
-                continue
-            m = eligible & (pc >= lo) & (pc <= hi)
-            keep |= m & (u < r)
+            in_bucket = eligible & (pc >= lo) & (pc <= hi)
+            rp = r_pol.get(name, 0.0)
+            rv = r_val.get(name, 0.0)
+            if rp > 0:
+                keep |= (in_bucket & has_pol) & (u < rp)
+            if rv > 0:
+                keep |= (in_bucket & ~has_pol) & (u < rv)
+
+        if diag is not None:
+            # Nesting: the prior corpus used ONE rate per bucket over the same u
+            # and the same eligible mask, so any row it kept must survive here.
+            if prior is not None:
+                old_keep = np.zeros(stop - start, dtype=bool)
+                old_elig = (pc <= MAX_PIECES) & (md >= prior["value_min_depth"])
+                old_pol = pdp >= prior["policy_min_depth"]
+                for name, lo, hi in BUCKETS:
+                    ob = old_elig & (pc >= lo) & (pc <= hi)
+                    rp = prior["bucket_rates_policy"].get(name, 0.0)
+                    rv = prior["bucket_rates_value_only"].get(name, 0.0)
+                    if rp > 0:
+                        old_keep |= (ob & old_pol) & (u < rp)
+                    if rv > 0:
+                        old_keep |= (ob & ~old_pol) & (u < rv)
+                prior_lost += int((old_keep & ~keep).sum())
+                del old_keep, old_elig, old_pol
+
+            bins = np.minimum(((np.arange(start, stop) // bin_width)
+                               ).astype(np.int64), _ORDER_BINS - 1)
+            for key, m in (("eligible_policy", eligible & has_pol),
+                           ("eligible_value_only", eligible & ~has_pol),
+                           ("selected_policy", keep & has_pol),
+                           ("selected_value_only", keep & ~has_pol)):
+                order_hist[key] += np.bincount(bins[m], minlength=_ORDER_BINS)
+            del bins
+
         idx = np.nonzero(keep)[0]
         if len(idx):
             chunks.append(idx.astype(np.int64) + start)
-        del pc, md, eligible, keep, u
+        del pc, md, pdp, eligible, has_pol, keep, u
+
+    if diag is not None:
+        qs = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+        diag["source_order_quantiles"] = {
+            "quantiles": qs,
+            "unit": "fraction of source file by line number",
+            "populations": {k: _quantiles_from_hist(v, n, qs)
+                            for k, v in order_hist.items()},
+            "counts": {k: int(v.sum()) for k, v in order_hist.items()},
+        }
+        if prior is not None:
+            diag["nesting"] = {
+                "prior_value_min_depth": prior["value_min_depth"],
+                "prior_manifest": prior["manifest"],
+                "prior_bucket_rates_policy": prior["bucket_rates_policy"],
+                "prior_bucket_rates_value_only": prior["bucket_rates_value_only"],
+                "prior_rows_dropped": prior_lost,
+                "is_strict_superset": prior_lost == 0,
+            }
+
     return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
 
 
@@ -282,9 +381,9 @@ def main() -> int:
                     default=_HERE / "lichess_db_eval.jsonl.zst")
     ap.add_argument("--index", type=Path, default=_HERE / "index" / "pass_a_index.bin")
     ap.add_argument("--out-dir", type=Path,
-                    default=_PROJECT_ROOT / "data" / "processed" / "multipv")
+                    default=_PROJECT_ROOT / "data" / "processed" / "multipv_90m")
     ap.add_argument("--manifest", type=Path,
-                    default=_HERE / "manifests" / "dataset_manifest.json")
+                    default=_HERE / "manifests" / "dataset_manifest_90m.json")
 
     ap.add_argument("--value-scale", type=float, default=VALUE_SCALE,
                     help="tanh calibration constant; LOCKED at the default. "
@@ -298,11 +397,25 @@ def main() -> int:
     ap.add_argument("--val-permille", type=int, default=5,
                     help="sha1(fen) %% 1000 < N goes to val")
 
-    ap.add_argument("--target", type=int, default=30_000_000)
+    ap.add_argument("--target", type=int, default=91_355_000,
+                    help="PRE-rejection selection target. Scale it by the yield "
+                         "and val share of a previous manifest to land a given "
+                         "number of TRAIN records.")
     ap.add_argument("--shares", type=str,
                     default='{"<=5":0.01,"6-14":0.35,"15-27":0.40,">=28":0.24}')
-    ap.add_argument("--n-train-shards", type=int, default=64)
-    ap.add_argument("--n-val-shards", type=int, default=4)
+    ap.add_argument("--policy-share", type=float, default=0.65,
+                    help="fraction of each bucket drawn from policy-bearing "
+                         "rows. Clamps at the pool ceiling; see feasibility_scan.")
+    ap.add_argument("--no-spill", dest="spill", action="store_false",
+                    help="when one half's pool is exhausted, do NOT make it up "
+                         "from the other half - let the bucket under-deliver "
+                         "and the piece-count share targets slip instead.")
+    ap.add_argument("--n-train-shards", type=int, default=192)
+    ap.add_argument("--n-val-shards", type=int, default=12)
+    ap.add_argument("--nest-under", type=Path,
+                    default=_HERE / "manifests" / "dataset_manifest.json",
+                    help="manifest of a corpus this build must remain a strict "
+                         "superset of. Empty path disables the check.")
 
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1))
     ap.add_argument("--batch-lines", type=int, default=2000)
@@ -324,19 +437,29 @@ def main() -> int:
 
     shares = json.loads(args.shares)
 
-    # --- derive per-bucket rates from the index ---
-    ix = np.memmap(args.index, dtype=INDEX_DTYPE, mode="r")
-    pc_all = np.asarray(ix["piece_count"])
-    md_all = np.asarray(ix["max_depth"])
-    eligible = (pc_all <= 32) & (md_all >= args.value_min_depth)
-    avail = {}
-    for name, lo, hi in BUCKETS:
-        avail[name] = int((eligible & (pc_all >= lo) & (pc_all <= hi)).sum())
-    rates = {}
-    for name, _, _ in BUCKETS:
-        want = args.target * shares.get(name, 0.0)
-        rates[name] = min(want / avail[name], 1.0) if avail[name] else 0.0
-    del pc_all, md_all, eligible, ix
+    # --- derive per-bucket rates from the index -----------------------------
+    # Availability and rate derivation both come from feasibility_scan, which is
+    # also what the pre-flight report runs, so the two cannot disagree.
+    print("scanning index for per-bucket availability...", file=sys.stderr)
+    avail_full = bucket_availability(args.index, args.value_min_depth,
+                                     args.policy_min_depth)
+    avail = {k: v["eligible"] for k, v in avail_full.items()}
+    r_pol, r_val, plan = derive_rates(avail_full, args.target, shares,
+                                      args.policy_share, spill=args.spill)
+    plan_tot = plan_totals(plan)
+    ceiling = coverage_ceiling(avail_full, args.target, shares)
+
+    prior = None
+    if str(args.nest_under) and args.nest_under.exists():
+        pm = json.loads(args.nest_under.read_text())
+        # A single-rate manifest is just the two-rate form with both equal.
+        p_pol = pm.get("bucket_sampling_rates_policy") or pm["bucket_sampling_rates"]
+        p_val = pm.get("bucket_sampling_rates_value_only") or pm["bucket_sampling_rates"]
+        prior = {"manifest": str(args.nest_under),
+                 "value_min_depth": pm["value_min_depth"],
+                 "policy_min_depth": pm["policy_min_depth"],
+                 "bucket_rates_policy": p_pol,
+                 "bucket_rates_value_only": p_val}
 
     cfg = dict(
         value_min_depth=args.value_min_depth,
@@ -349,14 +472,37 @@ def main() -> int:
         n_train_shards=args.n_train_shards,
         n_val_shards=args.n_val_shards,
         shard_seed=args.seed,
-        bucket_rates=rates,
+        bucket_rates_policy=r_pol,
+        bucket_rates_value_only=r_val,
+        prior=prior,
     )
 
-    print("per-bucket sampling rates:", json.dumps(rates, indent=2), file=sys.stderr)
-    print("building selection from index...", file=sys.stderr)
+    print(f"\npolicy_share {args.policy_share:.2f} -> expected coverage "
+          f"{plan_tot['expected_coverage']:.2%} (pool ceiling {ceiling:.2%})",
+          file=sys.stderr)
+    print(f"  {'bucket':<8} {'r_policy':>10} {'r_value':>10} {'expected':>12} "
+          f"{'share':>8} {'cov':>8}  clamped", file=sys.stderr)
+    for name, _, _ in BUCKETS:
+        d = plan[name]
+        cl = ",".join(k for k, f in (("policy", d["policy_clamped"]),
+                                     ("value-only", d["value_only_clamped"])) if f)
+        print(f"  {name:<8} {r_pol[name]:>10.4f} {r_val[name]:>10.4f} "
+              f"{d['expected_total']:>12,.0f} {d['expected_share']:>7.2%} "
+              f"{d['expected_coverage']:>7.2%}  {cl or '-'}", file=sys.stderr)
+    if plan_tot["shortfall"] > 0:
+        print(f"  WARNING: expected shortfall {plan_tot['shortfall']:,.0f} rows",
+              file=sys.stderr)
+
+    print("\nbuilding selection from index...", file=sys.stderr)
     t0 = time.time()
-    selected = build_selection(args.index, cfg, args.seed)
+    diag: dict = {}
+    selected = build_selection(args.index, cfg, args.seed, diag=diag)
     print(f"selected {len(selected):,} lines in {time.time()-t0:.1f}s", file=sys.stderr)
+    nest = diag.get("nesting")
+    if nest is not None:
+        print(f"nesting vs {prior['manifest']}: "
+              f"{'STRICT SUPERSET' if nest['is_strict_superset'] else 'BROKEN'} "
+              f"({nest['prior_rows_dropped']:,} prior rows dropped)", file=sys.stderr)
 
     n_shards = args.n_train_shards + args.n_val_shards
     ckpt_path = args.out_dir / "pass_b_checkpoint.json"
@@ -505,8 +651,23 @@ def main() -> int:
         "seed": args.seed,
         "target": args.target,
         "target_shares": shares,
+        "policy_share": args.policy_share,
+        "policy_share_spill": bool(args.spill),
+        "policy_coverage_ceiling": ceiling,
         "bucket_available": avail,
-        "bucket_sampling_rates": rates,
+        "bucket_available_split": avail_full,
+        "bucket_sampling_rates_policy": r_pol,
+        "bucket_sampling_rates_value_only": r_val,
+        "selection_plan": plan,
+        "selection_plan_totals": plan_tot,
+        "realised_policy_coverage": (
+            sum(stats.get(f"bucket_{nm}_policy", 0) for nm, _, _ in BUCKETS)
+            / accepted if accepted else 0.0),
+        "nesting": diag.get("nesting", {
+            "is_strict_superset": None,
+            "reason": "no --nest-under manifest given",
+        }),
+        "source_order_quantiles": diag.get("source_order_quantiles", {}),
         "selected_lines": int(len(selected)),
         "record_dtype": [[n, str(RECORD_DTYPE.fields[n][0])] for n in RECORD_DTYPE.names],
         "record_size_bytes": RECORD_DTYPE.itemsize,
@@ -540,10 +701,29 @@ def main() -> int:
             "It is NOT fitted to this corpus and deliberately so: MCTS Q backup "
             "and the tuned C_PUCT / VALUE_LOSS are denominated in these units. "
             "~11.5% of cp values saturate above |v|=0.99; accepted.",
-            "post_selection_piece_histogram.policy_coverage: policy coverage is "
-            "roughly flat across buckets (Pass A predicted 43/37/42% for "
-            "6-14 / 15-27 / >=28), i.e. NOT opening-skewed, so no preferential "
-            "sampling of policy-bearing positions was applied.",
+            "post_selection_piece_histogram.policy_coverage: NATURAL policy "
+            "coverage is roughly flat across piece-count buckets (Pass A "
+            "predicts 43/37/42% for 6-14 / 15-27 / >=28), so policy coverage "
+            "and piece count are close to independent. This build DOES "
+            "preferentially sample policy-bearing rows - see policy_share - but "
+            "because the two are independent, that oversampling needs no "
+            "piece-count-stratified correction: the split is applied WITHIN "
+            "each bucket, so target_shares are unaffected. The coverage numbers "
+            "here are therefore post-oversampling and are NOT the natural rate.",
+            "policy_share is a request, not a guarantee: "
+            "policy_coverage_ceiling is the highest coverage the pool can give "
+            "at this target and share vector, and a bucket whose policy pool "
+            "runs out has its deficit made up from its value-only pool (see "
+            "policy_share_spill and selection_plan[*].spilled_to_value_only). "
+            "That keeps target_shares exact and lets coverage give instead.",
+            "source_order_quantiles: policy coverage varies ~4x along SOURCE "
+            "ORDER (dead end D5 - source order is not exchangeable), so heavy "
+            "policy oversampling can pull the selected set toward whichever "
+            "region of the dump is policy-dense, which correlates with a "
+            "different Stockfish-version mix. Compare selected_policy against "
+            "eligible_policy: if the selected quantiles are tighter, the policy "
+            "labels are drawn from a narrower slice of the file than the value "
+            "labels and are correspondingly more homogeneous in provenance.",
             "value_strata: report value metrics against these three groups, not "
             "in aggregate. A head collapsing toward 0 scores well on the "
             "exact-zero mass by doing nothing; also track prediction std.",
@@ -569,10 +749,28 @@ def main() -> int:
               f"{d['with_policy']:>12,} {d['policy_coverage']:>7.2%}",
           file=sys.stderr)
 
+    realised_cov = manifest["realised_policy_coverage"]
+    print(f"\npolicy coverage: requested {args.policy_share:.2%}, "
+          f"realised {realised_cov:.2%}, pool ceiling {ceiling:.2%}",
+          file=sys.stderr)
+
     print("\nvalue strata (report metrics against these, not in aggregate):",
           file=sys.stderr)
     for k, d in value_strata.items():
         print(f"  {k:<18} {d['count']:>12,} {d['share']:>7.2%}", file=sys.stderr)
+
+    soq = diag.get("source_order_quantiles")
+    if soq:
+        print("\nsource-order quantiles (fraction of file; selected vs eligible).",
+              file=sys.stderr)
+        print("A tighter selected spread than eligible means those labels come "
+              "from a narrower\nslice of the dump - i.e. a narrower SF-version "
+              "mix. Watch the policy rows.", file=sys.stderr)
+        hdr = "  ".join(f"q{int(q*100):02d}" for q in soq["quantiles"])
+        print(f"  {'population':<22} {'count':>12}  {hdr}", file=sys.stderr)
+        for k, vals in soq["populations"].items():
+            cells = "  ".join(f"{v:.3f}" for v in vals)
+            print(f"  {k:<22} {soq['counts'][k]:>12,}  {cells}", file=sys.stderr)
 
     print("\nrejections:", file=sys.stderr)
     for k, v in sorted(stats.items()):

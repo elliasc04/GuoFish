@@ -1,0 +1,552 @@
+{
+  "index": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\data\\multiPV\\index\\pass_a_index.bin",
+  "index_rows": 394669566,
+  "target": 91355000,
+  "target_shares": {
+    "<=5": 0.01,
+    "6-14": 0.35,
+    "15-27": 0.4,
+    ">=28": 0.24
+  },
+  "grid": {
+    "24": {
+      "18": {
+        "<=5": {
+          "eligible": 11196915,
+          "policy": 5440428,
+          "value_only": 5756487
+        },
+        "6-14": {
+          "eligible": 55875998,
+          "policy": 24292117,
+          "value_only": 31583881
+        },
+        "15-27": {
+          "eligible": 98387603,
+          "policy": 38348197,
+          "value_only": 60039406
+        },
+        ">=28": {
+          "eligible": 37969584,
+          "policy": 16548631,
+          "value_only": 21420953
+        }
+      },
+      "20": {
+        "<=5": {
+          "eligible": 11196915,
+          "policy": 5437576,
+          "value_only": 5759339
+        },
+        "6-14": {
+          "eligible": 55875998,
+          "policy": 24211833,
+          "value_only": 31664165
+        },
+        "15-27": {
+          "eligible": 98387603,
+          "policy": 37815698,
+          "value_only": 60571905
+        },
+        ">=28": {
+          "eligible": 37969584,
+          "policy": 16148206,
+          "value_only": 21821378
+        }
+      },
+      "22": {
+        "<=5": {
+          "eligible": 11196915,
+          "policy": 5380384,
+          "value_only": 5816531
+        },
+        "6-14": {
+          "eligible": 55875998,
+          "policy": 23659151,
+          "value_only": 32216847
+        },
+        "15-27": {
+          "eligible": 98387603,
+          "policy": 35059859,
+          "value_only": 63327744
+        },
+        ">=28": {
+          "eligible": 37969584,
+          "policy": 14159088,
+          "value_only": 23810496
+        }
+      }
+    },
+    "26": {
+      "18": {
+        "<=5": {
+          "eligible": 10771845,
+          "policy": 5196146,
+          "value_only": 5575699
+        },
+        "6-14": {
+          "eligible": 48503578,
+          "policy": 20791254,
+          "value_only": 27712324
+        },
+        "15-27": {
+          "eligible": 68370224,
+          "policy": 25377767,
+          "value_only": 42992457
+        },
+        ">=28": {
+          "eligible": 23128100,
+          "policy": 10019565,
+          "value_only": 13108535
+        }
+      },
+      "20": {
+        "<=5": {
+          "eligible": 10771845,
+          "policy": 5193528,
+          "value_only": 5578317
+        },
+        "6-14": {
+          "eligible": 48503578,
+          "policy": 20728798,
+          "value_only": 27774780
+        },
+        "15-27": {
+          "eligible": 68370224,
+          "policy": 25009155,
+          "value_only": 43361069
+        },
+        ">=28": {
+          "eligible": 23128100,
+          "policy": 9760936,
+          "value_only": 13367164
+        }
+      },
+      "22": {
+        "<=5": {
+          "eligible": 10771845,
+          "policy": 5140801,
+          "value_only": 5631044
+        },
+        "6-14": {
+          "eligible": 48503578,
+          "policy": 20281110,
+          "value_only": 28222468
+        },
+        "15-27": {
+          "eligible": 68370224,
+          "policy": 23023138,
+          "value_only": 45347086
+        },
+        ">=28": {
+          "eligible": 23128100,
+          "policy": 8426234,
+          "value_only": 14701866
+        }
+      }
+    },
+    "28": {
+      "18": {
+        "<=5": {
+          "eligible": 10344893,
+          "policy": 4944219,
+          "value_only": 5400674
+        },
+        "6-14": {
+          "eligible": 42672870,
+          "policy": 18058822,
+          "value_only": 24614048
+        },
+        "15-27": {
+          "eligible": 48430833,
+          "policy": 17729852,
+          "value_only": 30700981
+        },
+        ">=28": {
+          "eligible": 13410393,
+          "policy": 6023715,
+          "value_only": 7386678
+        }
+      },
+      "20": {
+        "<=5": {
+          "eligible": 10344893,
+          "policy": 4941815,
+          "value_only": 5403078
+        },
+        "6-14": {
+          "eligible": 42672870,
+          "policy": 18010433,
+          "value_only": 24662437
+        },
+        "15-27": {
+          "eligible": 48430833,
+          "policy": 17489161,
+          "value_only": 30941672
+        },
+        ">=28": {
+          "eligible": 13410393,
+          "policy": 5874538,
+          "value_only": 7535855
+        }
+      },
+      "22": {
+        "<=5": {
+          "eligible": 10344893,
+          "policy": 4892848,
+          "value_only": 5452045
+        },
+        "6-14": {
+          "eligible": 42672870,
+          "policy": 17649953,
+          "value_only": 25022917
+        },
+        "15-27": {
+          "eligible": 48430833,
+          "policy": 16139758,
+          "value_only": 32291075
+        },
+        ">=28": {
+          "eligible": 13410393,
+          "policy": 5075988,
+          "value_only": 8334405
+        }
+      }
+    },
+    "30": {
+      "18": {
+        "<=5": {
+          "eligible": 9868053,
+          "policy": 4661689,
+          "value_only": 5206364
+        },
+        "6-14": {
+          "eligible": 37609832,
+          "policy": 15679531,
+          "value_only": 21930301
+        },
+        "15-27": {
+          "eligible": 35139851,
+          "policy": 13016503,
+          "value_only": 22123348
+        },
+        ">=28": {
+          "eligible": 7281750,
+          "policy": 3523105,
+          "value_only": 3758645
+        }
+      },
+      "20": {
+        "<=5": {
+          "eligible": 9868053,
+          "policy": 4659492,
+          "value_only": 5208561
+        },
+        "6-14": {
+          "eligible": 37609832,
+          "policy": 15641779,
+          "value_only": 21968053
+        },
+        "15-27": {
+          "eligible": 35139851,
+          "policy": 12865602,
+          "value_only": 22274249
+        },
+        ">=28": {
+          "eligible": 7281750,
+          "policy": 3447489,
+          "value_only": 3834261
+        }
+      },
+      "22": {
+        "<=5": {
+          "eligible": 9868053,
+          "policy": 4614054,
+          "value_only": 5253999
+        },
+        "6-14": {
+          "eligible": 37609832,
+          "policy": 15351850,
+          "value_only": 22257982
+        },
+        "15-27": {
+          "eligible": 35139851,
+          "policy": 11994817,
+          "value_only": 23145034
+        },
+        ">=28": {
+          "eligible": 7281750,
+          "policy": 3033928,
+          "value_only": 4247822
+        }
+      }
+    }
+  },
+  "reachable": {
+    "24": true,
+    "26": true,
+    "28": false,
+    "30": false
+  },
+  "policy_share_sweep": {
+    "24": {
+      "ceiling": 0.8517934322149855,
+      "points": {
+        "0.4": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 36542000.0,
+          "expected_coverage": 0.4,
+          "shortfall": 0.0
+        },
+        "0.5": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 45677500.0,
+          "expected_coverage": 0.5,
+          "shortfall": 0.0
+        },
+        "0.55": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 50245250.0,
+          "expected_coverage": 0.55,
+          "shortfall": 0.0
+        },
+        "0.6": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 54813000.0,
+          "expected_coverage": 0.6,
+          "shortfall": 0.0
+        },
+        "0.65": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 59380750.0,
+          "expected_coverage": 0.65,
+          "shortfall": 0.0
+        },
+        "0.7": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 63948499.99999999,
+          "expected_coverage": 0.7,
+          "shortfall": 0.0
+        }
+      }
+    },
+    "26": {
+      "ceiling": 0.6175079524930217,
+      "points": {
+        "0.4": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 36542000.0,
+          "expected_coverage": 0.4,
+          "shortfall": 0.0
+        },
+        "0.5": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 44475836.0,
+          "expected_coverage": 0.4868462153138854,
+          "shortfall": 0.0
+        },
+        "0.55": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 47947326.0,
+          "expected_coverage": 0.5248462153138854,
+          "shortfall": 0.0
+        },
+        "0.6": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 51418816.0,
+          "expected_coverage": 0.5628462153138853,
+          "shortfall": 0.0
+        },
+        "0.65": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 54835841.5,
+          "expected_coverage": 0.600250030102348,
+          "shortfall": 0.0
+        },
+        "0.7": {
+          "expected_selected": 91355000.0,
+          "expected_policy": 56138374.0,
+          "expected_coverage": 0.6145079524930217,
+          "shortfall": 0.0
+        }
+      }
+    },
+    "28": {
+      "ceiling": 0.46289400689617427,
+      "points": {
+        "0.4": {
+          "expected_selected": 82840193.0,
+          "expected_policy": 33646458.0,
+          "expected_coverage": 0.406161028620491,
+          "shortfall": 8514807.0
+        },
+        "0.5": {
+          "expected_selected": 82840193.0,
+          "expected_policy": 39807599.0,
+          "expected_coverage": 0.4805348413420524,
+          "shortfall": 8514807.0
+        },
+        "0.55": {
+          "expected_selected": 82840193.0,
+          "expected_policy": 41451989.0,
+          "expected_coverage": 0.5003849882387406,
+          "shortfall": 8514807.0
+        },
+        "0.6": {
+          "expected_selected": 82840193.0,
+          "expected_policy": 41922262.0,
+          "expected_coverage": 0.5060618581610499,
+          "shortfall": 8514807.0
+        },
+        "0.65": {
+          "expected_selected": 82840193.0,
+          "expected_policy": 41967939.5,
+          "expected_coverage": 0.5066132511304023,
+          "shortfall": 8514807.0
+        },
+        "0.7": {
+          "expected_selected": 82840193.0,
+          "expected_policy": 42013617.0,
+          "expected_coverage": 0.5071646440997548,
+          "shortfall": 8514807.0
+        }
+      }
+    },
+    "30": {
+      "ceiling": 0.3597878605440315,
+      "points": {
+        "0.4": {
+          "expected_selected": 75309401.0,
+          "expected_policy": 29468211.0,
+          "expected_coverage": 0.39129525143879446,
+          "shortfall": 16045599.0
+        },
+        "0.5": {
+          "expected_selected": 75309401.0,
+          "expected_policy": 32411645.0,
+          "expected_coverage": 0.43037980079007665,
+          "shortfall": 16045599.0
+        },
+        "0.55": {
+          "expected_selected": 75309401.0,
+          "expected_policy": 32457322.5,
+          "expected_coverage": 0.43098633197202035,
+          "shortfall": 16045599.0
+        },
+        "0.6": {
+          "expected_selected": 75309401.0,
+          "expected_policy": 32503000.0,
+          "expected_coverage": 0.431592863153964,
+          "shortfall": 16045599.0
+        },
+        "0.65": {
+          "expected_selected": 75309401.0,
+          "expected_policy": 32548677.5,
+          "expected_coverage": 0.4321993943359077,
+          "shortfall": 16045599.0
+        },
+        "0.7": {
+          "expected_selected": 75309401.0,
+          "expected_policy": 32594355.0,
+          "expected_coverage": 0.43280592551785135,
+          "shortfall": 16045599.0
+        }
+      }
+    }
+  },
+  "recommended": {
+    "value_min_depth": 26,
+    "policy_min_depth": 20,
+    "policy_share": 0.65,
+    "r_policy": {
+      "<=5": 0.11433605441233782,
+      "6-14": 1.0,
+      "15-27": 0.9497442036726151,
+      ">=28": 1.0
+    },
+    "r_value_only": {
+      "<=5": 0.05731881139060401,
+      "6-14": 0.4048799666460003,
+      "15-27": 0.29495813398880916,
+      ">=28": 0.9100108295222532
+    },
+    "plan": {
+      "<=5": {
+        "available_policy": 5193528,
+        "available_value_only": 5578317,
+        "want_total": 913550.0,
+        "want_policy": 593807.5,
+        "want_value_only": 319742.5,
+        "expected_policy": 593807.5,
+        "expected_value_only": 319742.5,
+        "expected_total": 913550.0,
+        "expected_share": 0.01,
+        "expected_coverage": 0.65,
+        "shortfall": 0.0,
+        "policy_clamped": false,
+        "value_only_clamped": false,
+        "spilled_to_value_only": 0.0,
+        "spilled_to_policy": 0.0
+      },
+      "6-14": {
+        "available_policy": 20728798,
+        "available_value_only": 27774780,
+        "want_total": 31974249.999999996,
+        "want_policy": 20783262.5,
+        "want_value_only": 11190987.499999996,
+        "expected_policy": 20728798.0,
+        "expected_value_only": 11245451.999999996,
+        "expected_total": 31974249.999999996,
+        "expected_share": 0.35,
+        "expected_coverage": 0.6482966136813217,
+        "shortfall": 0.0,
+        "policy_clamped": true,
+        "value_only_clamped": false,
+        "spilled_to_value_only": 54464.5,
+        "spilled_to_policy": 0.0
+      },
+      "15-27": {
+        "available_policy": 25009155,
+        "available_value_only": 43361069,
+        "want_total": 36542000.0,
+        "want_policy": 23752300.0,
+        "want_value_only": 12789700.0,
+        "expected_policy": 23752300.0,
+        "expected_value_only": 12789700.0,
+        "expected_total": 36542000.0,
+        "expected_share": 0.4,
+        "expected_coverage": 0.65,
+        "shortfall": 0.0,
+        "policy_clamped": false,
+        "value_only_clamped": false,
+        "spilled_to_value_only": 0.0,
+        "spilled_to_policy": 0.0
+      },
+      ">=28": {
+        "available_policy": 9760936,
+        "available_value_only": 13367164,
+        "want_total": 21925200.0,
+        "want_policy": 14251380.0,
+        "want_value_only": 7673820.0,
+        "expected_policy": 9760936.0,
+        "expected_value_only": 12164264.0,
+        "expected_total": 21925200.0,
+        "expected_share": 0.24,
+        "expected_coverage": 0.4451925638078558,
+        "shortfall": 0.0,
+        "policy_clamped": true,
+        "value_only_clamped": false,
+        "spilled_to_value_only": 4490444.0,
+        "spilled_to_policy": 0.0
+      }
+    },
+    "totals": {
+      "expected_selected": 91355000.0,
+      "expected_policy": 54835841.5,
+      "expected_coverage": 0.600250030102348,
+      "shortfall": 0.0
+    },
+    "coverage_ceiling": 0.6175079524930217,
+    "nesting_preserved": true
+  }
+}
