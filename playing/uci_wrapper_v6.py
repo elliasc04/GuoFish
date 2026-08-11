@@ -24,10 +24,28 @@ came to be running at a virtual loss its own logs never mentioned.
 A rejected value is logged on stderr and DROPPED, leaving the previous value in
 place, exactly as v5 did — but here the rejection is loud, names the reason, and
 the surviving value is re-printed in the next configuration log, so the two can
-be reconciled after the fact. `PolicyTemperature` and `DirichletEpsilon` are
-advertised and refused at anything but their identity value: the C++ core
-implements neither and C11 may not change it. See
+be reconciled after the fact. `DirichletEpsilon` is advertised and refused at
+anything but 0.0: the C++ arena stores one prior per child and preserves no
+untouched network distribution for noise to be derived from. See
 `playv6.UNSUPPORTED_IN_CORE`.
+
+`PolicyTemperature` WAS in that set until C11b and is now a real knob — the
+search core divides the logits by it at the root and at every interior node.
+Changing it rebuilds the search, which drops the tree AND the transposition
+cache, because both hold priors materialised at the old temperature.
+
+THE BOOK AND SYZYGY OPTIONS (C11b)
+==================================
+`UseBook`, `BookPath`, `BookSeed`, `UseSyzygy` and `SyzygyPath`. Both features
+default ON. None of the five is a `SearchConfig` field, so none rebuilds the
+search or costs the tree; what they do is reopen a reader, which happens here at
+the `setoption` that caused it rather than at the next `isready`.
+
+A book or tablebase move BYPASSES MCTS. The engine says so on every such move —
+`info depth 0 string book e2e4`, an `info string source=...` with the running
+per-game tally, and a `[game] decided N moves: ...` line on `ucinewgame` — so a
+benchmark that accidentally left the book on reports it in its own output
+instead of quietly shifting the ELO.
 
 FLOATS ARE `type string`
 ========================
@@ -176,6 +194,15 @@ OPTIONS: tuple[Option, ...] = (
     Option("PonderDecay", "ponder_decay", "string", float),
     Option("VerifyCompaction", "verify_compaction", "check", _parse_bool),
 
+    # C11b. Both features default ON — see playv6's module docstring for why,
+    # and for the telemetry that keeps a bypassed move from silently
+    # contaminating a benchmark.
+    Option("UseBook", "use_book", "check", _parse_bool),
+    Option("BookPath", "book_path", "string", _parse_optional_path),
+    Option("BookSeed", "book_seed", "spin", int, "min 0 max 2147483647"),
+    Option("UseSyzygy", "use_syzygy", "check", _parse_bool),
+    Option("SyzygyPath", "syzygy_path", "string", _parse_optional_path),
+
     Option("DefaultSims", "default_sims", "spin", int, "min 1 max 100000000"),
     Option("SimCap", "sim_cap", "spin", int, "min 1 max 100000000"),
     Option("FixedSims", "fixed_sims", "spin", _parse_optional_int,
@@ -188,6 +215,20 @@ OPTIONS: tuple[Option, ...] = (
 )
 
 _BY_LOWER_NAME = {option.name.lower(): option for option in OPTIONS}
+
+# C11b. Options that reopen a READER rather than rebuilding the SearchConfig.
+#
+# None of these is a `SearchConfig` field, so `Engine.reconfigure` does nothing
+# for them and the tree survives — which is right: changing which book is open
+# does not invalidate a single prior in the tree. What it does invalidate is the
+# open file handle, so it is reopened here, at the command that caused it,
+# rather than at the next `isready` where a failure would have no cause
+# attached.
+#
+# Split by reader so a `BookSeed` change does not make Fathom re-read 290 table
+# headers to answer a question about a random number generator.
+_BOOK_OPTIONS = frozenset({"use_book", "book_path", "book_seed"})
+_SYZYGY_OPTIONS = frozenset({"use_syzygy", "syzygy_path"})
 
 
 def missing_options() -> set[str]:
@@ -363,6 +404,15 @@ class UCIEngine:
 
         self.config = updated
         self.engine.reconfigure(updated)
+        # C11b. Reopen the affected reader, but only once the engine is loaded:
+        # before `isready` there is nothing to reopen and `ensure_ready` will
+        # open it from the final config anyway, which is the whole reason the
+        # readers are opened there rather than in `Engine.__init__`.
+        if self.engine.ready:
+            if option.attr in _BOOK_OPTIONS:
+                self.engine.reopen_book()
+            elif option.attr in _SYZYGY_OPTIONS:
+                self.engine.reopen_syzygy()
         err(f"[setoption] {option.name}: {_format_option_value(previous)} -> "
             f"{_format_option_value(value)}")
 
@@ -402,6 +452,17 @@ class UCIEngine:
     # --- position ---------------------------------------------------------
 
     def handle_ucinewgame(self) -> None:
+        # C11b. The game that is ENDING is reported before its counters are
+        # reset, because this is the last moment they exist. A run whose book
+        # was on by accident says so here, in its own log, per game.
+        if self.engine.ready:
+            counts = self.engine.decision_counts
+            total = sum(counts.get(s, 0) for s in ("search", "book", "tablebase"))
+            if total:
+                err(f"[game] decided {total} moves: search={counts.get('search', 0)} "
+                    f"book={counts.get('book', 0)} "
+                    f"tablebase={counts.get('tablebase', 0)}  "
+                    f"[{self.engine.book_state}] [{self.engine.syzygy_state}]")
         self.board = chess.Board()
         self._base_fen = chess.STARTING_FEN
         self._moves = []
@@ -636,6 +697,23 @@ class UCIEngine:
         if not final and now - self._last_info < INFO_INTERVAL_S:
             return
         self._last_info = now
+
+        if outcome.bypassed:
+            # C11b. A bypassed move has no search to describe: no depth, no
+            # nodes, no score the engine computed. Emitting the ordinary line
+            # with zeros would tell a GUI the engine searched and found nothing,
+            # which is a different and false statement. `depth 0` plus a string
+            # naming the source is v5's convention and what a log parser can
+            # filter on.
+            counts = self.engine.decision_counts
+            log(f"info depth 0 string {outcome.source} {outcome.best_move}")
+            log(f"info string source={outcome.source} delivered=0 "
+                f"bypass=true "
+                f"game_counts search={counts.get('search', 0)} "
+                f"book={counts.get('book', 0)} "
+                f"tablebase={counts.get('tablebase', 0)}")
+            return
+
         parts = [
             f"info depth {max(1, outcome.depth)}",
             f"seldepth {max(1, outcome.max_depth)}",
@@ -658,13 +736,18 @@ class UCIEngine:
                            else str(int(outcome.nominal_sims_per_s)))
             inflation = ("n/a" if outcome.inflation is None
                          else f"{outcome.inflation:.2f}")
-            log(f"info string delivered={outcome.delivered} "
+            counts = self.engine.decision_counts
+            log(f"info string source={outcome.source} "
+                f"delivered={outcome.delivered} "
                 f"nominal={nominal} inherited={outcome.inherited} "
                 f"delivered_nps={int(outcome.sims_per_s)} "
                 f"nominal_nps={nominal_nps} "
                 f"inflation={inflation} "
                 f"budget_source={outcome.budget_source} "
-                f"reason={outcome.reason}")
+                f"reason={outcome.reason} "
+                f"game_counts search={counts.get('search', 0)} "
+                f"book={counts.get('book', 0)} "
+                f"tablebase={counts.get('tablebase', 0)}")
 
     def _emit_bestmove(self, outcome: SearchOutcome) -> None:
         """Emit the move, and mirror it to stderr.

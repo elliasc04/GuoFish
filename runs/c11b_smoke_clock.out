@@ -1,0 +1,65 @@
+﻿running: C:\Users\Ethan Guo\Github\GuoFish\cutechess-1.4.0-win64\cutechess-cli.exe -engine name=guofish-v6 cmd=python arg=-u arg=playing/uci_wrapper_v6.py ... (55 tokens)
+log: benchmarking\engine\games\c11b_smoke_clock\20260810-223413\cutechess.log
+Finished game 1 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 1 - 0 - 0  [1.000] 1
+Finished game 2 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 2 - 0 - 0  [1.000] 2
+Finished game 3 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 3 - 0 - 0  [1.000] 3
+Finished game 4 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 4 - 0 - 0  [1.000] 4
+Finished game 5 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 5 - 0 - 0  [1.000] 5
+Finished game 6 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 6 - 0 - 0  [1.000] 6
+Finished game 7 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 7 - 0 - 0  [1.000] 7
+Finished game 8 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 8 - 0 - 0  [1.000] 8
+Finished game 9 (guofish-v6 vs stockfish): 1-0 {White mates}
+Score of guofish-v6 vs stockfish: 9 - 0 - 0  [1.000] 9
+Finished game 10 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 10 - 0 - 0  [1.000] 10
+Finished game 11 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 11 - 0 - 0  [1.000] 11
+Finished game 12 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 12 - 0 - 0  [1.000] 12
+Finished game 13 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 13 - 0 - 0  [1.000] 13
+Finished game 14 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 14 - 0 - 0  [1.000] 14
+Finished game 15 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 15 - 0 - 0  [1.000] 15
+Finished game 16 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 16 - 0 - 0  [1.000] 16
+Finished game 17 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 17 - 0 - 0  [1.000] 17
+Finished game 18 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 18 - 0 - 0  [1.000] 18
+Finished game 19 (guofish-v6 vs stockfish): 1-0 {White wins by adjudication}
+Score of guofish-v6 vs stockfish: 19 - 0 - 0  [1.000] 19
+Finished game 20 (stockfish vs guofish-v6): 0-1 {Black wins by adjudication}
+Score of guofish-v6 vs stockfish: 20 - 0 - 0  [1.000] 20
+cutechess exited 0
+
+verifying
+  [PASS] the engine's stderr was captured — benchmarking\engine\games\c11b_smoke_clock\20260810-223413\guofish.stderr.log
+  [PASS] 20 games completed — 20 finished
+  [PASS] zero illegal moves (cutechess)
+  [PASS] zero null bestmoves
+  [PASS] the engine mirrored its bestmoves to stderr — 463 move(s) recorded
+  [PASS] zero engine crashes / stalls
+  [PASS] zero Python tracebacks in the engine's output — 0 traceback(s)
+  [PASS] zero timeouts
+  [PASS] every PGN game replays legally under python-chess — 20 games, 0 with an illegal move
+  [PASS] no abnormal PGN termination
+  [PASS] the engine logged delivered-sims telemetry during the match — 445 move telemetry line(s)
+  [PASS] the engine logged its resolved configuration during the match — 495 config line(s)
+  [PASS] the resolved book/Syzygy state was recorded — book=open C:\Users\Ethan Guo\Github\GuoFish\assets\gm2001.bin [highest-weight entry (deterministic)] seed=0 (deterministic: highest-weight entry) | syzygy=open C:\Users\Ethan Guo\Github\GuoFish\assets\syzygy [largest table 5 men (mode 1 root bypass + mode 2 leaf overrides)] | decisions: search=409 book=17 tablebase=0
+  [INFO] decisions: search=409 book=17 tablebase=0 (17/426 moves bypassed MCTS)
+
+verdict -> benchmarking\engine\games\c11b_smoke_clock\20260810-223413\verdict.json
+  book=open C:\Users\Ethan Guo\Github\GuoFish\assets\gm2001.bin [highest-weight entry (deterministic)] seed=0 (deterministic: highest-weight entry)
+  syzygy=open C:\Users\Ethan Guo\Github\GuoFish\assets\syzygy [largest table 5 men (mode 1 root bypass + mode 2 leaf overrides)]
+  decisions: search=409 book=17 tablebase=0
+13/13 checks passed

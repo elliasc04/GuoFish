@@ -615,8 +615,20 @@ def main() -> int:
         return 1
 
     model, device = live_evaluator.load_default_model()
+    # C11b. See tools/bench_provenance.py: every artifact records the resolved
+    # book/Syzygy state, and "not applicable" is a resolved state. This harness
+    # drives guofish_core directly, so no number below can contain a
+    # zero-simulation bypassed move.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import bench_provenance
+    feature_state = bench_provenance.not_applicable(
+        "this harness drives guofish_core directly; no opening book or "
+        "tablebase is ever opened and no move can bypass MCTS")
+
     log(f"platform : {platform.system()} {platform.machine()}  {platform.platform()}")
     log(f"build    : {build['compiler']}, asan={build['asan']} asserts={build['asserts']}")
+    for line in bench_provenance.require_recorded_state(feature_state):
+        log(f"bypass   : {line}")
     log(f"device   : {torch.cuda.get_device_name(0)}, torch {torch.__version__}")
 
     evaluator = live_evaluator.TorchEvaluator(model, device, args.max_batch,

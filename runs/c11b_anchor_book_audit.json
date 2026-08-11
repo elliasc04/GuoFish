@@ -1,0 +1,86 @@
+{
+ "pgn": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\benchmarking\\engine\\games\\v5\\guofishv5_10.9M_2ksims_2600sf_fixednodes.pgn",
+ "book": "C:\\Users\\Ethan Guo\\Github\\GuoFish\\assets\\gm2001.bin",
+ "engine": "Guofish5-10.9M",
+ "opening_plies_skipped": 16,
+ "games": 200,
+ "engine_moves_examined": 9555,
+ "moves_in_book": 10,
+ "moves_matching_the_top_weighted_entry": 10,
+ "agreement": 0.0010465724751439038,
+ "top_entry_agreement": 0.0010465724751439038,
+ "book_runs": [
+  3,
+  2,
+  1,
+  1,
+  1,
+  1,
+  1
+ ],
+ "longest_run": 3,
+ "share_in_runs_of_3_or_more": 0.0003139717425431711,
+ "by_offset": {
+  "0": {
+   "n": 200,
+   "hits": 5,
+   "rate": 0.025
+  },
+  "1": {
+   "n": 200,
+   "hits": 1,
+   "rate": 0.005
+  },
+  "2": {
+   "n": 200,
+   "hits": 2,
+   "rate": 0.01
+  },
+  "3": {
+   "n": 200,
+   "hits": 2,
+   "rate": 0.01
+  },
+  "4": {
+   "n": 200,
+   "hits": 0,
+   "rate": 0.0
+  },
+  "5": {
+   "n": 200,
+   "hits": 0,
+   "rate": 0.0
+  },
+  "6": {
+   "n": 200,
+   "hits": 0,
+   "rate": 0.0
+  },
+  "7": {
+   "n": 200,
+   "hits": 0,
+   "rate": 0.0
+  },
+  "8": {
+   "n": 200,
+   "hits": 0,
+   "rate": 0.0
+  },
+  "9": {
+   "n": 200,
+   "hits": 0,
+   "rate": 0.0
+  },
+  "10": {
+   "n": 199,
+   "hits": 0,
+   "rate": 0.0
+  },
+  "11": {
+   "n": 198,
+   "hits": 0,
+   "rate": 0.0
+  }
+ },
+ "verdict": "THE BOOK DID NOT MATERIALLY AFFECT THIS ANCHOR: 0.10% of the engine's moves past the opening cutoff appear in the book at all, and 0.03% sit in a run of three or more. At this level the agreement is what two strong move-choosers produce by coincidence, and gm2001.bin's coverage has evidently run out inside the Cutechess-supplied opening. Gate 5 is therefore comparable to this anchor whether the book is on or off \u2014 but run it ON with BookSeed=0, which is both the v5 default and the reproducible setting."
+}

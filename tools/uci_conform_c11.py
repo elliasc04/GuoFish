@@ -18,9 +18,21 @@ WHAT EACH CHECK IS FOR
                   CPuctFactor, then assert both appear in the configuration the
                   engine logs to stderr on `isready`. This is the check that
                   fails on v5 by construction — v5 logs no configuration at all.
-  refusals        PolicyTemperature and DirichletEpsilon are advertised and are
-                  REFUSED at anything but their identity value, loudly, with the
-                  previous value surviving. A silent accept is the defect.
+  temperature     C11b. PolicyTemperature 0.8 is ACCEPTED, reaches the resolved
+                  configuration, and rebuilds the search — dropping the tree AND
+                  the cache, both of which hold priors materialised at the old
+                  temperature. This check was the opposite one until C11b
+                  implemented the knob.
+  refusals        DirichletEpsilon is advertised and REFUSED at anything but
+                  0.0, loudly, with the previous value surviving; so is
+                  PolicyTemperature 0, which would be a division by zero. A
+                  silent accept is the defect.
+  bypass          C11b, in a SECOND engine process with the shipping defaults
+                  ON. The book and Syzygy states are in the config header; a
+                  book move is announced, reports zero delivered simulations and
+                  carries the per-game tally; `UseBook false` is honoured and the
+                  same position is then searched. The main run above deliberately
+                  disables both — see `run`.
   isready-load    `isready` before anything else answers `readyok` (and pays the
                   model load), then answers again in under a second.
   position/go     `position startpos moves ...` then `go nodes N` returns a
@@ -224,7 +236,30 @@ class Competitor:
 
 def run(engine_path: Path, extra_args: list[str], *, go_timeout: float,
         load_timeout: float, rounds: int, keep_log: Path | None = None) -> Report:
+    """The protocol checks, run with the BOOK AND SYZYGY OFF.
+
+    C11b defaults both ON, and that is right for deployment and wrong here. Half
+    the checks below are statements about the SEARCH — that the reported `nodes`
+    is delivered simulations and not the budget, that a reused root does less
+    work, that the inflation ratio is finite and above 1. A book move bypasses
+    MCTS and delivers zero simulations, and the opening this script drives
+    (`OPENING`, a Ruy Lopez) is exactly the kind of line an opening book covers
+    to a dozen plies. With the book on, those checks would be measuring the
+    book.
+
+    So this run disables both and `run_bypass_checks` turns them on in a second
+    process to test the bypass on its own terms. That split IS the measurement
+    discipline C11b requires, applied to C11b's own harness: a run that mixes
+    bypassed moves into a search measurement has to say so, and the cleanest way
+    to say so is not to mix them.
+
+    A caller who passes their own `--book-path`/`--syzygy-path`/`--no-book`
+    arguments overrides this, because then they have said what they want.
+    """
     report = Report()
+    if not any(a.startswith(("--book", "--no-book", "--syzygy", "--no-syzygy"))
+               for a in extra_args):
+        extra_args = ["--no-book", "--no-syzygy", *extra_args]
     engine = EngineProcess(engine_path, extra_args)
 
     try:
@@ -244,7 +279,10 @@ def run(engine_path: Path, extra_args: list[str], *, go_timeout: float,
         for required in ("VirtualLoss", "CPuctFactor", "PolicyTemperature",
                          "Threads", "MaxOutstanding", "MaxBatch", "CacheEntries",
                          "CPuctInit", "CPuctBase", "FPURoot", "FPUTree",
-                         "MaxTreeDepth"):
+                         "MaxTreeDepth",
+                         # C11b's five.
+                         "UseBook", "BookPath", "BookSeed", "UseSyzygy",
+                         "SyzygyPath"):
             report.check(f"option {required} advertised", required in names)
 
         # --- option echo (C11's stated validation) ------------------------
@@ -263,10 +301,42 @@ def run(engine_path: Path, extra_args: list[str], *, go_timeout: float,
                      f"c_puct_factor={PROBE_C_PUCT_FACTOR}" in text,
                      "searched for 'c_puct_factor=1.23'")
 
+        # --- temperature: accepted, then restored (C11b) -------------------
+        #
+        # This section used to live under "refusals" and asserted that
+        # `PolicyTemperature 0.8` was REFUSED, because the C++ core had no
+        # temperature. C11b implemented it, so the check is now the opposite
+        # one: the value must travel to the resolved configuration, and the
+        # stderr must say the search was rebuilt — because a temperature change
+        # invalidates every prior in the tree AND in the transposition cache.
+        print("temperature", flush=True)
+        before = len(engine.stderr_lines)
+        engine.send("setoption name PolicyTemperature value 0.8")
+        engine.send("isready")
+        engine.read_until(lambda l: l.strip() == "readyok", timeout=load_timeout)
+        time.sleep(0.3)
+        temp_text = "\n".join(engine.stderr_lines[before:])
+        report.check("PolicyTemperature 0.8 is accepted",
+                     "REFUSED" not in temp_text or "PolicyTemperature" not in temp_text,
+                     "C11b implements it; refusing it now would be the "
+                     "mirror-image defect")
+        report.check("PolicyTemperature 0.8 reaches the resolved config",
+                     "policy_temperature=0.8" in temp_text,
+                     "searched for 'policy_temperature=0.8'")
+        report.check("a temperature change rebuilds the search "
+                     "(tree AND cache dropped)",
+                     "rebuilding the search" in temp_text
+                     and "TRANSPOSITION CACHE" in temp_text)
+        engine.send("setoption name PolicyTemperature value 1.0")
+        engine.send("isready")
+        engine.read_until(lambda l: l.strip() == "readyok", timeout=load_timeout)
+
         # --- refusals -----------------------------------------------------
         print("refusals", flush=True)
         before = len(engine.stderr_lines)
-        engine.send("setoption name PolicyTemperature value 0.8")
+        # 0 is still refused, and for a sharper reason than "unimplemented":
+        # the temperature DIVIDES the logits.
+        engine.send("setoption name PolicyTemperature value 0")
         engine.send("setoption name DirichletEpsilon value 0.25")
         engine.send("setoption name VirtualLoss value not-a-number")
         engine.send("setoption name NoSuchOption value 3")
@@ -274,7 +344,7 @@ def run(engine_path: Path, extra_args: list[str], *, go_timeout: float,
         engine.read_until(lambda l: l.strip() == "readyok", timeout=load_timeout)
         time.sleep(0.3)
         new_text = "\n".join(engine.stderr_lines[before:])
-        report.check("PolicyTemperature 0.8 refused loudly",
+        report.check("PolicyTemperature 0 refused loudly (it divides the logits)",
                      "REFUSED" in new_text and "PolicyTemperature" in new_text)
         report.check("DirichletEpsilon 0.25 refused loudly",
                      "REFUSED" in new_text and "DirichletEpsilon" in new_text)
@@ -288,6 +358,35 @@ def run(engine_path: Path, extra_args: list[str], *, go_timeout: float,
                      and f"virtual_loss={PROBE_VIRTUAL_LOSS} " in new_text,
                      "the post-refusal config log still shows the identity "
                      "values and the surviving VirtualLoss")
+
+        # --- the resolved book/Syzygy state is in the log (C11b) -----------
+        #
+        # This run has both features OFF (see `run`'s docstring), and the point
+        # of the check is that the log says so RATHER THAN saying nothing. The
+        # convention C11b requires is that the resolved state is always present,
+        # so that a benchmark artifact cannot be produced without it; a run with
+        # the features off has to demonstrate the same convention as a run with
+        # them on.
+        #
+        # TWO PLACES, AND THEY HAVE DIFFERENT GUARANTEES. The one-line `as_kv()`
+        # record is emitted on EVERY `isready`, so `use_book=`/`use_syzygy=` must
+        # be in the lines this section just produced. The grouped human-readable
+        # block is emitted only when the configuration CHANGED — a GUI sends
+        # `isready` before every move and eleven identical lines per move is 660
+        # lines for two games — so it is checked against the whole transcript
+        # rather than against this section's slice.
+        all_text = engine.stderr_text()
+        report.check("every isready records the resolved book state",
+                     "use_book=" in new_text and "book_seed=" in new_text,
+                     "the one-line as_kv() record, which is emitted every time")
+        report.check("every isready records the resolved Syzygy state",
+                     "use_syzygy=" in new_text and "syzygy_path=" in new_text)
+        report.check("the grouped config block names the resolved book path",
+                     "[config] book" in all_text
+                     and str(REPO_ROOT / "assets") in all_text,
+                     "emitted on change only, so checked over the whole run")
+        report.check("the grouped config block names the resolved Syzygy path",
+                     "[config] syzygy" in all_text)
 
         # --- isready is fast once loaded ----------------------------------
         started = time.perf_counter()
@@ -485,6 +584,107 @@ def run(engine_path: Path, extra_args: list[str], *, go_timeout: float,
     return report
 
 
+def run_bypass_checks(engine_path: Path, extra_args: list[str], *,
+                      go_timeout: float, load_timeout: float,
+                      keep_log: Path | None = None) -> Report:
+    """C11b's bypass, in a second process with the shipping defaults ON.
+
+    Everything here is about ATTRIBUTION rather than about chess. A book move is
+    a move this port and the Python reference would both play, by construction,
+    so the only thing that keeps it from silently diluting a strength or
+    throughput measurement is that the engine SAYS it took one — on the move, in
+    the per-game tally, and in the configuration header. These are the checks
+    that the saying happens.
+    """
+    report = Report()
+    engine = EngineProcess(engine_path, extra_args)
+    try:
+        print("bypass (defaults ON)", flush=True)
+        engine.send("uci")
+        engine.read_until(lambda l: l.strip() == "uciok", timeout=60.0)
+        engine.send("isready")
+        engine.read_until(lambda l: l.strip() == "readyok", timeout=load_timeout)
+        time.sleep(0.3)
+        text = engine.stderr_text()
+
+        report.check("book and Syzygy default ON",
+                     "use_book=true" in text and "use_syzygy=true" in text,
+                     "the resolved config log, not the dataclass default")
+        report.check("BookSeed defaults to the deterministic 0",
+                     "book_seed=0" in text and "DETERMINISTIC" in text)
+        report.check("the book reader opened or said why not",
+                     "[book] opened" in text or "[book] WARNING" in text)
+        report.check("the Syzygy reader opened or said why not",
+                     "[syzygy] opened" in text or "[syzygy] WARNING" in text)
+
+        book_open = "[book] opened" in text
+        engine.send("ucinewgame")
+        engine.send("position startpos")
+        engine.send("go nodes 400")
+        lines = engine.read_until(is_bestmove, timeout=go_timeout)
+        strings = info_strings(lines)
+        move = bestmove_of(lines)
+        board = chess.Board()
+        report.check("the start position answers a legal move",
+                     chess.Move.from_uci(move) in board.legal_moves, move)
+
+        if book_open:
+            report.check("a book move is announced as one",
+                         any("string book " in s for s in strings)
+                         or any("source=book" in s for s in strings),
+                         f"info strings: {strings[:3]}")
+            report.check("a book move reports zero delivered simulations",
+                         any("delivered=0" in s for s in strings),
+                         f"info strings: {strings[:3]}")
+            report.check("a book move carries the per-game tally",
+                         any("game_counts" in s and "book=1" in s for s in strings),
+                         f"info strings: {strings[:3]}")
+            # And the tally is reported when the game ends.
+            before = len(engine.stderr_lines)
+            engine.send("ucinewgame")
+            engine.send("isready")
+            engine.read_until(lambda l: l.strip() == "readyok", timeout=load_timeout)
+            time.sleep(0.3)
+            ended = "\n".join(engine.stderr_lines[before:])
+            report.check("ucinewgame reports the finished game's decision counts",
+                         "[game] decided" in ended and "book=" in ended,
+                         ended.splitlines()[:2])
+        else:
+            report.check("book checks skipped: no book file", True,
+                         "assets/gm2001.bin is absent; the engine warned and "
+                         "disabled it, which is the required behaviour")
+
+        # Turning the book off must be honoured, and must show in the log.
+        before = len(engine.stderr_lines)
+        engine.send("setoption name UseBook value false")
+        engine.send("isready")
+        engine.read_until(lambda l: l.strip() == "readyok", timeout=load_timeout)
+        time.sleep(0.3)
+        off_text = "\n".join(engine.stderr_lines[before:])
+        report.check("UseBook false is accepted and logged",
+                     "use_book=false" in off_text)
+
+        engine.send("position startpos")
+        engine.send("go nodes 400")
+        lines = engine.read_until(is_bestmove, timeout=go_timeout)
+        nodes = info_nodes(lines)
+        report.check("with the book off, the start position is SEARCHED",
+                     bool(nodes) and max(nodes) > 0,
+                     f"info nodes: {nodes[:5]}")
+
+        code = engine.close(grace=20.0)
+        report.check("quit exits cleanly (bypass run)", code == 0,
+                     f"exit code {code}")
+    finally:
+        if engine.proc.poll() is None:
+            engine.proc.kill()
+        if keep_log is not None:
+            keep_log.parent.mkdir(parents=True, exist_ok=True)
+            keep_log.write_text(engine.stderr_text(), encoding="utf-8", newline="\n")
+            print(f"bypass engine stderr -> {keep_log}", flush=True)
+    return report
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -499,12 +699,24 @@ def main(argv=None) -> int:
     parser.add_argument("--keep-log", type=Path, default=None,
                         help="write the engine's stderr here")
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument("--skip-bypass", action="store_true",
+                        help="skip the C11b book/Syzygy section, which starts a "
+                             "second engine process with the shipping defaults ON")
     args = parser.parse_args(argv)
 
     print(f"engine: {args.engine} {' '.join(args.engine_arg)}", flush=True)
     report = run(args.engine, args.engine_arg, go_timeout=args.go_timeout,
                  load_timeout=args.load_timeout, rounds=args.rounds,
                  keep_log=args.keep_log)
+
+    if not args.skip_bypass:
+        bypass_log = (args.keep_log.with_suffix(".bypass" + args.keep_log.suffix)
+                      if args.keep_log else None)
+        bypass = run_bypass_checks(args.engine, args.engine_arg,
+                                   go_timeout=args.go_timeout,
+                                   load_timeout=args.load_timeout,
+                                   keep_log=bypass_log)
+        report.rows.extend(bypass.rows)
 
     passed = len(report.rows) - len(report.failures)
     print(f"\n{passed}/{len(report.rows)} checks passed", flush=True)

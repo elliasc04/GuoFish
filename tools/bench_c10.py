@@ -252,9 +252,23 @@ def main() -> int:
 
     model, device = live_evaluator.load_default_model()
 
+    # C11b. The resolved book/Syzygy state, in the header, before any table.
+    # "Not applicable" is a resolved state and is the strongest version of the
+    # line: this harness drives guofish_core directly, never constructs an
+    # EngineConfig, and could not take a bypass if one were offered — so no
+    # number below can contain a zero-simulation move. A reader of BENCH.md
+    # should not have to infer that from the tool's name.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import bench_provenance
+    feature_state = bench_provenance.not_applicable(
+        "this harness drives guofish_core directly; no opening book or "
+        "tablebase is ever opened and no move can bypass MCTS")
+
     print(f"platform : {platform.system()} {platform.machine()}")
     print(f"build    : {build['compiler']}, asan={build['asan']} ubsan={build['ubsan']} "
           f"asserts={build['asserts']}")
+    for line in bench_provenance.require_recorded_state(feature_state):
+        print(f"bypass   : {line}")
     print(f"device   : {torch.cuda.get_device_name(0)}, torch {torch.__version__}")
     print(f"position : {args.fen}")
     print(f"budget   : {args.sims} simulations, W={args.workers} K={args.in_flight} "

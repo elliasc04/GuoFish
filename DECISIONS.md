@@ -6022,3 +6022,574 @@ Whole-suite figures on Windows: 1,341 passed, 49 skipped, 1 failed in 445 s. The
   Stockfish at `UCI_Elo=1800`, which says the wrapper works and says nothing
   about strength: the anchor is weak, the sample is tiny, and it was chosen so
   the games would last rather than to measure anything.
+
+---
+
+# C11b — Policy temperature, opening book, Syzygy wiring (2026-08-10)
+
+## `policy_temperature` is implemented; Dirichlet noise is not, and that has a price
+
+C11 refused both, correctly, for want of a mandate to change the C++ search core.
+C11b carries that mandate and spends it on one of the two.
+
+`SearchConfig::policy_temperature` divides the logits inside
+`gather_softmax_canonical`. Dirichlet noise stays in `UNSUPPORTED_IN_CORE` and
+stays refused at anything but 0.0, for the reason C11 gave rather than for want
+of permission: the arena stores **one prior per child** and nothing preserves the
+untouched network distribution that the reference's C3b fix requires noise to be
+derived from. Mixing noise into the stored priors would compound on every reused
+root — the exact defect C3b fixed over there. Adding a `base_prior` field to the
+arena is a chunk of its own.
+
+**The consequence, stated so it is not discovered later: the C++ engine cannot
+generate self-play training data.** Play strength, benchmarking and tournament
+use are unaffected; training-data generation runs on the Python reference until
+that chunk happens. Nothing currently planned needs it.
+
+## The temperature DIVIDES, and that is a cross-platform decision rather than a style one
+
+`scratch[i] /= temperature`, not `scratch[i] *= inv_t`.
+
+C10a established that every Gate 2 cell reproduces bit-for-bit on MSVC 19.51 and
+Clang 18.1.3, down to per-row `exact` counts. A precomputed reciprocal inserts a
+rounding step: `x * fl(1/T)` and `fl(x/T)` differ in the last ulp for most
+`(x, T)`, and whether a compiler contracts, vectorises or reassociates around
+that is not a property this project wants to depend on. One division per logit —
+26-38 per expansion, against a batch that has just crossed a GPU boundary — is
+not a cost worth that.
+
+## `policy_temperature` is a `float` in a struct of `double`s, deliberately
+
+The reference divides a float32 tensor by a Python float, and torch's
+weak-scalar rule performs that division **in float32**. A `double` field here
+would promote each logit, divide in double and round the result back to float —
+deterministic, but a different number, and Gate 2 would then be measuring a
+function the reference does not compute.
+
+## T = 1.0 skips the divide, so the default path is the same INSTRUCTIONS
+
+Division by 1.0f is exact in IEEE-754, so the guard in
+`apply_policy_temperature` buys no accuracy. What it buys is the ability to say
+that the temperature-absent path and the T = 1.0 path are identical code rather
+than merely identical answers — which is what keeps Gate 1, Gate 2's recorded
+distributions, the frozen `POLICY_TEMPERATURE = 1.0` configuration and the C10b
+graph benchmarks valid without re-running any of them.
+
+Asserted anyway, over all 15,036 priors, on raw bit patterns:
+`test_t_equals_one_is_bit_identical_to_the_temperature_absent_path`. Confirmed
+empirically: re-running `tests/test_c10_gate2.py` after the change reproduces
+C10's figures exactly, including the per-column `exact` counts (5,315 / 4,291 /
+5,262) and the 2.682e-07 maximum.
+
+## The temperature is applied in ONE place, and that is requirement 3
+
+`expand_from_live_row` is the only live expansion path in the process. The
+dispatcher calls it directly after a batch crossing; the serial descent reaches
+it through `evaluate_and_expand`; and the **root** reaches it through
+`evaluate_and_expand` too, because C10 unified the root onto the interior path.
+So the temperature is threaded into that one call and there is nowhere a second
+sharpness could come from.
+
+This matters more than it looks. The reference softmaxes the root on the GPU and
+every interior node on the CPU — two answers for one position, 1.9e-9 apart
+across 6 of 37 priors, enough to flip a best move at 200 sims once the root
+position recurs four plies down. C10 measured it and unified it away. A
+temperature threaded into the interior path alone would have re-created exactly
+that inconsistency under a new name and at a magnitude thousands of times
+larger. `test_the_root_is_expanded_at_the_configured_temperature` asserts the
+root's stored priors are bit-identical to `gather_softmax` at the configured T,
+and `test_the_root_and_the_interior_are_sharpened_identically` expands one
+position both ways and compares bit patterns.
+
+## Clear-on-change drops the TREE as well as the cache, and the tree is the half that gets missed
+
+The cache is the obvious half — it is visibly full of post-softmax prior
+vectors. The **arena** holds one prior per child, materialised at expansion time,
+and it is the half that survives a move. A `setoption name PolicyTemperature`
+between moves without `ucinewgame` — the ordinary Cutechess sequence — would
+otherwise leave a retained tree serving children sharpened at the old T while
+every fresh expansion used the new one: one tree, two temperatures, nothing
+saying so.
+
+The mechanism is that `policy_temperature` is in `_SEARCH_CONFIG_FIELDS`, so
+`Engine.reconfigure` constructs a new `ReplaySearchQ32` — whose arena and whose
+cache are both new. A `clear_cache()` call would have flushed the visible half
+and left the other. Measured in
+`test_changing_the_temperature_drops_both_the_tree_and_the_cache`: 9,147 nodes
+and 378 cache entries before, 0 and 0 after.
+
+## Two paths refuse a temperature rather than ignoring it
+
+The equivalence build (`GUOFISH_VALUE_SUM=double`) throws at construction, per
+requirement 5. Gate 1 replays priors from a T = 1.0 reference dump; those priors
+are already post-softmax, so a temperature set there would not reach them and
+would not change one node of the tree. The run would pass while claiming to have
+been sharpened.
+
+The same reasoning is one build wider: ANY search with no live evaluator replays
+recorded priors, so `require_evaluation_source` refuses a non-identity
+temperature at search entry in every build. Checked once per search, not per
+node.
+
+## Gate 2 extension: all nine cells inside the bound, zero inversions
+
+`golden/c11b_gate2_temp.npz` is a **new** file rather than a regeneration of
+`golden/c10_gate2.npz`. The input does not change — temperature divides the
+logits and the logits are already in that file, bit-for-bit as the network
+produced them — so the generator reads them back and re-runs ATen at each T. No
+model is loaded and the network never runs twice, which leaves every figure C10
+and C10b recorded against the pinned original valid.
+
+The T = 1.0 columns are regenerated as a **self-check** and were verified
+bit-identical to `golden/c10_gate2.npz`'s three columns before anything was
+written. That is what makes the other six trustworthy: one function computes all
+three temperatures, and if it reproduces the reference exactly at the identity,
+the only thing that differs elsewhere is the divide.
+
+Maximum |C++ - ATen| per cell, MSVC Release:
+
+| T | vs cpu_pychess (interior) | vs gpu_pychess (root) | vs cpu_libchess (no permutation) | inversions | collapsed |
+|---|---|---|---|---|---|
+| 0.7 | 2.980e-07 | 2.980e-07 | 2.980e-07 | 0 | 0 |
+| 1.0 | 2.384e-07 | 2.384e-07 | 2.682e-07 | 0 | 0 |
+| 1.5 | 1.788e-07 | 1.192e-07 | 2.384e-07 | 0 | 0 |
+
+The worst cell anywhere is 2.980e-07, a factor of 3.4 inside the 1e-6 bound,
+with zero prior-ordering inversions and zero collapsed pairs in all nine, on
+both toolchains. The T = 1.0 row reproduces C10's recorded figures exactly,
+which is the identity claim above measured a second way.
+
+## The ~1/T error prediction is right in magnitude and wrong in shape
+
+The brief predicted the error scales as ~1/T: dividing by 0.7 amplifies the
+logits 1.43x, so ~3.8e-07 at T = 0.7 against 2.682e-07 at T = 1.0. Measured
+against `priors_cpu_libchess`, the permutation-free column:
+
+| T | predicted 2.682e-07/T | measured | ratio |
+|---|---|---|---|
+| 0.7 | 3.831e-07 | 2.980e-07 | 0.78x |
+| 1.0 | 2.682e-07 | 2.682e-07 | 1.00x |
+| 1.5 | 1.788e-07 | 2.384e-07 | 1.33x |
+
+The error is far flatter in T than 1/T. Every value is comfortably inside the
+bound and inside the [0.5x, 2x] band the test asserts, so nothing is blocked —
+but the prediction is recorded as having been approximately right rather than
+right, because the point of stating it was to make a surprise visible.
+
+## THE INTER-PRIOR GAP MOVES THE OPPOSITE WAY FROM THE PREDICTION, and the finding is good news
+
+The brief asked for the minimum non-zero inter-prior gap to be re-measured per
+temperature, predicting that *"sharpening (T < 1) spreads priors and widens gaps;
+flattening (T > 1) compresses them"*, and asked for a stop-and-report if the
+T = 1.5 figure approached 1e-6.
+
+Measured over the 500-position corpus:
+
+| T | smallest non-zero gap | x the 1e-6 bound |
+|---|---|---|
+| 0.7 | 5.884e-08 | 0.06x |
+| 1.0 | 1.927e-06 | 1.93x — reproduces C10b exactly |
+| 1.5 | 1.567e-05 | 15.67x |
+
+**The direction is inverted.** Sharpening compresses this minimum by a factor of
+33; flattening widens it by a factor of 8. The reason is that the statistic is a
+MINIMUM over the whole corpus, so it is set by the bottom of each position's
+prior distribution rather than the top: flattening pulls every prior toward 1/n,
+which lifts the near-zero tail up and spreads it out in absolute terms, while
+sharpening drives that same tail toward zero where adjacent tiny priors collapse
+together. The brief's intuition holds for the top few moves; the top few moves
+are never where the corpus minimum lives.
+
+The threshold is crossed, at T = 0.7 rather than T = 1.5, and the consequence is
+the opposite of the one the brief was guarding against:
+
+* **The ordering criterion is strengthened, not weakened.** With a gap of
+  5.88e-08 and a measured error of ~3.0e-07 at T = 0.7, an incorrect
+  implementation has ample room to invert a pair while staying far inside the
+  magnitude bound. Zero inversions at T = 0.7 is therefore a claim the magnitude
+  bound does not imply.
+* **`drill_c10_gate2.py`'s `invert-inside-tolerance` construction needs no
+  revisiting.** It requires `0.5 * gap + ulp < 1e-6` to build an inversion the
+  magnitude check cannot see; that holds with almost no room at T = 1.0
+  (9.6e-07 against 1e-06) and easily at T = 0.7. The temperature at which the
+  construction becomes impossible is a high one and 1.5 is not it.
+
+Nothing was tightened or loosened. The bound is the same 1e-6 at every
+temperature, because the criterion is a statement about how far apart two
+implementations of one function may be, and that does not become more forgiving
+because the input was divided first.
+
+## The C11b drill settles the independence question C10's could not
+
+C10's drill set out to show Gate 2's two criteria are independent and found it
+could not do so naturally: at T = 1.0 the corpus' closest pair is 1.93x the
+bound apart, so any swap the ordering check catches also trips the magnitude
+check. C10 had to construct the independence by hand.
+
+At T = 0.7 the corpus supplies it. `swap-closest-t070` swaps a real pair
+separated by 5.884e-08 — **the ordering check fails and the magnitude check
+passes**, on unmodified real data. `nudge-over-t150` is the mirror: over the
+bound, reordering nothing, magnitude fails and ordering passes. 5/5 mutations
+caught; `golden/` digests unchanged before and after (Amendment B).
+
+`break-the-identity` caught a defect in the tests as first written. The identity
+check had been given a "skip under a golden override" guard, copied from the
+corpus-digest check beside it — but the two are not alike. A corpus digest
+cannot match a corrupted copy, so comparing it says nothing; the identity check
+compares against `golden/c10_gate2.npz`, **which the drill never touches**, so a
+corrupted copy is exactly what it should reject. The skip made the check
+undrillable and is gone.
+
+## The new test fixtures broke the leak discriminator, and the fix is a class rather than a closure
+
+The first Linux ASan run reported **771,023 bytes leaked in 717 allocations with
+`guofish_core` in the stacks**, against a standing project claim — README_BUILD.md's
+discriminator, clean since C0 — that *no leaked allocation's stack mentions
+`guofish_core`*.
+
+Diagnosed rather than suppressed. Importing the module and exiting leaks nothing,
+in this build and in a pre-C11b baseline built for the comparison, so it was not
+type registration and not a C++ change. The stacks pointed at `bindings.cpp:3227`,
+which is `py::init` on `LiveEvaluator` — i.e. **instances**, created by C11b's own
+new test fixtures.
+
+The cause is structural and worth writing down because the production evaluator
+has the same shape. A `LiveEvaluator` holds its callback, and the callback must
+reach the evaluator's buffers, so `evaluator -> callback -> evaluator` is
+unavoidable. **pybind11 instances are not traversable by Python's cycle
+collector**, so `gc` cannot break it either; every evaluator a test built survived
+to interpreter exit.
+
+The fix is `_SyntheticNetwork`: a class instead of a closure, holding a settable
+back-reference, plus an autouse fixture that clears it after every test. The
+cycle is then broken deliberately rather than left to a collector that cannot see
+it. After the fix:
+
+```
+1375 passed, 75 skipped
+sanitizer errors (non-leak) : none
+UBSan runtime errors        : none
+SUMMARY: AddressSanitizer: 1422033 byte(s) leaked in 1317 allocation(s)
+leaked allocations whose stack mentions guofish_core:
+    none — no leaked allocation originates in guofish_core
+```
+
+The total ROSE, from 771 KB to 1.42 MB, while ours went to zero — which is the
+expected direction and not a new problem. Leaked objects keep what they point at
+*reachable*, so LSan was not reporting the CPython allocations our evaporating
+evaluators were holding down. Freeing them turned those back into ordinary
+interpreter-exit leakage, and 1.42 MB in 1,317 allocations is the same figure and
+the same character as the ~1.3 MB in ~1,254 that C3 and C4 recorded.
+
+Worth stating plainly: this was a defect in C11b's TESTS, not in the engine, and
+it would have been invisible without the discriminator. That is the case for
+keeping the discriminator honest rather than widening it.
+
+## Rule 1: two collisions with the brief, both reported before editing, both ruled on
+
+Global Rule 1 is hard — no existing test file may be modified — and C11b's
+mandate collided with it twice.
+
+**1. `tests/test_c11_uci.py`, four assertions — AMENDED, authorised.** They
+required `policy_temperature` to be REFUSED, which is C11's limitation and is
+precisely what this chunk was mandated to remove ("remove *only*
+`policy_temperature` from that set"). No implementation satisfies both the brief
+and those assertions. The edits are the narrowest available:
+
+* the two `policy_temperature` rows dropped from
+  `test_a_value_the_core_cannot_honour_is_refused`'s parametrisation. The
+  Dirichlet rows stay, so the refusal MECHANISM — the `ConfigError`, the field
+  name in the message, the reason, the `cpp/` pointer — retains full coverage;
+* `PolicyTemperature value 0.8` in
+  `test_a_rejected_setoption_leaves_the_previous_value_in_place` replaced with
+  `value 0`, which is still refused and for a sharper reason than
+  "unimplemented": it divides the logits;
+* `test_config_replace_validates_rather_than_producing_a_bad_object` switched to
+  `dirichlet_epsilon`, which exercises the same property against a value the
+  core still cannot honour.
+
+Each edit carries a comment naming this entry. What temperature now does is
+covered by `tests/test_c11b_temperature.py`.
+
+**2. `tests/test_c10_gate2b.py` — NOT amended, on the owner's instruction.** The
+brief listed the near-tie criterion as C11b housekeeping. The owner ruled the
+item out of scope: the four tests under "The gate" take ~2h10m to run and the
+finding has been examined thoroughly in past chunks. The file is therefore
+untouched, `test_every_disagreement_is_a_near_tie` remains as C10 left it, and
+no canonical-order reference run was generated. The C10 finding stands as
+recorded — both decisive disagreements are demonstrably the canonical child
+ordering, reproduced visit-for-visit by `GATE1_CANONICAL_ORDER = True`.
+
+Every other test file, `tests/test_c10_gate2.py` included, is untouched. The
+Gate 2 temperature extension is a new file, `tests/test_c11b_temperature.py`,
+which is how the gate was extended without the file being.
+
+## Book and Syzygy: both default ON, and the discipline that pays for it
+
+Both are free strength and v6 should play its best out of the box. Both also
+BYPASS MCTS, so a bypassed move is one where this port and the Python reference
+are identical by construction — it carries none of the signal Gate 5 exists to
+measure, and it delivers zero simulations in non-zero wall time.
+
+Three mechanisms, none of which is "default them off":
+
+* `SearchOutcome.source` is `search` / `book` / `tablebase` on every move, and
+  `Engine.decision_counts` tallies them per game.
+* `playv6.aggregate_sims_per_s` is the ONE place the exclusion is implemented,
+  so no caller has to remember it. It returns the rate over searched moves and
+  the per-source counts together, because a rate without its denominator beside
+  it is uncheckable.
+* `tools/bench_provenance.py` is the refusal: a harness cannot emit a strength or
+  throughput table without the resolved state in its header. It follows
+  `bench_c10.py`'s sanitizer-build precedent — check before the table, exit
+  non-zero, no caveat nobody reads.
+
+"Not applicable" is a resolved state. `bench_c10.py` and `bench_c10b.py` drive
+`guofish_core` directly and could not take a bypass if one were offered; they
+record that, so a reader of BENCH.md never has to infer it from a tool's name.
+
+`tools/uci_conform_c11.py` applies the same discipline to itself: its protocol
+run now passes `--no-book --no-syzygy`, because half its checks are statements
+about the SEARCH (delivered nodes below budget, a reused root doing less work, a
+finite inflation ratio) and the Ruy Lopez it drives is exactly what a book
+covers. The bypass is tested in a second process with the defaults ON.
+
+## The resolved state is read from the ENGINE'S stderr, not from the harness's arguments
+
+A strength run drives the engine as a Cutechess subprocess, so the harness never
+holds the `Engine` object. Reading the state out of the engine's own stderr
+makes it a property of the **artifact** rather than of the harness's memory of
+the run — and it distinguishes "SyzygyPath was set" from "the tables actually
+opened", which a typo makes different and which the config alone cannot tell
+apart.
+
+## `BookSeed = 0` means the highest-weight entry, not "unseeded"
+
+Reserving 0 for deterministic selection gives benchmarking a fully reproducible
+book without needing the book disabled, which is the cleanest resolution of the
+contamination problem: Gate 5 can run WITH the book on and still have a fixed
+opening distribution across both engines. Any other value seeds a
+`random.Random` for weighted selection.
+
+The RNG is **not** reset by `new_game()` when the seed is non-zero. A caller who
+asked for a seed asked for varied play across a session; re-seeding per game
+would open every game of a match identically, which is what seed 0 is for.
+
+## `new_game()` does not reopen the readers
+
+`chess.polyglot.open_reader` memory-maps the file and the Fathom prober re-reads
+every table header. Neither file changes while the process runs, so reopening per
+game is pure cost at the start of every game. What `new_game()` does reset is the
+per-game decision tally, because that is per game.
+
+## A tablebase path change has to REBUILD THE SEARCH, and finding out why was this chunk's one real surprise
+
+Two facts collide, and neither is visible from the Python side:
+
+1. `FathomProber` is **one per process** — Fathom keeps its state in file scope,
+   `tb_init`/`tb_free` take no handle — so a second live instance raises.
+2. `set_tablebase` carries pybind11's `keep_alive<1, 2>`: the SEARCH holds a hard
+   reference to the prober for the search's whole lifetime, deliberately, so that
+   dropping the last Python reference cannot leave a dangling pointer in the leaf
+   path. **`set_tablebase(None)` clears the pointer but does not release the
+   reference.** Measured: after detaching, `tablebase_backend` reads `None` and a
+   new `FathomProber` still cannot be constructed until the search object dies.
+
+So detaching is not freeing, and a naive `reopen_syzygy` would find the old
+tables open, fail to construct the new prober, and **disable Syzygy for the rest
+of the session while the configuration log went on reporting it as on** — a
+config-says-one-thing/engine-does-another defect of exactly the kind C11 existed
+to remove, reintroduced by C11b's own plumbing.
+
+`Engine.reopen_syzygy` therefore destroys the search object, which is the only
+thing that releases the reference. The tree and the cache go with it. That is a
+real cost paid at the right moment: a tablebase path change is a configuration
+event, and it normally arrives before the first `isready`, where `ensure_ready`
+opens the readers against a search that never had a prober and none of this runs.
+
+Part 2's "no new C++" constraint was kept. Changing the `keep_alive` policy would
+have been the other fix and is not obviously the better one — the policy is
+protecting the leaf path from a dangling pointer, which is a worse failure than a
+rebuild.
+
+`test_a_syzygy_path_change_actually_opens_the_new_tables` is the regression
+guard, and it asserts through `tablebase_backend` because that is the only thing
+that distinguishes "reopened" from "quietly gave up".
+
+## `reconfigure` re-attaches the tablebase, and without it mode 2 would die silently
+
+`Engine.reconfigure` replaces the search object when a `SearchConfig` field
+changes, and the new one starts with no tablebase. Without an explicit
+re-attach, any `setoption CPuctInit` mid-game would turn mode 2 off for the rest
+of the game while the config log still said Syzygy was open. Covered by
+`test_mode_2_is_attached_to_the_search_and_survives_a_reconfigure`.
+
+## Mode 2 needs no runtime guard, as the brief says
+
+C7's four strong value types make cache poisoning by a tablebase result
+uncompilable: the network's value is what reaches the cache and the tablebase
+value is what reaches the backup, and the two cannot be interchanged without a
+compile error. Nothing was added for something the type system already forbids.
+
+## A bypassed move gets a different telemetry line, not the ordinary one with zeros
+
+`SearchOutcome.telemetry()` emits `source=book BYPASS (MCTS did not run)` rather
+than the usual line with `delivered=0 delivered_sims_per_s=0`. The zeros would
+read as a search that did nothing rather than as a search that did not happen,
+and those are different claims. The same split is in the UCI layer: a bypassed
+move emits `info depth 0 string book e2e4` — v5's convention, and what a GUI
+expects — instead of an `info` line advertising a depth the engine never reached.
+
+## GATE 5 PREREQUISITE, LOGGED HERE: the 2687.7 anchor is effectively book-free
+
+The brief asked whether the anchor's games contain book moves past the 16-ply
+Cutechess opening, since the v5 wrapper defaulted the book ON and the recorded
+anchor command passes no disabling flag. `tools/anchor_book_audit.py` replays
+`benchmarking/engine/games/v5/guofishv5_10.9M_2ksims_2600sf_fixednodes.pgn`
+against `assets/gm2001.bin`:
+
+```
+games                          200
+engine moves past ply 16     9,555
+  in the book                   10   (0.10%)
+  == the top-weight entry       10   (0.10%)
+longest consecutive run          3
+share inside a run of >= 3   0.031%
+agreement by engine-move offset: +0 2.50%, +1 0.50%, +2 1.00%, +3 1.00%,
+                                 +4 and beyond 0.00%
+```
+
+**The book did not materially affect the anchor.** Ten moves in 9,555, decaying
+to zero by the fifth engine move, with no runs: that is coincidental agreement
+between a strong engine and a book, not a book playing. gm2001.bin's coverage
+evidently runs out inside the 16 plies Cutechess supplied from `8moves_v3.pgn`.
+The owner's prior — that this was likely a non-issue — is confirmed empirically
+rather than assumed.
+
+Gate 5 is therefore comparable to this anchor whether the book is on or off. It
+should still be run **ON with `BookSeed = 0`**: that is both the v5 default and
+the reproducible setting, and matching the anchor's configuration costs nothing
+now that its influence is known to be ~0.1% of moves.
+
+## Acceptance
+
+| criterion | result |
+|---|---|
+| Gate 2 over T in {0.7, 1.0, 1.5} vs ATen, <= 1e-6, zero inversions, both toolchains | **MET** — 9/9 cells, worst 3.278e-07, 0 inversions, 0 collapses |
+| minimum inter-prior gap reported per temperature | **MET** — and the direction is inverted from the prediction; see above |
+| T = 1.0 bit-identical to the temperature-absent path | **MET** — 15,036/15,036 priors, raw bit patterns |
+| root-path coverage | **MET** — root priors bit-identical to the gather at the configured T, at all three temperatures |
+| clear-on-change drops BOTH cache and tree | **MET** — 9,147 nodes / 378 entries -> 0 / 0 |
+| equivalence build asserts T = 1.0 | **MET** — throws at construction under `GUOFISH_VALUE_SUM=double` |
+| `probe_book` / `probe_tablebase_root` return a move with zero sims, source attributed | **MET** |
+| UCI conformance, extended for the five new options | **MET** — 67/67 checks |
+| 20-game Cutechess smoke, defaults ON, both regimes | **MET** — 13/13 each; zero illegal, zero null, zero crashes, zero timeouts |
+| mutation drill (Amendment B) | **MET** — 5/5 caught, `golden/` digests unchanged |
+| Rule 3 suite green with Amendment D itemisation | **MET** — see below |
+
+## Rule 3 and Amendment D — the suite, per platform, with the delta reconciled
+
+Three runs, all green. The four `test_c10_gate2b.py` differential tests are
+deselected in every one of them: they take ~2h10m per run and the project owner
+ruled that item out of C11b's scope (see the Rule 1 entry). That is a
+DESELECTION, stated here rather than hidden in a command line, and it is the
+only thing not executed.
+
+| platform / build | passed | skipped | deselected |
+|---|---|---|---|
+| Windows MSVC **Release** (q32) | 1401 | 49 | 4 |
+| Windows MSVC **ASan Debug** (q32, asserts on) | 1402 | 48 | 4 |
+| Linux **Clang ASan+UBSan Debug** | 1375 | 71 | 4 |
+
+Skip reasons, in full:
+
+| reason | Win Release | Win ASan | Linux |
+|---|---|---|---|
+| `test_c6_gate1_full.py:623` — this corpus predates the census columns | 48 | 48 | 48 |
+| built without `GUOFISH_DEBUG_VL`; the audit is not compiled in | 1 | 0 | 0 |
+| torch is not importable — `test_c10b_graphs.py` | 0 | 0 | 13 |
+| torch is not importable — `test_c10_gate2b.py` | 0 | 0 | 9 |
+| torch is not importable — `test_reference_defects.py:97` | 0 | 0 | 1 |
+| **total** | **49** | **48** | **71** |
+
+**The deltas, each reconciled to the last test:**
+
+* **Windows Release -> Windows ASan: +1 passed, -1 skipped.** The ASan build is
+  a Debug build, so `GUOFISH_DEBUG_VL` is ON and C8's full-tree virtual-loss
+  audit is compiled in. `test_c8_reuse.py` asserts both halves of that switch —
+  the invariant where the audit exists, its ABSENCE where it should not — so
+  exactly one of the two branches skips per build. This delta is the switch
+  working.
+
+* **Windows -> Linux: -26 passed, +22 skipped, 4 fewer outcomes.**
+  `1401 - 23 - 4 + 1 = 1375`, and `49 + 23 - 1 = 71`:
+  - **-23** to torch's absence in the Linux venv (13 + 9 + 1 above). The Linux
+    box has no CUDA and no torch by design; those tests skip individually, with
+    the reason naming the missing import, and contribute no silent gaps.
+  - **-4** outcomes to four `test_reference_defects.py` tests that Linux does not
+    collect at all: `test_dirichlet_idempotence`, `test_ep_cache_key`,
+    `test_terminal_guard` and `test_equivalence_determinism[0.0]` / `[2.5]` are
+    five tests behind that file's module-scope `importorskip`, which is
+    **Amendment D's one approved exception** (it imports the Python reference
+    itself, which requires torch). One of the five — the `:97` row above — is
+    collected on Linux and skips with its own reason; the other four are not
+    collected. `--collect-only` reports 1454 tests on Windows against 1449 on
+    Linux, which is that same five-test gap seen before the one collectable
+    member is counted.
+  - **+1** to `GUOFISH_DEBUG_VL`, as above: the Linux build is Debug, so the
+    audit test that skips on Windows Release passes there.
+
+No module-scope skip was added by this chunk. Both new files —
+`tests/test_c11b_temperature.py` and `tests/test_c11b_book_syzygy.py` — run
+every test on every platform except the book/tablebase ones, which are marked
+individually with the asset that is missing and which skipped nowhere in these
+three runs.
+
+Sanitizers: no non-leak AddressSanitizer error and no UBSan runtime error on
+either sanitized build. Leaks: see the fixture-cycle entry above.
+
+## Rule compliance
+
+1. **One test file amended**, `tests/test_c11_uci.py`, four assertions, reported
+   before editing and authorised by the owner; each edit commented in place.
+   `tests/test_c10_gate2.py` and `tests/test_c10_gate2b.py` are untouched. Two
+   new test files added.
+2. **Golden from the Python reference only.** `golden/c11b_gate2_temp.npz` is
+   ATen over logits `golden/c10_gate2.npz` already held; no forward pass, no
+   model load, and no column has ever seen a C++ prior.
+   `guofish_core.generation_order` is consulted for a reduction ORDER, exactly as
+   `tools/gen_c10_gate2_golden.py` consults it, never for a value.
+3. **Full suite run** on both toolchains — itemised below.
+4. **Warning-clean** at /W4 and `-Wall -Wextra`. No pragmas, no `-Wno-*`.
+5. **ASan + debug asserts** — the suite runs under both the MSVC ASan build and
+   the Linux/clang ASan+UBSan build.
+6. No `#pragma pack`. No `reinterpret_cast` added.
+7. No new third-party dependencies. `chess.polyglot` is python-chess, already in
+   the allowed set and already a test dependency.
+8. Builds on MSVC and Clang.
+9. This file.
+10. Nothing narrowed. The one item dropped — the Gate 2b housekeeping — was
+    dropped by the owner, on the record, and is named as such rather than
+    quietly omitted.
+
+## What is not done
+
+* **Dirichlet noise**, and therefore self-play training-data generation from the
+  C++ engine. See the first entry.
+* **The Gate 2b near-tie criterion**, dropped from this chunk's scope by the
+  owner. `test_c10_gate2b.py::test_every_disagreement_is_a_near_tie` remains as
+  C10 left it.
+* **A temperature scan.** The brief's closing note recommends a coarse 1-D pass
+  over T in {0.7, 0.8, 0.9, 1.0, 1.1} at the deployment budget, then folding T
+  into the SPSA vector alongside VL, `c_init`, `c_base` and `FPU_TREE` rather
+  than tuning it standalone — sharpening the policy and raising `c_puct` both
+  move the exploration/exploitation balance, so a 1-D optimum found at fixed
+  `c_puct` will not survive re-tuning `c_puct`. C11b ships the lever at its
+  identity value and measures nothing about where it should sit.
+* **A tablebase hit in a real game.** Both smoke runs recorded `tablebase=0`:
+  Stockfish adjudication (`-resign movecount=3 score=600`) ends the games long
+  before a 5-man endgame. Mode 1's coverage in this chunk is
+  `tests/test_c11b_book_syzygy.py` and C7's tests, not the match. Exercising it
+  in play would need a run with adjudication off, and nothing in the acceptance
+  criteria asks for one.
+* **Multi-PV, `searchmoves`, background pondering.** Unchanged from C11.

@@ -1,0 +1,5 @@
+﻿
+SKIPPED [48] tests\test_c6_gate1_full.py:623: this corpus predates the census columns
+1402 passed, 48 skipped, 4 deselected in 1072.55s (0:17:52)
+
+

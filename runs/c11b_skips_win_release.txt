@@ -1,0 +1,6 @@
+﻿
+SKIPPED [48] tests\test_c6_gate1_full.py:623: this corpus predates the census columns
+SKIPPED [1] tests\test_c8_reuse.py:760: built without GUOFISH_DEBUG_VL; the audit is not compiled in
+1401 passed, 49 skipped, 4 deselected in 108.85s (0:01:48)
+
+

@@ -53,6 +53,11 @@ if str(REPO_ROOT) not in sys.path:
 import chess  # noqa: E402
 import chess.pgn  # noqa: E402
 
+# `tools/` is not a package (no __init__.py) and adding one would change how
+# every other script in here is invoked, so the sibling is imported by path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bench_provenance  # noqa: E402
+
 CUTECHESS = REPO_ROOT / "cutechess-1.4.0-win64" / "cutechess-cli.exe"
 STOCKFISH = REPO_ROOT / "stockfish-windows-x86-64-avx2.exe"
 OPENINGS = REPO_ROOT / "assets" / "8moves_v3.pgn"
@@ -118,6 +123,15 @@ def build_command(args, out_dir: Path) -> list[str]:
     ]
     if args.fixed_sims:
         engine_args += ["--fixed-sims", str(args.fixed_sims)]
+    # C11b. NOTHING IS PASSED WHEN THE DEFAULTS ARE WANTED, so the smoke run
+    # exercises the shipping configuration rather than a configuration only this
+    # harness produces. The flags exist for the contrast run.
+    if args.no_book:
+        engine_args += ["--no-book"]
+    if args.no_syzygy:
+        engine_args += ["--no-syzygy"]
+    if args.book_seed is not None:
+        engine_args += ["--book-seed", str(args.book_seed)]
 
     if args.mode == "nodes":
         # `tc=inf nodes=N` makes cutechess send `go nodes N` with no clock, and
@@ -288,6 +302,35 @@ def verify(out_dir: Path, expected_games: int) -> dict:
     check("the engine logged its resolved configuration during the match",
           bool(configs), f"{len(configs)} config line(s)")
 
+    # --- C11b: the resolved book/Syzygy state, and the hits it produced ----
+    #
+    # THE RUN REFUSES TO BE PUBLISHED WITHOUT THIS. Both features default ON and
+    # both bypass MCTS, so a games table that does not say whether either was
+    # open describes a measurement nobody can interpret. The state is read out
+    # of the engine's OWN stderr rather than out of the harness's arguments,
+    # which is what makes it a property of the artifact: a run whose book was on
+    # by accident says so in its own verdict file.
+    state = bench_provenance.from_engine_log(engine_text)
+    try:
+        header = bench_provenance.require_recorded_state(state)
+        check("the resolved book/Syzygy state was recorded", True,
+              " | ".join(header))
+    except bench_provenance.UnrecordedState as exc:
+        header = []
+        check("the resolved book/Syzygy state was recorded", False,
+              str(exc).splitlines()[0])
+    findings["feature_state"] = state
+    findings["feature_header"] = header
+
+    hits = state.get("hits") or {}
+    bypassed = hits.get("book", 0) + hits.get("tablebase", 0)
+    total = bypassed + hits.get("search", 0)
+    print(f"  [INFO] decisions: search={hits.get('search', 0)} "
+          f"book={hits.get('book', 0)} tablebase={hits.get('tablebase', 0)} "
+          f"({bypassed}/{total} moves bypassed MCTS)"
+          if total else "  [INFO] no decision markers found in the engine's stderr",
+          flush=True)
+
     findings["evidence"].update({
         "finished_games": len(finished),
         "illegal": illegal[:10],
@@ -297,6 +340,8 @@ def verify(out_dir: Path, expected_games: int) -> dict:
         "tracebacks": len(tracebacks),
         "telemetry_lines": len(telemetry),
         "config_lines": len(configs),
+        "bypassed_moves": bypassed,
+        "decided_moves": total,
     })
     findings["ok"] = all(c["ok"] for c in findings["checks"])
     return findings
@@ -331,6 +376,16 @@ def main(argv=None) -> int:
     parser.add_argument("--virtual-loss", type=float, default=2.5)
     parser.add_argument("--sim-cap", type=int, default=60000)
     parser.add_argument("--fixed-sims", type=int, default=None)
+    parser.add_argument("--no-book", action="store_true",
+                        help="C11b. Disable the opening book. The smoke run's "
+                             "acceptance criterion is the DEFAULTS, so this is "
+                             "for a contrast run, not for the acceptance one")
+    parser.add_argument("--no-syzygy", action="store_true",
+                        help="C11b. Disable the Syzygy bypass and leaf overrides")
+    parser.add_argument("--book-seed", type=int, default=None,
+                        help="C11b. 0 (the engine's default) always plays the "
+                             "highest-weight entry; any other value seeds "
+                             "weighted-random selection")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--verify-only", type=Path, default=None,
                         help="skip the match and verify an existing run directory")
@@ -356,6 +411,10 @@ def main(argv=None) -> int:
     (out_dir / "verdict.json").write_text(json.dumps(findings, indent=1),
                                           encoding="utf-8", newline="\n")
     print(f"\nverdict -> {out_dir / 'verdict.json'}", flush=True)
+    # C11b. The header goes above the verdict, in the artifact and on the
+    # terminal, not below it — a caveat under a table is read by nobody.
+    for line in findings.get("feature_header") or []:
+        print(f"  {line}", flush=True)
     failures = [c for c in findings["checks"] if not c["ok"]]
     print(f"{len(findings['checks']) - len(failures)}/{len(findings['checks'])} "
           f"checks passed", flush=True)

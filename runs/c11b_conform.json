@@ -1,0 +1,340 @@
+[
+ {
+  "check": "uciok",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "id name",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option lines present",
+  "ok": true,
+  "detail": "35 advertised"
+ },
+ {
+  "check": "every option advertises a type",
+  "ok": true,
+  "detail": "malformed: []"
+ },
+ {
+  "check": "option VirtualLoss advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option CPuctFactor advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option PolicyTemperature advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option Threads advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option MaxOutstanding advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option MaxBatch advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option CacheEntries advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option CPuctInit advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option CPuctBase advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option FPURoot advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option FPUTree advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option MaxTreeDepth advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option UseBook advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option BookPath advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option BookSeed advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option UseSyzygy advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "option SyzygyPath advertised",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "stderr carries a configuration log",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "VirtualLoss=3.7 in the logged config",
+  "ok": true,
+  "detail": "searched for 'virtual_loss=3.7'"
+ },
+ {
+  "check": "CPuctFactor=1.23 in the logged config",
+  "ok": true,
+  "detail": "searched for 'c_puct_factor=1.23'"
+ },
+ {
+  "check": "PolicyTemperature 0.8 is accepted",
+  "ok": true,
+  "detail": "C11b implements it; refusing it now would be the mirror-image defect"
+ },
+ {
+  "check": "PolicyTemperature 0.8 reaches the resolved config",
+  "ok": true,
+  "detail": "searched for 'policy_temperature=0.8'"
+ },
+ {
+  "check": "a temperature change rebuilds the search (tree AND cache dropped)",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "PolicyTemperature 0 refused loudly (it divides the logits)",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "DirichletEpsilon 0.25 refused loudly",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "a non-numeric value is refused, not coerced",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "an unknown option is refused loudly",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "the refused values did not stick",
+  "ok": true,
+  "detail": "the post-refusal config log still shows the identity values and the surviving VirtualLoss"
+ },
+ {
+  "check": "every isready records the resolved book state",
+  "ok": true,
+  "detail": "the one-line as_kv() record, which is emitted every time"
+ },
+ {
+  "check": "every isready records the resolved Syzygy state",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "the grouped config block names the resolved book path",
+  "ok": true,
+  "detail": "emitted on change only, so checked over the whole run"
+ },
+ {
+  "check": "the grouped config block names the resolved Syzygy path",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "isready answers in under a second once loaded",
+  "ok": true,
+  "detail": "0 ms"
+ },
+ {
+  "check": "bestmove is legal in the searched position",
+  "ok": true,
+  "detail": "bestmove b5c6 in r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4"
+ },
+ {
+  "check": "an info line was emitted",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "info string carries both sim counts",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "the second search reports fewer nodes than the budget",
+  "ok": true,
+  "detail": "reported nodes 0 against a budget of 3000 (first search reported 366)"
+ },
+ {
+  "check": "a larger budget on the reused root delivers real, under-budget work",
+  "ok": true,
+  "detail": "reported nodes 3000 against a budget of 6000"
+ },
+ {
+  "check": "the reported inflation is finite and above 1 on the reused root",
+  "ok": true,
+  "detail": "inflation=2.0"
+ },
+ {
+  "check": "stop after 300 ms returns a bestmove",
+  "ok": true,
+  "detail": "107 ms, bestmove b5c6"
+ },
+ {
+  "check": "stop after 300 ms returns promptly",
+  "ok": true,
+  "detail": "107 ms"
+ },
+ {
+  "check": "stop immediately returns a bestmove",
+  "ok": true,
+  "detail": "10 ms, bestmove b5c6"
+ },
+ {
+  "check": "stop immediately returns promptly",
+  "ok": true,
+  "detail": "10 ms"
+ },
+ {
+  "check": "isready is answered while a search is running",
+  "ok": true,
+  "detail": "0 ms"
+ },
+ {
+  "check": "the search still ends after an isready mid-search",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "ponderhit converts to a timed search and returns",
+  "ok": true,
+  "detail": "1176 ms"
+ },
+ {
+  "check": "a pondering search answers stop",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "under load: no illegal move",
+  "ok": true,
+  "detail": "20 moves played"
+ },
+ {
+  "check": "under load: no null bestmove",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "a position with no legal move answers bestmove 0000",
+  "ok": true,
+  "detail": "0000"
+ },
+ {
+  "check": "quit exits cleanly",
+  "ok": true,
+  "detail": "exit code 0"
+ },
+ {
+  "check": "book and Syzygy default ON",
+  "ok": true,
+  "detail": "the resolved config log, not the dataclass default"
+ },
+ {
+  "check": "BookSeed defaults to the deterministic 0",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "the book reader opened or said why not",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "the Syzygy reader opened or said why not",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "the start position answers a legal move",
+  "ok": true,
+  "detail": "e2e4"
+ },
+ {
+  "check": "a book move is announced as one",
+  "ok": true,
+  "detail": "info strings: ['info string source=book delivered=0 bypass=true game_counts search=0 book=1 tablebase=0']"
+ },
+ {
+  "check": "a book move reports zero delivered simulations",
+  "ok": true,
+  "detail": "info strings: ['info string source=book delivered=0 bypass=true game_counts search=0 book=1 tablebase=0']"
+ },
+ {
+  "check": "a book move carries the per-game tally",
+  "ok": true,
+  "detail": "info strings: ['info string source=book delivered=0 bypass=true game_counts search=0 book=1 tablebase=0']"
+ },
+ {
+  "check": "ucinewgame reports the finished game's decision counts",
+  "ok": true,
+  "detail": [
+   "[game] decided 1 moves: search=0 book=1 tablebase=0  [open C:\\Users\\Ethan Guo\\Github\\GuoFish\\assets\\gm2001.bin [highest-weight entry (deterministic)]] [open C:\\Users\\Ethan Guo\\Github\\GuoFish\\assets\\syzygy [5-man]]",
+   "[config] model_path=None max_batch=128 graphs=true pin=true switch_interval=0.0005 threads=1 max_outstanding=24 affinity=none c_puct_init=1.43 c_puct_base=19652 c_puct_factor=1 fpu_root=0 fpu_tree=0.3 virtual_loss=2.5 max_tree_depth=80 cache_entries=400000 cache_shards=0 arena_capacity=1200000 ponder_decay=1 verify_compaction=false policy_temperature=1 dirichlet_epsilon=0 dirichlet_alpha=0.3 default_sims=5000 sim_cap=60000 fixed_sims=None slice_seconds=0.05 min_slice_sims=32 use_book=true book_path=None book_seed=0 use_syzygy=true syzygy_path=None ponder=false move_overhead_ms=100 in_flight=24 effective_outstanding=24"
+  ]
+ },
+ {
+  "check": "UseBook false is accepted and logged",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "with the book off, the start position is SEARCHED",
+  "ok": true,
+  "detail": "info nodes: [399, 399]"
+ },
+ {
+  "check": "quit exits cleanly (bypass run)",
+  "ok": true,
+  "detail": "exit code 0"
+ }
+]

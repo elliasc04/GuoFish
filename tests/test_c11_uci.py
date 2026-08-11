@@ -152,7 +152,15 @@ def test_a_rejected_setoption_leaves_the_previous_value_in_place():
     for bad in ("name VirtualLoss value not-a-number",
                 "name VirtualLoss value -1",
                 "name NoSuchOption value 3",
-                "name PolicyTemperature value 0.8",
+                # C11b AMENDMENT (authorised; see DECISIONS.md, "Two tests in
+                # test_c11_uci.py asserted the absence of the feature C11b was
+                # mandated to build"). This line read `PolicyTemperature value
+                # 0.8` when the core had no temperature and 1.0 was the only
+                # accepted value. It has one now, so 0.8 is a legal setting and
+                # asserting it is dropped would assert the feature away. `0` is
+                # still refused, and for a sharper reason than "unimplemented":
+                # the temperature DIVIDES the logits.
+                "name PolicyTemperature value 0",
                 "name DirichletEpsilon value 0.25"):
         engine.handle_setoption(bad.split())
     assert engine.config.virtual_loss == 2.5
@@ -187,9 +195,16 @@ def test_every_config_field_appears_in_the_one_line_record():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("field_name,bad", [("policy_temperature", 0.8),
-                                            ("policy_temperature", 1.2),
-                                            ("dirichlet_epsilon", 0.25),
+# C11b AMENDMENT (authorised; see DECISIONS.md). `("policy_temperature", 0.8)`
+# and `("policy_temperature", 1.2)` were the first two rows here. C11b's mandate
+# was to implement that knob and to "remove *only* policy_temperature from that
+# set", so those rows now assert the ABSENCE of the feature this chunk was
+# built to add. Dirichlet noise is still refused and still exercises every part
+# of the mechanism this test checks — the ConfigError, the field name in the
+# message, the reason, and the `cpp/` pointer — so nothing about the refusal
+# PATH has lost coverage. What temperature does now is covered by
+# tests/test_c11b_temperature.py.
+@pytest.mark.parametrize("field_name,bad", [("dirichlet_epsilon", 0.25),
                                             ("dirichlet_epsilon", 1.0)])
 def test_a_value_the_core_cannot_honour_is_refused(field_name, bad):
     with pytest.raises(ConfigError) as caught:
@@ -537,8 +552,13 @@ def test_config_replace_validates_rather_than_producing_a_bad_object():
     """`setoption` builds a copy and only then adopts it, so a rejected value
     never occupies the live object even briefly."""
     config = EngineConfig()
+    # C11b AMENDMENT (authorised; see DECISIONS.md). This read
+    # `config.replace(policy_temperature=0.8)`, which is now a legal setting.
+    # `dirichlet_epsilon` is the surviving member of UNSUPPORTED_IN_CORE and
+    # exercises the same property — that `replace` validates rather than
+    # producing a bad object — against a value the core still cannot honour.
     with pytest.raises(ConfigError):
-        config.replace(policy_temperature=0.8)
-    assert config.policy_temperature == 1.0
+        config.replace(dirichlet_epsilon=0.25)
+    assert config.dirichlet_epsilon == 0.0
     assert config.replace(virtual_loss=3.7).virtual_loss == 3.7
     assert config.virtual_loss == 2.5

@@ -37,13 +37,59 @@ THE TWO v5 DEFECTS THIS CHUNK CLOSES
 
 WHAT THE CORE DOES NOT IMPLEMENT, AND IS THEREFORE REFUSED
 ==========================================================
-`policy_temperature` and Dirichlet root noise exist in the Python reference
-(`core.mctsv4.POLICY_TEMPERATURE`, `ParallelMCTS._add_dirichlet_noise` and the
-`MCTSNode.base_prior` field the C3b fix added) and have NO counterpart anywhere
-in `cpp/`. C11's scope forbids changing the C++ search core, so this module
-cannot make them work. It refuses them instead: both are advertised, both accept
-only their identity value, and any other value raises with a message naming the
-missing mechanism. Accepting them and doing nothing is precisely defect 1.
+C11 refused BOTH `policy_temperature` and Dirichlet root noise, because neither
+had a counterpart in `cpp/` and C11's scope forbade changing the search core.
+
+C11b was given that mandate and used it for one of the two. `policy_temperature`
+is now a real knob: `SearchConfig::policy_temperature` divides the logits inside
+`gather_softmax_canonical`, at the root and at every interior node alike, and
+this module passes it through like any other search field. It is no longer in
+`UNSUPPORTED_IN_CORE`.
+
+Dirichlet noise stays refused, and stays refused for the reason C11 gave rather
+than for want of a mandate: the arena stores ONE prior per child and nothing
+preserves the untouched network distribution that the reference's C3b fix
+requires noise to be derived from. Mixing noise into the stored priors would
+compound on every reused root — the exact defect C3b fixed over there. Adding a
+`base_prior` field to the arena is a chunk of its own and nothing currently
+planned needs it. The consequence, stated plainly so it is not discovered later:
+**the C++ engine cannot generate self-play training data.** Play strength,
+benchmarking and tournament use are unaffected; training-data generation runs on
+the Python reference until that chunk happens.
+
+THE OPENING BOOK AND SYZYGY, AND WHY THEY DEFAULT ON
+====================================================
+C11b re-introduces both, as v5 had them. Both default to **ON**, because both
+are free strength and the engine should play its best out of the box.
+
+That is right for deployment and wrong for measurement, and the discipline that
+has to come with it is not "default them off" — it is that a bypassed move is
+VISIBLE IN THE ENGINE'S OWN OUTPUT. A book or tablebase move skips MCTS
+entirely, so it is a move where this port and the Python reference are identical
+by construction, and folding it into a strength or throughput figure dilutes
+exactly the signal that figure exists to carry.
+
+Three mechanisms, all here:
+
+  * `SearchOutcome.source` is `search`, `book` or `tablebase`, on every move.
+  * A bypassed move delivers ZERO simulations, so `sims_per_s` on it is not a
+    slow move — it is a meaningless one. `SearchOutcome.bypassed` marks it and
+    every aggregate in this file and in `tools/` excludes it rather than
+    dividing by it or averaging it in.
+  * `Engine.decision_counts` tallies the three per game, and `describe()` /
+    `as_kv()` carry the RESOLVED reader state — the path that was opened, or the
+    path that was tried and missing. A run that accidentally had the book on
+    reports book hits in its own output instead of quietly shifting the ELO.
+
+`BookSeed = 0` means "always play the highest-weight move". A non-zero seed
+picks weighted-randomly from a seeded RNG and the RNG is NOT reset between
+games, because varied play across a session is the whole point of asking for a
+seed. Zero gives benchmarking a fully reproducible book without needing the book
+disabled, which is the cleanest resolution of the contamination problem above.
+
+Missing files WARN AND DISABLE, naming the path they tried, and never fail: a
+typo'd `SyzygyPath` and an intentionally absent one must not be
+indistinguishable.
 
 SWITCH INTERVAL
 ===============
@@ -63,6 +109,7 @@ import contextlib
 import dataclasses
 import io
 import math
+import random
 import sys
 import time
 from dataclasses import dataclass, field, fields
@@ -77,6 +124,16 @@ import guofish_core  # noqa: E402
 
 DEFAULT_MODEL = REPO_ROOT / "models" / "guofish5_20M" / "v5_10.9M_best.pt"
 DEFAULT_SWITCH_INTERVAL = guofish_core.DEFAULT_SWITCH_INTERVAL
+
+# The two host-side asset locations, restated from uci_wrapper_v5.py rather than
+# imported so the v6 surface does not depend on the v5 one. Neither is a build
+# dependency: a missing book or an absent tablebase directory disables that
+# feature with a warning naming the path, and the engine plays on.
+DEFAULT_BOOK = REPO_ROOT / "assets" / "gm2001.bin"
+DEFAULT_SYZYGY = REPO_ROOT / "assets" / "syzygy"
+
+# What decided a move. `SearchOutcome.source` is one of these and nothing else.
+DECISION_SOURCES = ("search", "book", "tablebase")
 
 # Largest |value| the v5 label pipeline ever produced (data/multiPV/labels.py:
 # VALUE_CLAMP / VALUE_MATE = 0.995), restated from uci_wrapper_v5.py rather than
@@ -156,17 +213,14 @@ def q_to_centipawns(q: float, value_scale: float) -> int:
 
 # Fields the C++ core has no mechanism for, mapped to the ONLY value this
 # module will accept for them and the sentence explaining why. Refusing is the
-# whole point: `policy_temperature = 0.8` on a core that cannot sharpen priors
-# is a benchmark row that describes a search nobody ran.
+# whole point: a value the core cannot honour, accepted silently, is a benchmark
+# row that describes a search nobody ran.
+#
+# C11b REMOVED `policy_temperature` FROM THIS SET. It is implemented now — see
+# SearchConfig::policy_temperature and cpp/evaluator.hpp — so refusing it would
+# have become the mirror-image defect: a knob the engine has, declared broken.
+# Dirichlet noise stays, and the module docstring says what that costs.
 UNSUPPORTED_IN_CORE: dict[str, tuple[float, str]] = {
-    "policy_temperature": (
-        1.0,
-        "cpp/ has no prior-sharpening step: SearchConfig carries no temperature "
-        "field and gather_softmax_canonical raises the logits to no power. The "
-        "reference's core.mctsv4.POLICY_TEMPERATURE was not ported and C11's "
-        "scope forbids changing the search core, so only the identity value 1.0 "
-        "is accepted.",
-    ),
     "dirichlet_epsilon": (
         0.0,
         "cpp/ has no root-noise mechanism and no per-node base_prior: the arena "
@@ -230,8 +284,13 @@ class EngineConfig:
     ponder_decay: float = 1.0
     verify_compaction: bool = False
 
-    # --- declared, refused unless identity (see UNSUPPORTED_IN_CORE) ------
+    # C11b. T in softmax(logits / T). 1.0 is the identity, skips the divide, and
+    # is what every figure recorded before C11b was measured at. A SearchConfig
+    # field, so changing it rebuilds the search — which is how the tree and the
+    # cache get dropped together. See `reconfigure` and `_SEARCH_CONFIG_FIELDS`.
     policy_temperature: float = 1.0
+
+    # --- declared, refused unless identity (see UNSUPPORTED_IN_CORE) ------
     dirichlet_epsilon: float = 0.0
     dirichlet_alpha: float = 0.3
 
@@ -247,22 +306,51 @@ class EngineConfig:
     slice_seconds: float = 0.05
     min_slice_sims: int = 32
 
-    # --- host-side features ----------------------------------------------
-    # NO opening book and NO Syzygy bypass. v5's wrapper carried both; neither
-    # is in C11's implementation scope, and a config field that is logged but
-    # does nothing is the defect this chunk exists to remove. Cutechess supplies
-    # openings with `-openings file=...`, which needs nothing from the engine,
-    # and the core's tablebase backend is attached through `set_tablebase` by
-    # whichever chunk decides to ship one.
+    # --- host-side features (C11b) ----------------------------------------
+    # BOTH DEFAULT ON. See the module docstring for why, and for the three
+    # mechanisms that keep a bypassed move from silently contaminating a
+    # measurement.
+    #
+    # The paths are `None` for "the shipped default", exactly as `model_path`
+    # is, and `book_target`/`syzygy_target` resolve them. What gets logged is
+    # the RESOLVED path and whether the reader actually opened, because "the
+    # config said assets/gm2001.bin" and "the engine is playing book moves" are
+    # different claims and only the second one matters.
+    use_book: bool = True
+    book_path: Optional[Path] = None
+    # 0 IS NOT "unseeded". It means "always play the highest-weight entry",
+    # which is what gives a benchmark a fully reproducible book without having
+    # to turn the book off. Any other value seeds a `random.Random` for
+    # weighted selection. See `Engine.probe_book`.
+    book_seed: int = 0
+    use_syzygy: bool = True
+    syzygy_path: Optional[Path] = None
+
     ponder: bool = False
     move_overhead_ms: int = 100
 
     def __post_init__(self) -> None:
-        if self.model_path is not None:
-            self.model_path = Path(self.model_path)
+        for name in ("model_path", "book_path", "syzygy_path"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, Path(value))
         self.validate()
 
     # --- derived ----------------------------------------------------------
+
+    @property
+    def book_target(self) -> Path:
+        """The Polyglot file this configuration would open. Always a path.
+
+        Resolution and USE are separate questions: this answers the first even
+        when `use_book` is False, so a log can say which book was declined.
+        """
+        return self.book_path or DEFAULT_BOOK
+
+    @property
+    def syzygy_target(self) -> Path:
+        """The tablebase directory this configuration would open."""
+        return self.syzygy_path or DEFAULT_SYZYGY
 
     @property
     def in_flight(self) -> int:
@@ -329,6 +417,16 @@ class EngineConfig:
             raise ConfigError(f"c_puct_factor must be > 0, got {self.c_puct_factor}")
         if self.virtual_loss < 0.0:
             raise ConfigError(f"virtual_loss must be >= 0, got {self.virtual_loss}")
+        # It DIVIDES the logits, so 0 is a division by zero and a negative is an
+        # inverted policy. The reference validates it with the same
+        # parenthetical (SearchParams.__post_init__) and so does the C++
+        # ReplaySearch constructor; this is the third of three, and it is the
+        # one that turns the failure into a `setoption` refusal rather than an
+        # exception out of the first search.
+        if not self.policy_temperature > 0.0:
+            raise ConfigError(
+                f"policy_temperature must be > 0 (it divides the logits), got "
+                f"{self.policy_temperature}")
         if self.default_sims < 1:
             raise ConfigError(f"default_sims must be >= 1, got {self.default_sims}")
         if self.sim_cap < 1:
@@ -342,6 +440,13 @@ class EngineConfig:
         if self.move_overhead_ms < 0:
             raise ConfigError(
                 f"move_overhead_ms must be >= 0, got {self.move_overhead_ms}")
+        # A negative seed is not "0 but signed": 0 has a specific meaning here
+        # (deterministic, highest weight) and anything else is an RNG seed, so
+        # the only value worth refusing is one that reads as a typo.
+        if self.book_seed < 0:
+            raise ConfigError(
+                f"book_seed must be >= 0 (0 means 'always the highest-weight "
+                f"book move'), got {self.book_seed}")
         return self
 
     # --- the core objects -------------------------------------------------
@@ -359,6 +464,7 @@ class EngineConfig:
             cache_slots=self.cache_entries,
             ponder_decay=self.ponder_decay,
             verify_compaction=self.verify_compaction,
+            policy_temperature=self.policy_temperature,
         )
         # 0 means "whatever the core's default is". Setting it explicitly to 0
         # would be a cache with no shards, which the core refuses.
@@ -425,7 +531,9 @@ class EngineConfig:
             f"fpu_root={self.fpu_root:g} fpu_tree={self.fpu_tree:g}",
             f"[config] search     : virtual_loss={self.virtual_loss:g} "
             f"max_tree_depth={self.max_tree_depth} "
-            f"policy_temperature={self.policy_temperature:g} "
+            f"policy_temperature={self.policy_temperature:g}"
+            f"{'' if self.policy_temperature == 1.0 else ' (NON-IDENTITY: priors are '
+               'being sharpened/flattened at the root and at every interior node)'} "
             f"dirichlet_epsilon={self.dirichlet_epsilon:g} "
             f"dirichlet_alpha={self.dirichlet_alpha:g}",
             f"[config] memory     : cache_entries={self.cache_entries} "
@@ -437,8 +545,18 @@ class EngineConfig:
             f"move_overhead_ms={self.move_overhead_ms}",
             f"[config] host       : ponder={self.ponder} "
             f"ponder_decay={self.ponder_decay:g} "
-            f"verify_compaction={self.verify_compaction} "
-            f"(no opening book, no Syzygy bypass — neither is wired in v6)",
+            f"verify_compaction={self.verify_compaction}",
+            # THE LINE A BENCHMARK ARTIFACT HAS TO CARRY. Both features bypass
+            # MCTS, so a strength or throughput number measured with either on
+            # is measuring something other than this port's search — and the
+            # only defence against discovering that afterwards is that the
+            # resolved state is in the run's own log, every time.
+            f"[config] book       : use_book={self.use_book} "
+            f"path={self.book_target} "
+            f"seed={self.book_seed}"
+            f"{' (DETERMINISTIC: always the highest-weight entry)' if self.book_seed == 0 else ' (weighted-random)'}",
+            f"[config] syzygy     : use_syzygy={self.use_syzygy} "
+            f"path={self.syzygy_target}",
             "[config] NOT IMPLEMENTED BY THE CORE, accepted only at the value shown: "
             + ", ".join(f"{name}={only:g}" for name, (only, _) in
                         sorted(UNSUPPORTED_IN_CORE.items())),
@@ -505,9 +623,35 @@ class SearchOutcome:
     # number in one line and `n/a` in the next.
     budget_source: str = "nodes"
 
+    # C11b. WHAT DECIDED THE MOVE: "search", "book" or "tablebase".
+    #
+    # The other two mean MCTS never ran. That is not a detail of provenance —
+    # it is the difference between a move this port computed and a move it
+    # looked up, and a bypassed move is one where this engine and the Python
+    # reference are identical by construction. Gate 5 exists to measure where
+    # they are not, so a bypassed move dilutes precisely the signal it wants.
+    # Carrying the source on every outcome is what makes an accidentally-on
+    # book self-revealing in the run's own output rather than a mystery in the
+    # ELO afterwards.
+    source: str = "search"
+
+    @property
+    def bypassed(self) -> bool:
+        """True when MCTS did not run. `delivered` is 0 and `sims_per_s` is 0/0.
+
+        Every aggregate over a set of moves must filter on this rather than
+        averaging a zero-simulation move in — see `aggregate_sims_per_s`.
+        """
+        return self.source != "search"
+
     @property
     def sims_per_s(self) -> float:
-        """DELIVERED simulations per second. The honest rate (C11's objective)."""
+        """DELIVERED simulations per second. The honest rate (C11's objective).
+
+        Zero on a bypassed move, and that zero is not a slow move: it is the
+        absence of a measurement. `bypassed` is how a caller tells the two
+        apart.
+        """
         return self.delivered / self.wall_s if self.wall_s > 0 else 0.0
 
     @property
@@ -544,7 +688,17 @@ class SearchOutcome:
                         else f"{self.nominal_sims_per_s:,.0f}")
         inflation = ("n/a" if self.inflation is None
                      else f"{self.inflation:.2f}x")
-        return (f"[search] delivered={self.delivered} nominal={nominal} "
+        if self.bypassed:
+            # A bypassed move has no delivered sims, no inflation, no PV depth
+            # and no cache traffic worth reporting, and printing the search
+            # fields as zeros would read as a search that did nothing rather
+            # than as a search that did not happen. Different line, same prefix.
+            return (f"[search] source={self.source} BYPASS (MCTS did not run) "
+                    f"best={self.best_move} wall={self.wall_s * 1000:.1f}ms "
+                    f"delivered=0 nominal={nominal} "
+                    f"budget_source={self.budget_source} reason={self.reason}")
+        return (f"[search] source={self.source} delivered={self.delivered} "
+                f"nominal={nominal} "
                 f"inherited={self.inherited} slices={self.slices} "
                 f"wall={self.wall_s * 1000:.1f}ms "
                 f"delivered_sims_per_s={self.sims_per_s:,.0f} "
@@ -556,6 +710,33 @@ class SearchOutcome:
                 f"best={self.best_move} score_cp={self.score_cp} "
                 f"budget_source={self.budget_source} "
                 f"stopped={self.stopped} reason={self.reason}")
+
+
+def aggregate_sims_per_s(outcomes: Iterable[SearchOutcome]) -> tuple[float, dict]:
+    """(delivered sims/s over the SEARCHED moves, a per-source tally).
+
+    THE ONE PLACE THE EXCLUSION IS IMPLEMENTED, so that no caller has to
+    remember it. A book or tablebase move delivers zero simulations in some
+    nonzero wall time, so folding it into a throughput mean drags the mean down
+    by however many moves the book happened to cover — a number that has
+    nothing to do with the engine's speed and everything to do with which
+    opening was played.
+
+    Both halves are returned together on purpose: a rate without the counts
+    beside it is a number whose denominator nobody can check.
+    """
+    outcomes = list(outcomes)
+    counts = {source: 0 for source in DECISION_SOURCES}
+    for outcome in outcomes:
+        counts[outcome.source] = counts.get(outcome.source, 0) + 1
+    searched = [o for o in outcomes if not o.bypassed]
+    delivered = sum(o.delivered for o in searched)
+    wall = sum(o.wall_s for o in searched)
+    counts["moves"] = len(outcomes)
+    counts["searched"] = len(searched)
+    counts["bypassed"] = len(outcomes) - len(searched)
+    counts["excluded_wall_s"] = sum(o.wall_s for o in outcomes if o.bypassed)
+    return (delivered / wall if wall > 0 else 0.0), counts
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +773,28 @@ class Engine:
         # The position the tree is rooted at, as the UCI layer described it.
         self._base_fen: Optional[str] = None
         self._moves: list[str] = []
+        # A python-chess mirror of the rooted position, maintained by
+        # `set_position`. The bypasses need a board — Polyglot keys it and
+        # `tablebase_root_move` takes its FEN — and reconstructing one per move
+        # from `_base_fen` + `_moves` would replay the whole game every ply.
+        self._board = None
+
+        # --- C11b: the two host-side readers -------------------------------
+        # Opened ONCE, in `ensure_ready`. Not in `__init__`, so a GUI can send
+        # every `setoption` first; not in `new_game`, because the Polyglot
+        # reader is memory-mapped and reopening it per game is pure cost for no
+        # benefit — see `new_game`.
+        self.book = None
+        self.book_rng: Optional[random.Random] = None
+        self.tablebase = None
+        # What actually happened when they were opened, as a short string for
+        # the config log. "off", "open <path>", "missing <path>" or
+        # "error <path>: ...". This is the RESOLVED state a benchmark artifact
+        # has to record; the config alone only says what was asked for.
+        self.book_state = "off"
+        self.syzygy_state = "off"
+        # Per-game tally of what decided each move. Reset by `new_game`.
+        self.decision_counts = {source: 0 for source in DECISION_SOURCES}
 
     # --- lifecycle --------------------------------------------------------
 
@@ -648,6 +851,12 @@ class Engine:
         self.search.set_evaluator(self.evaluator.core)
         self._ready = True
 
+        # C11b. Both readers open here and nowhere else. `open_readers` is
+        # idempotent and is also what a path change calls, so there is one
+        # implementation of "open what the config asks for and say what
+        # happened".
+        self.open_readers()
+
         for line in cfg.describe():
             err(line)
         err(f"[init] build={build} device={torch.cuda.get_device_name(0)} "
@@ -670,26 +879,308 @@ class Engine:
 
         Fields that live in `SearchConfig` are baked into the search object at
         construction, so changing one after `isready` means rebuilding the
-        search — and that throws the tree away. The UCI layer therefore applies
-        options to `self.config` and calls this only between games; a `setoption`
-        arriving mid-game is applied to the config and takes effect on the next
-        rebuild, which is reported rather than assumed.
+        search — and that throws the tree away.
+
+        THE REBUILD DROPS BOTH THE TREE AND THE TRANSPOSITION CACHE, and for
+        `policy_temperature` that is a correctness requirement rather than a
+        side effect (C11b requirement 4). Both stores hold priors that were
+        materialised at a temperature: the arena holds one per child from
+        expansion time, the cache holds whole post-softmax vectors. Flushing
+        only the cache — which is the obvious half, because the cache is
+        visibly full of priors — would leave a retained tree serving children
+        sharpened at the old T alongside fresh expansions at the new one.
+        Constructing a new `ReplaySearchQ32` makes that unrepresentable: the
+        arena and the cache are both members of the object being replaced.
+
+        `_base_fen`/`_moves` are cleared too, so the next `position` rebuilds
+        from scratch instead of trying to extend a tree that no longer exists.
+
+        The UCI layer applies options to `self.config` and calls this per
+        `setoption`; the reader can see which changes cost a rebuild in the
+        stderr line below.
         """
         rebuild = self._ready and _search_config_differs(self.config, config)
         self.config = config
         if not rebuild:
             return
-        err("[config] a SearchConfig field changed; rebuilding the search "
-            "(the tree is discarded, the checkpoint and the graphs are not)")
-        self.search.set_evaluator(None)
-        self.search = guofish_core.ReplaySearchQ32(config.to_search_config())
-        self.search.set_evaluator(self.evaluator.core)
-        self._base_fen = None
-        self._moves = []
+        # `_rebuild_search` re-points the new search at the OPEN prober. That is
+        # not optional bookkeeping: without it, any `setoption CPuctInit`
+        # mid-game would turn mode 2 off for the rest of the game while the
+        # configuration log went on reporting Syzygy as open.
+        self._rebuild_search("a SearchConfig field changed; both the tree and "
+                             "the cache hold values materialised under the "
+                             "previous configuration")
         for line in config.describe():
             err(line)
 
+    # --- C11b: the opening book and the tablebase -------------------------
+
+    def open_readers(self) -> None:
+        """Open both readers per the current config. Idempotent.
+
+        Called from `ensure_ready`, and never from `new_game`.
+
+        MISSING FILES WARN AND DISABLE, NAMING THE PATH. A typo'd `SyzygyPath`
+        and an intentionally absent one must not produce the same output, so the
+        warning always carries the path that was tried; and neither is a reason
+        to refuse to play chess, so neither raises.
+        """
+        self.reopen_book()
+        self.reopen_syzygy()
+
+    def reopen_book(self) -> None:
+        """Close and reopen the book alone, for a `UseBook`/`BookPath`/`BookSeed`
+        change. Kept separate from the tablebase so a seed change does not make
+        Fathom re-read 290 table headers for nothing."""
+        if self.book is not None:
+            self.book.close()
+        self.book = None
+        self.book_rng = None
+        self.book_state = "off"
+        self._open_book()
+
+    def reopen_syzygy(self) -> None:
+        """Close and reopen the tablebase alone, for a `UseSyzygy`/`SyzygyPath`
+        change.
+
+        REPLACING THE PROBER MEANS REPLACING THE SEARCH OBJECT, and that is not
+        over-caution — it is the only thing that works. Two facts collide:
+
+          1. `FathomProber` is ONE PER PROCESS. Fathom keeps its state in file
+             scope (`tb_init`/`tb_free` take no handle), so constructing a
+             second one while the first is alive raises rather than silently
+             sharing and double-freeing its tables.
+
+          2. `set_tablebase` carries pybind11's `keep_alive<1, 2>`: the SEARCH
+             holds a hard reference to the prober for the search's whole
+             lifetime, so that a caller who drops their only reference cannot
+             leave a dangling pointer in the leaf path. `set_tablebase(None)`
+             clears the pointer — `tablebase_backend` goes to None — but it does
+             NOT release that reference. Measured, not assumed.
+
+        So detaching is not freeing, and a `setoption name SyzygyPath value
+        <other>` would find the old tables still open, fail to construct the new
+        prober, and disable Syzygy entirely while the config log went on saying
+        it was on. Destroying the search is what releases the reference.
+
+        The tree and the cache go with it. That is a real cost and it is the
+        right one at the moment it is paid: a tablebase path change is a
+        configuration event, not a per-move one, and it normally arrives before
+        the first `isready` — where `ensure_ready` opens the readers against a
+        search that never had a prober and none of this runs at all.
+        """
+        had_prober = self.tablebase is not None
+        # Ours first, so the rebuild's `reattach_tablebase` finds nothing to
+        # reattach and the old prober is not carried onto the new search.
+        self.tablebase = None
+        if had_prober and self.search is not None:
+            self._rebuild_search(
+                "the Syzygy configuration changed and the previous prober is held "
+                "by the search object (pybind11 keep_alive); Fathom allows only "
+                "one open tablebase per process, so the search is rebuilt to "
+                "release it")
+        self.syzygy_state = "off"
+        self._open_syzygy()
+
+    def _rebuild_search(self, why: str) -> None:
+        """Replace the C++ search object. THE TREE AND THE CACHE ARE BOTH LOST.
+
+        One implementation, two callers — `reconfigure` when a `SearchConfig`
+        field changed, and `reopen_syzygy` when the prober has to be released —
+        so that "what a rebuild entails" is written down once. Both stores hold
+        state that a rebuild is the correct way to discard: the arena holds
+        priors materialised at expansion time, the cache holds post-softmax
+        prior vectors, and neither can be selectively invalidated.
+        """
+        err(f"[config] rebuilding the search — {why}. The TREE and the "
+            f"TRANSPOSITION CACHE are both discarded; the checkpoint and the "
+            f"graphs are not.")
+        self.search.set_tablebase(None)
+        self.search.set_evaluator(None)
+        self.search = guofish_core.ReplaySearchQ32(self.config.to_search_config())
+        self.search.set_evaluator(self.evaluator.core)
+        self.reattach_tablebase()
+        self._base_fen = None
+        self._moves = []
+        self._board = None
+
+    def _open_book(self) -> None:
+        import chess.polyglot
+
+        cfg = self.config
+        path = cfg.book_target
+        if not cfg.use_book:
+            self.book_state = f"off (UseBook=false; would have used {path})"
+            return
+        if not path.is_file():
+            self.book_state = f"missing {path}"
+            err(f"[book] WARNING: no Polyglot book at {path}; book DISABLED for "
+                f"this run. Set BookPath, or UseBook=false to stop asking.")
+            return
+        try:
+            self.book = chess.polyglot.open_reader(str(path))
+        except Exception as exc:                              # noqa: BLE001
+            self.book_state = f"error {path}: {type(exc).__name__}: {exc}"
+            err(f"[book] WARNING: {path} could not be opened "
+                f"({type(exc).__name__}: {exc}); book DISABLED for this run.")
+            self.book = None
+            return
+        # Seeded once, here, and NOT reset by `new_game`: varied play across a
+        # session is the entire point of asking for a non-zero seed, and
+        # re-seeding per game would make every game of a match open identically
+        # while still costing the reproducibility that seed 0 gives for free.
+        self.book_rng = random.Random(cfg.book_seed) if cfg.book_seed else None
+        how = ("highest-weight entry (deterministic)" if cfg.book_seed == 0
+               else f"weighted-random, seed {cfg.book_seed}")
+        self.book_state = f"open {path} [{how}]"
+        err(f"[book] opened {path} — {how}")
+
+    def _open_syzygy(self) -> None:
+        cfg = self.config
+        path = cfg.syzygy_target
+        if not cfg.use_syzygy:
+            self.syzygy_state = f"off (UseSyzygy=false; would have used {path})"
+            return
+        if not path.is_dir():
+            self.syzygy_state = f"missing {path}"
+            err(f"[syzygy] WARNING: no tablebase directory at {path}; Syzygy "
+                f"DISABLED for this run. Set SyzygyPath, or UseSyzygy=false to "
+                f"stop asking.")
+            return
+        try:
+            # ONE FathomProber PER PROCESS — Fathom keeps its state in file
+            # scope, so a second live instance raises rather than silently
+            # sharing and double-freeing. Releasing the previous one is NOT as
+            # simple as dropping this reference; see `reopen_syzygy`, which is
+            # the only caller allowed to reach here with a prober already
+            # attached to a live search.
+            self.tablebase = guofish_core.FathomProber(str(path))
+        except Exception as exc:                              # noqa: BLE001
+            self.syzygy_state = f"error {path}: {type(exc).__name__}: {exc}"
+            err(f"[syzygy] WARNING: {path} could not be opened "
+                f"({type(exc).__name__}: {exc}); Syzygy DISABLED for this run.")
+            self.tablebase = None
+            return
+        # Mode 2 — leaf overrides on the search path. Mode 1, the root bypass,
+        # is `probe_tablebase_root` below and needs no wiring. C7's four strong
+        # value types make cache poisoning by a tablebase result uncompilable,
+        # so this needs no runtime guard: the network's value is what reaches
+        # the cache, and the tablebase value is what reaches the backup.
+        self.search.set_tablebase(self.tablebase)
+        self.syzygy_state = f"open {path} [{self.tablebase.largest}-man]"
+        err(f"[syzygy] opened {path} — largest table {self.tablebase.largest} men "
+            f"(mode 1 root bypass + mode 2 leaf overrides)")
+
+    def _close_readers(self) -> None:
+        """Teardown for `close()`, where the SEARCH is about to go too.
+
+        That last clause is load-bearing and is why this is not the same as
+        `open_readers`'s per-reader path. `set_tablebase(None)` detaches the
+        pointer but does not release the prober — pybind11's `keep_alive<1, 2>`
+        ties it to the search object's lifetime — so what actually frees
+        Fathom's tables is `close()` dropping `self.search` immediately after
+        this returns. Calling this WITHOUT then dropping the search leaves the
+        prober alive and the next `FathomProber(...)` raises. `reopen_syzygy`
+        exists precisely because of that, and does not call this.
+        """
+        if self.search is not None:
+            self.search.set_tablebase(None)
+        if self.book is not None:
+            self.book.close()
+        self.book = None
+        self.book_rng = None
+        self.tablebase = None
+        self.book_state = "off"
+        self.syzygy_state = "off"
+
+    def reattach_tablebase(self) -> None:
+        """Point the CURRENT search object at the open prober.
+
+        `reconfigure` replaces the search object, and the new one starts with no
+        tablebase. Without this, a `setoption` for any SearchConfig field would
+        silently turn mode 2 off for the rest of the game while the config log
+        still said Syzygy was open — a config-says-one-thing/engine-does-another
+        defect of exactly the kind C11 exists to have removed.
+        """
+        if self.search is not None and self.tablebase is not None:
+            self.search.set_tablebase(self.tablebase)
+
+    def probe_book(self, board) -> Optional[str]:
+        """A book move for `board` as UCI, or None on any miss.
+
+        Misses on: the book closed, the position absent, a lookup error, or an
+        entry whose move is not legal in this position (a corrupt or
+        wrong-variant book). Every one of those falls through to MCTS, which is
+        the reference's behaviour and the only safe one.
+
+        `BookSeed = 0` TAKES THE HIGHEST-WEIGHT ENTRY rather than sampling. That
+        is what makes a benchmark's opening distribution fixed across two
+        engines without having to disable the book — and disabling it is the
+        alternative that changes what is being measured.
+        """
+        if self.book is None:
+            return None
+        try:
+            if self.book_rng is None:
+                entry = max(self.book.find_all(board), key=lambda e: e.weight,
+                            default=None)
+                if entry is None:
+                    return None
+            else:
+                entry = self.book.weighted_choice(board, random=self.book_rng)
+        except IndexError:
+            return None                      # the position is not in the book
+        except Exception as exc:             # noqa: BLE001
+            err(f"[book] WARNING: lookup failed for {board.fen()} "
+                f"({type(exc).__name__}: {exc}); falling through to search")
+            return None
+        move = entry.move
+        if move not in board.legal_moves:
+            err(f"[book] WARNING: book move {move.uci()} is not legal in "
+                f"{board.fen()}; falling through to search")
+            return None
+        return move.uci()
+
+    def probe_tablebase_root(self, board) -> Optional[str]:
+        """Mode 1: the tablebase-optimal move for `board`, or None on any miss.
+
+        Delegates to `guofish_core.tablebase_root_move`, which is C7's tested
+        implementation running on a `SearchBoard` — so the position handed to
+        Fathom carries the RAW en-passant square rather than chess-library's
+        filtered one. Nothing is re-implemented here.
+
+        None means "fall through to MCTS" and covers out-of-range positions
+        (more men than the loaded tables), missing tables, and anything the
+        backend declines to answer.
+        """
+        if self.tablebase is None:
+            return None
+        try:
+            return guofish_core.tablebase_root_move(board.fen(en_passant="fen"),
+                                                    self.tablebase)
+        except Exception as exc:                              # noqa: BLE001
+            err(f"[syzygy] WARNING: root probe failed for {board.fen()} "
+                f"({type(exc).__name__}: {exc}); falling through to search")
+            return None
+
+    def bypass_move(self, board) -> tuple[Optional[str], str]:
+        """(uci, source) if a bypass fires, else (None, "search").
+
+        BOOK FIRST, THEN TABLEBASE, which is v5's order and the right one: they
+        cannot both fire (a book covers openings, a 5-man table covers
+        endgames), and checking the cheaper memory-mapped lookup first costs
+        nothing when it misses.
+        """
+        uci = self.probe_book(board)
+        if uci is not None:
+            return uci, "book"
+        uci = self.probe_tablebase_root(board)
+        if uci is not None:
+            return uci, "tablebase"
+        return None, "search"
+
     def close(self) -> None:
+        self._close_readers()
         if self.search is not None:
             self.search.set_evaluator(None)
             self.search = None
@@ -708,13 +1199,17 @@ class Engine:
         scratch. A rebuild is the reference's `move not in root.children` branch
         widened to the whole position: cheap, correct and always available.
         """
+        import chess
+
         self.ensure_ready()
         moves = list(moves)
         extendable = (self._base_fen == base_fen
+                      and self._board is not None
                       and len(moves) >= len(self._moves)
                       and moves[:len(self._moves)] == self._moves)
 
         if extendable:
+            board = self._board.copy()
             for uci in moves[len(self._moves):]:
                 try:
                     self.search.apply_move(uci)
@@ -723,8 +1218,14 @@ class Engine:
                         f"the tree from {base_fen}")
                     extendable = False
                     break
+                board.push(chess.Move.from_uci(uci))
             if extendable:
                 self._moves = moves
+                # Advanced in step with the tree, so the bypass probes and the
+                # search always see the same position. A copy is pushed onto and
+                # only adopted on success, so a refused apply_move leaves the
+                # mirror untouched rather than half-advanced.
+                self._board = board
                 return True
 
         self._rebuild(base_fen, moves)
@@ -755,6 +1256,7 @@ class Engine:
         self.search.set_position(board.fen(en_passant="fen"), history)
         self._base_fen = base_fen
         self._moves = list(moves)
+        self._board = board
 
     def new_game(self) -> None:
         """Between games: drop the tree AND the transposition cache.
@@ -763,12 +1265,28 @@ class Engine:
         a game and wrong across one: cross-game transpositions are near-worthless
         and the entries are full prior vectors, so a tournament process would
         grow to its cap and stay there.
+
+        THE READERS ARE NOT REOPENED HERE, and that is a deliberate omission
+        rather than a gap. `chess.polyglot.open_reader` memory-maps the file and
+        the Fathom prober re-reads every table header, so reopening per game
+        costs real time at the start of every game and buys nothing: neither
+        file changes while the process runs, and a path change goes through
+        `open_readers` from the UCI layer.
+
+        THE BOOK RNG IS NOT RESET EITHER, when the seed is non-zero. A caller
+        that asked for a seeded book asked for varied play across a session;
+        re-seeding per game would open every game of a match identically, which
+        is what `BookSeed = 0` is for and is not what a non-zero seed means.
+
+        What IS reset is the per-game decision tally, because it is per game.
         """
         if not self._ready:
             return
         self.search.clear_cache()
         self._base_fen = None
         self._moves = []
+        self._board = None
+        self.decision_counts = {source: 0 for source in DECISION_SOURCES}
 
     # --- the search -------------------------------------------------------
 
@@ -799,6 +1317,22 @@ class Engine:
         self.ensure_ready()
         if self._base_fen is None:
             raise RuntimeError("Engine.search_move: no position set")
+
+        # C11b. THE BYPASS, BEFORE ANY SIMULATION IS BUDGETED.
+        #
+        # A book or tablebase hit answers the move outright and MCTS never
+        # runs, so this sits ahead of the slice loop rather than inside it —
+        # there is no partial search to abandon and no `info` line to emit
+        # about a search that did not happen. `delivered` is 0 by construction,
+        # `source` says which lookup answered, and `bypassed` is what every
+        # aggregate filters on.
+        if self._board is not None:
+            started = time.perf_counter()
+            uci, source = self.bypass_move(self._board)
+            if uci is not None:
+                self.decision_counts[source] = self.decision_counts.get(source, 0) + 1
+                return self._bypass_outcome(uci, source, nominal, budget_source,
+                                            time.perf_counter() - started)
 
         cfg = self.config
         parallel = cfg.to_parallel_config()
@@ -870,12 +1404,51 @@ class Engine:
                 reason = "stalled"
                 break
 
+        self.decision_counts["search"] = self.decision_counts.get("search", 0) + 1
         return self._outcome(nominal, budget_source, inherited, delivered,
                              time.perf_counter() - started, slices,
                              eval_rows, eval_batches,
                              stopped=stopped, reason=reason, with_pv=True)
 
     # --- reporting internals ---------------------------------------------
+
+    def _bypass_outcome(self, uci: str, source: str, nominal: Optional[int],
+                        budget_source: str, wall: float) -> SearchOutcome:
+        """The outcome for a move MCTS did not compute.
+
+        Every search field is zero and is MEANT to read as zero — no delivered
+        simulations, no inherited visits, no slices, no PV beyond the move
+        itself, no score. A book move carries no evaluation, so reporting one
+        would be inventing it; `score_cp` stays 0 and the `info` line the UCI
+        layer emits says `depth 0`, which is what v5 did and what a GUI
+        expects.
+
+        `root_visits` and `nodes` are read off the live tree rather than
+        zeroed: the tree still exists and still holds whatever the previous
+        move built, and reporting 0 there would say the engine had thrown it
+        away.
+        """
+        return SearchOutcome(
+            best_move=uci,
+            mating_move=None,
+            nominal=nominal,
+            inherited=0,
+            delivered=0,
+            wall_s=wall,
+            slices=0,
+            root_visits=int(self.search.root_visits),
+            score_cp=0,
+            q=0.0,
+            pv=[uci],
+            depth=1,
+            max_depth=0,
+            nodes=int(self.search.nodes),
+            hashfull=0,
+            stopped=False,
+            reason=source,
+            budget_source=budget_source,
+            source=source,
+        )
 
     def _outcome(self, nominal: Optional[int], budget_source: str,
                  inherited: int, delivered: int, wall: float, slices: int,
@@ -990,10 +1563,26 @@ class Engine:
 # Everything in SearchConfig, plus the two that size the arena and the cache;
 # `max_batch`/`threads`/`max_outstanding`/`affinity` live in ParallelConfig,
 # which is rebuilt per search and therefore free.
+#
+# `policy_temperature` IS IN THIS LIST AND IT IS THE ENTRY MOST WORTH EXPLAINING
+# (C11b requirement 4). Everything else here changes how the NEXT selection is
+# scored; temperature changes what is already STORED. Priors are materialised
+# into the arena at expansion time and into the transposition cache as
+# post-softmax probabilities, so after a `setoption PolicyTemperature` between
+# moves — no `ucinewgame`, which is the ordinary Cutechess sequence — a retained
+# tree would keep serving children sharpened at the old T while every fresh
+# expansion used the new one. One tree, two temperatures, and nothing anywhere
+# saying so.
+#
+# Being in this tuple is what prevents that, and it drops BOTH stores at once:
+# `reconfigure` constructs a new ReplaySearchQ32, whose arena and whose cache are
+# both new. That is why the mechanism is a rebuild rather than a `clear_cache()`
+# call — flushing the cache alone would leave the tree, and the tree is the half
+# that survives a move.
 _SEARCH_CONFIG_FIELDS = (
     "c_puct_init", "c_puct_base", "c_puct_factor", "fpu_root", "fpu_tree",
     "virtual_loss", "max_tree_depth", "cache_entries", "cache_shards",
-    "arena_capacity", "ponder_decay", "verify_compaction",
+    "arena_capacity", "ponder_decay", "verify_compaction", "policy_temperature",
 )
 
 
@@ -1052,7 +1641,9 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--max-tree-depth", type=int, default=EngineConfig.max_tree_depth)
     g.add_argument("--policy-temperature", type=float,
                    default=EngineConfig.policy_temperature,
-                   help="NOT IMPLEMENTED BY THE CORE; only 1.0 is accepted")
+                   help="T in softmax(logits / T), applied at the root and at "
+                        "every interior node. <1 sharpens, >1 flattens, 1.0 is "
+                        "the identity and skips the divide entirely")
     g.add_argument("--dirichlet-epsilon", type=float,
                    default=EngineConfig.dirichlet_epsilon,
                    help="NOT IMPLEMENTED BY THE CORE; only 0.0 is accepted")
@@ -1083,6 +1674,23 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                         "expired clock still makes progress instead of spinning")
     g.add_argument("--move-overhead-ms", type=int, default=EngineConfig.move_overhead_ms,
                    help="subtracted from every allotted move time")
+
+    g = parser.add_argument_group("opening book / Syzygy (C11b; both default ON)")
+    g.add_argument("--no-book", dest="use_book", action="store_false", default=True,
+                   help="disable the Polyglot opening book. NOTE: a book move "
+                        "bypasses MCTS entirely, so leaving it on dilutes any "
+                        "measurement of the search itself — see --book-seed")
+    g.add_argument("--book-path", type=Path, default=None,
+                   help=f"Polyglot book (default: {DEFAULT_BOOK})")
+    g.add_argument("--book-seed", type=int, default=EngineConfig.book_seed,
+                   help="0 (the default) always plays the highest-weight entry, "
+                        "which makes the book fully reproducible; any other "
+                        "value seeds weighted-random selection")
+    g.add_argument("--no-syzygy", dest="use_syzygy", action="store_false", default=True,
+                   help="disable the Syzygy tablebase (root bypass and leaf "
+                        "overrides both)")
+    g.add_argument("--syzygy-path", type=Path, default=None,
+                   help=f"Syzygy directory (default: {DEFAULT_SYZYGY})")
 
 
 def config_from_args(args: argparse.Namespace) -> EngineConfig:
@@ -1146,7 +1754,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         for uci in args.moves:
             board.push(chess.Move.from_uci(uci))
         played = list(args.moves)
-        totals = {"delivered": 0, "nominal": 0, "wall": 0.0}
+        outcomes: list[SearchOutcome] = []
         for ply in range(args.selfplay):
             if board.is_game_over(claim_draw=True):
                 err(f"[selfplay] game over after {ply} plies: {board.result()}")
@@ -1155,20 +1763,31 @@ def main(argv: Optional[list[str]] = None) -> int:
             outcome = engine.search_move(budget=budget, nominal=budget,
                                          budget_source="nodes")
             err(f"[selfplay] ply {ply + 1}: {outcome.telemetry()}")
-            totals["delivered"] += outcome.delivered
-            totals["nominal"] += outcome.nominal or 0
-            totals["wall"] += outcome.wall_s
+            outcomes.append(outcome)
             if outcome.best_move is None:
                 err("[selfplay] no move returned; stopping")
                 break
             board.push(chess.Move.from_uci(outcome.best_move))
             played.append(outcome.best_move)
-        wall = totals["wall"] or 1e-9
-        err(f"[selfplay] TOTAL delivered={totals['delivered']} "
-            f"nominal={totals['nominal']} wall={wall:.2f}s "
-            f"delivered_sims_per_s={totals['delivered'] / wall:,.0f} "
-            f"nominal_sims_per_s={totals['nominal'] / wall:,.0f} "
-            f"inflation={totals['nominal'] / max(1, totals['delivered']):.2f}x")
+
+        # BYPASSED MOVES ARE EXCLUDED FROM THE RATE, not folded into it. A book
+        # move delivers zero simulations in some non-zero wall time, so including
+        # it would report a throughput that depends on which opening was played.
+        # The counts are printed beside the rate so the denominator is visible.
+        rate, counts = aggregate_sims_per_s(outcomes)
+        searched = [o for o in outcomes if not o.bypassed]
+        delivered = sum(o.delivered for o in searched)
+        nominal = sum(o.nominal or 0 for o in searched)
+        wall = sum(o.wall_s for o in searched) or 1e-9
+        err(f"[selfplay] TOTAL moves={counts['moves']} "
+            f"search={counts['search']} book={counts['book']} "
+            f"tablebase={counts['tablebase']} "
+            f"(bypassed {counts['bypassed']}, excluded {counts['excluded_wall_s']:.2f}s)")
+        err(f"[selfplay] OVER THE SEARCHED MOVES ONLY: delivered={delivered} "
+            f"nominal={nominal} wall={wall:.2f}s "
+            f"delivered_sims_per_s={rate:,.0f} "
+            f"nominal_sims_per_s={nominal / wall:,.0f} "
+            f"inflation={nominal / max(1, delivered):.2f}x")
         print(" ".join(played), flush=True)
         return 0
     finally:
@@ -1176,9 +1795,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 __all__ = [
+    "DECISION_SOURCES",
+    "DEFAULT_BOOK",
     "DEFAULT_MODEL",
     "DEFAULT_SWITCH_INTERVAL",
+    "DEFAULT_SYZYGY",
     "ConfigError",
+    "aggregate_sims_per_s",
     "Engine",
     "EngineConfig",
     "SearchOutcome",
