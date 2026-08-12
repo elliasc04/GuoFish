@@ -317,13 +317,193 @@ never accumulate in one.
 | `metrics.py` | stratified value metrics, mirror consistency, policy top-k |
 | `train_v5.py` | training loop, LR range test, logging, checkpointing, resume |
 | `bench_batch.py` | VRAM / throughput sweep to choose `--micro-batch` |
-| `configs/base.yaml` | this run's config |
+| `gates.py` | seen/unseen probe, the head-to-head match, the pre-registered bar |
+| `configs/base.yaml` | the 10M × 9 run's config |
+| `configs/corpus90m.yaml` | the 90M × 4 run's config |
 | `tests/` | the properties that fail silently if broken |
 
 Nothing the manifest states is hardcoded. `value_scale`, the policy coverage and
 the value strata are read from
 `data/multiPV/manifests/dataset_manifest.json` at startup and travel into every
 checkpoint.
+
+---
+
+## The 90M × 4 regime (`configs/corpus90m.yaml`)
+
+```bash
+python training/v5_multiPV/train_v5.py --config training/v5_multiPV/configs/corpus90m.yaml
+```
+
+Same net, same effective batch, same LR. **Only the data changes**: 4.5× the
+unique records at 44% of the epochs, to cut value-head poisoning in deep MCTS.
+
+| | 10M × 9 (`base.yaml`) | 90M × 4 (`corpus90m.yaml`) |
+|---|---|---|
+| corpus | `multipv` (30M-target, 10.5 GiB) | `multipv_90m` (32 GiB, 192 shards) |
+| train records | 10,000,000 (permuted prefix) | **90,076,117** (all of them) |
+| epochs | 9 | 4 |
+| steps/epoch | 9,766 | **87,965** |
+| total steps | 87,894 | **351,860** |
+| effective batch | 1024 | 1024 *(unchanged)* |
+| `max_lr` | 3.5e-4 | 3.5e-4 *(unchanged)* |
+| policy coverage | 0.403 | **0.601** (measured) |
+| wall clock | ≈4.2 h | **≈17 h** + ≈3 h for the gate |
+
+**The step count is derived, never written down.** `plan_epoch` sizes every
+accumulation window from the dataloader length, `steps_per_epoch = len(windows)`,
+and `total_steps = steps_per_epoch × epochs`. That lands at 351,860 against the
+351,562 a round 90.0M would give — the 0.085% is the 76,117 real records a round
+number would have discarded, and the number stays correct if the corpus is ever
+rebuilt at a different size.
+
+### The loader was re-measured, not assumed
+
+The 20M corpus (10.5 GiB) sat entirely in page cache on this 31.8 GiB box. **32
+GiB cannot**, so every access is a random NVMe read and the old figure did not
+transfer. Measured with the real sampler and collate at micro-batch 512:
+
+| corpus | workers | samples/s | vs GPU demand (~6,100) |
+|---|---|---|---|
+| 20M (control, cached) | 8 | 19,193 | 3.1× |
+| **90M** | 8 | **18,441** | **3.0×** |
+| 90M | 12 | 30,972 | 5.1× |
+
+Still 3× headroom at 8 workers, so the run stays GPU-bound and **no loader
+refactor is warranted**. 12 workers is the lever if a cold cache ever bites, but
+it is not the default: worker RAM comes straight out of the page cache this
+corpus is competing for.
+
+Two things *were* changed, both for the memory the index costs at this scale:
+`select_subset` returns **int32** (688 → 344 MiB) and the sampler's gather is
+**chunked** through a 1M window instead of materialising a third full-length
+array. Together that is ~1.4 GiB handed back to the page cache. The emitted
+order is unchanged, which `tests/test_gates.py` pins against `__iter__`.
+
+### `vocab_size = 43` is correct — 41 active + 2 reserved
+
+Checked rather than adjusted. The bands are 1 empty + 12 pieces + 2 side-to-move
++ 16 castling + 9 en-passant + 1 CLS = **41 active IDs (0–40)**, plus the two
+reserved rows documented at the top of `data/pgn_parallel.py`.
+
+`tests/test_vocab.py` reconstructs those bands from `pgn_parallel`'s own
+constants and asserts them **pairwise disjoint and contiguous** — the property a
+double count breaks and a bare total does not — then confirms it empirically
+against the 90M shards. Shrinking to 41 would save 768 parameters and make every
+shipped checkpoint back to v2 unloadable.
+
+### The gates
+
+| gate | when | what it answers |
+|---|---|---|
+| seen/unseen gap | 25% into epoch 1 | does exposure still buy accuracy? |
+| train/val gap | every epoch boundary | the durable version, comparable to 20M ep9's ~2% |
+| head-to-head | run completion | 200 paired games at 12k sims vs 20M ep9 |
+| the bar | after the match | ≥5% KL reduction **and** ≥100 ELO |
+
+The epoch-1 probe **costs no training data**. The two slices are the head and
+tail of epoch 0's sampler order, so they differ only in whether training has
+reached them yet — same distribution, same collate, mirror off. That construction
+dies at the epoch-1 boundary, which is why the train-slice-vs-val gap runs at
+every boundary as well.
+
+The KL threshold **re-scores the baseline on this run's val split** rather than
+reading an old log: the 90M rebuild re-drew the splits (452,405 val records
+against the 20M corpus's 147,963), so the two numbers would otherwise not be
+comparable. Thresholds live in `gates.py` as named constants so `git log -p`
+shows any move, and the ELO bar is judged on the **point estimate** because that
+is what was pre-registered — whether the 95% interval also clears +100 is
+reported alongside it, never substituted for it.
+
+### ELO comes from ordo, with two fallbacks
+
+Three estimators run on the same games, in order of authority. The one used is
+recorded in the verdict as `elo_source`, so a report never leaves it ambiguous.
+
+| source | why | when it is used |
+|---|---|---|
+| **ordo** | the house authority (`parse_cpuct_results.py`, `run_15k_ab.ps1`); *fits* white advantage and draw rate rather than assuming them, CI by simulation | whenever it produces a rating |
+| cutechess | its own `Elo difference: X +/- Y, LOS, DrawRatio` line, free with the match | ordo refused the input |
+| closed form | normal approximation on the trinomial score | neither of the above is finite |
+
+**The anchoring contract.** With only two players the anchor is a pure additive
+offset on the whole scale, so pinning the *baseline* at 0 makes the candidate's
+ordo rating **the ELO difference directly**, sign included:
+
+```bash
+ordo-win64.exe -q -a 0 -A "<baseline>" -D -W -s 1000 -J -p match.pgn -c out.csv
+```
+
+Verified on `benchmarking/engine/games/v5/v5_10M_vs_20M_800sims.pgn`:
+
+```
+ 1 Guofish5-10.9M-BIG   :     0.0   ----    64.0   100   64   100
+ 2 Guofish5-10.9M-SMALL :  -102.0   50.5    36.0   100   36   ---
+White advantage = 38.22 +/- 25.34
+Draw rate (equal opponents) = 52.93 % +/- 5.71
+```
+
+and the closed form on the same games gives −100.0 against ordo's −102.0. That
+2.0 ELO agreement is what makes the **disagreement warning** meaningful: at this
+sample size a large gap between two independent estimators on identical games is
+a naming or orientation bug, not a modelling difference, so >25 ELO warns and
+lands a note in the verdict.
+
+**That 100-game CI is also the sample-size argument.** ±50.5 at 100 games scales
+to roughly **±36 at 200**, so a true +100 ELO gain will show a lower bound near
++64. The bar is on the point estimate deliberately; the interval is printed next
+to it so nobody reads more precision into 200 games than they bought.
+
+**ordo legitimately refuses some inputs.** A clean sweep leaves it with
+all-wins/all-losses players, it purges them, the database stops being connected
+and it writes *no CSV at all* — reproduced here on a 6-game 0–6 smoke match.
+That is a real outcome of a real match, so it is caught, noted, and fallen
+through, never allowed to take the run down after 17 hours.
+
+---
+
+## The `MAX_LEGAL` truncation defect (pre-existing, found by the train/val gap)
+
+`legal_idx` is a fixed-width field of **`MAX_LEGAL = 128`** and Pass B truncates
+it. A position with more than 128 legal moves stores an incomplete legal set, and
+when one of its own PV moves is among those dropped, the policy target carries
+mass at an index the mask calls illegal. `log q` is `-inf` there, so that record's
+KL is `+inf` — **and one `+inf` makes the mean KL over its entire split `+inf`**.
+
+Measured in `multipv_90m`, every instance with `n_legal == 128` exactly:
+
+| split | affected | of |
+|---|---|---|
+| val | **1** (`val_0008.bin` row 31344) | 271,876 policy records |
+| train | 6 (~1e-6) | 5.77M policy records sampled |
+
+**It is not new.** The 20M run's log carries `KL inf` in 45 separate windows. It
+survived because **the gradient is clean**: `loss.backward()` seeds
+`grad_output = 1.0` on the scalar, so the infinite *value* never enters the
+backward and the weights are unharmed — pinned by
+`tests/test_truncated_legal.py`. The 20M *val* split happened to contain none, so
+`best_val` kept working there by luck.
+
+At 90M it stops being survivable, for a reason that has nothing to do with
+weights: an infinite epoch `total_loss` means `best_val` never improves, so
+**`_best.pt` is never written** and the head-to-head gate has no candidate to
+play. The pre-registered KL criterion is likewise unmeasurable.
+
+**The repair**: the target came from a multi-PV search, which only proposes legal
+moves, so any index carrying target mass *is* legal and the stored mask is merely
+missing it. `policy_kl_per_sample(..., repair_truncated_legal=True)` unions the
+target's support back into the mask — repairing a lossy field from a reliable
+one. For every record whose support already sits inside the legal set (all but
+~1e-6) the union **is** the identity, so healthy records are bit-identical; the
+tests assert exactly that before asserting anything else. Pass `False` to
+reproduce the pre-repair numbers.
+
+Confirmed on the real 452,405-record val split: `policy KL inf → 1.79827`, with
+top-1 (18.70%), top-5 (45.11%) and every value metric unchanged to the digit.
+
+> The proper fix is a Pass B reconversion with `MAX_LEGAL` raised to 218 (the
+> true maximum). That is a multi-hour reconversion of 90M records and was not
+> done here; the loss-side repair makes the metrics correct without it.
 
 ---
 
@@ -513,8 +693,10 @@ the 148k full split.
 
 ## Tests
 
-`python training/v5_multiPV/tests/run_all.py` — 48 tests, no pytest required
-(each module also runs standalone and is pytest-compatible).
+`python -m pytest training/v5_multiPV/tests/ -q` — **112 tests**. The older
+modules also run standalone via `tests/run_all.py`; the three added for the 90M
+regime use pytest fixtures and run under pytest (or standalone via
+`python <file>`).
 
 - `test_losses.py` — masked-KL correctness against a dense reference; masked
   logits contribute exactly zero probability; mask-before-log_softmax (with a
@@ -535,6 +717,30 @@ the 148k full split.
   encoder output; the value head reads CLS at 67; checkpoint→config recovery;
   stratification matches `pass_b_convert.py`; a collapsed head is caught by the
   strata but not the aggregate.
+- `test_vocab.py` — the vocabulary bands are pairwise disjoint (the double-count
+  check) and contiguous from 0; 41 active + 2 reserved = 43; square *positions*
+  are not vocabulary entries; the mirror LUT is a full-width permutation fixing
+  the reserved rows; the encoder emits only active tokens in the documented
+  slots; and the 90M shards agree, reserved band genuinely unused.
+- `test_gates.py` — `epoch_head_tail` matches the order training actually
+  follows (without which the seen/unseen gap compares two arbitrary slices and
+  still reports a plausible number); the chunked gather reproduces `__iter__`
+  exactly; the probe refuses a size that would straddle the measurement point;
+  ELO anchors and interval; **cutechess score orientation when the candidate is
+  named second**; the `Elo difference` line including its `+/- nan` sweep case;
+  both threshold criteria required; the bar is the registered one;
+  unevaluable ≠ pass; the gate payloads survive `JsonlLogger`. The ordo tests
+  run against the **real** PGNs in `benchmarking/engine/games/v5` — the
+  anchoring contract reproduces −102.0 ± 50.5, the sign flips when the roles
+  swap, ordo and the closed form agree to <25 ELO, an unknown player is a note
+  rather than an exception, and a second match with an odd game count (47)
+  checks the parser is not fitted to one file.
+- `test_truncated_legal.py` — the repair is the identity on healthy records
+  (asserted *first*); the defect reproduces as `+inf` and the repair removes it;
+  the repaired KL is a real KL that hits 0 on a perfect fit; the recovered index
+  gets live probability; **the infinite forward does not poison the backward**;
+  `check_support` still reports the defect with the repair on; and the actual
+  offending record from `val_0008.bin` row 31344.
 
 One note on the equivariant stub: the mirror identifies square `sq` with
 `sq^56`, so **any** equivariant function must assign equal logits to two

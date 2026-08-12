@@ -102,6 +102,11 @@ for _p in (str(_HERE), str(_DATA_MULTIPV), str(_PROJECT_ROOT)):
         sys.path.insert(0, _p)
 
 from dataset import MultiPVCollate, MultiPVDataset          # noqa: E402
+from gates import (SeenUnseenProbe, evaluate_thresholds,     # noqa: E402
+                   format_gap_report, format_verdict,
+                   head2head_preflight, probe_metrics,
+                   relative_gap, run_head2head, score_baseline,
+                   write_gate_report)
 from losses import (compute_losses, policy_denominator,      # noqa: E402
                     policy_kl_per_sample)
 from metrics import (PolicyAccumulator, ValueAccumulator,    # noqa: E402
@@ -252,11 +257,20 @@ def select_subset(total: int, subset, seed: int) -> "np.ndarray":
 
     `seed` is deliberately separate from the training seed: which records a run
     sees should not change because the weight init changed.
+
+    Returned as int32. At 90M records the int64 array this used to return is
+    720 MB, and the sampler holds a second one - 1.4 GB of index taken straight
+    out of the page cache that the 32 GiB corpus is competing for on a 31.8 GiB
+    box. int32 tops out at 2.1e9 records, ~24x the current corpus, and halves
+    both. The permutation itself is still drawn at int64 so the draw is
+    bit-identical to previous runs at the same seed.
     """
     perm = np.random.default_rng(seed).permutation(total)
-    if subset is None or subset >= total:
+    if subset is not None and subset < total:
+        perm = perm[:int(subset)]
+    if total > np.iinfo(np.int32).max:
         return perm
-    return perm[:int(subset)]
+    return perm.astype(np.int32, copy=False)
 
 
 def estimate_coverage(dataset, indices, n_samples: int = 200_000,
@@ -373,7 +387,16 @@ class ResumableRandomSampler(Sampler):
     `skip` are mutated from the main process between epochs - which is safe
     even with persistent_workers, because the sampler is iterated in the main
     process and only the resulting indices are shipped to workers.
+
+    The gather is CHUNKED rather than done in one shot. `self.indices[order]`
+    at 90M records materialises a third full-length array on top of `indices`
+    and `order`, and at the 20M scale that was 480 MB of transient nobody had
+    to think about. Here it is 1.1 GB, competing for the page cache the 32 GiB
+    corpus is streaming through on a 31.8 GiB box. Yielding through a 1M-element
+    window caps the transient at ~4 MB and produces exactly the same sequence.
     """
+
+    GATHER_CHUNK = 1 << 20
 
     def __init__(self, indices, seed: int, epoch: int = 0, skip: int = 0):
         self.indices = np.asarray(indices)
@@ -389,10 +412,28 @@ class ResumableRandomSampler(Sampler):
     def __iter__(self):
         g = np.random.default_rng(self.seed * 1_000_003 + self.epoch)
         order = g.permutation(self.n)
-        return iter(self.indices[order][self.skip:])
+        for lo in range(self.skip, self.n, self.GATHER_CHUNK):
+            block = self.indices[order[lo:lo + self.GATHER_CHUNK]]
+            yield from block.tolist()
 
     def __len__(self) -> int:
         return max(0, self.n - self.skip)
+
+    def epoch_head_tail(self, epoch: int, k: int):
+        """The first k and last k record indices of `epoch`'s order.
+
+        What makes the seen/unseen probe free: these are two uniform draws from
+        the same corpus that differ only in WHEN training reaches them, so no
+        record has to be withheld to get an unseen slice. Drawn from the same
+        generator __iter__ uses, so they describe the order training will
+        actually follow rather than a parallel one.
+        """
+        k = int(min(k, self.n // 2))
+        g = np.random.default_rng(self.seed * 1_000_003 + int(epoch))
+        order = g.permutation(self.n)
+        head = self.indices[order[:k]].copy()
+        tail = self.indices[order[self.n - k:]].copy()
+        return head, tail
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +889,108 @@ def run_lr_range_test(model, loader, device, amp_ctx, args, run_info,
 
 
 # ---------------------------------------------------------------------------
+# the automated gate: KL against the baseline, then the match, then the bar
+# ---------------------------------------------------------------------------
+def run_gate(args, out_dir: Path, tag: str, val_full_ds, collate_val, device,
+             amp_ctx, last_metrics: dict, jsonl) -> dict:
+    """Everything that happens after the last optimizer step, unattended.
+
+    Never raises. This fires at the end of a ~17-hour run, so a gate that threw
+    would be indistinguishable from the training having failed, and would do it
+    AFTER every checkpoint was already safely on disk. Failures are logged,
+    recorded in the report, and returned.
+    """
+    log("\n" + "=" * 96)
+    log("AUTOMATED GATE")
+    log("=" * 96)
+
+    payload: dict = {"requested": True}
+    candidate = out_dir / f"{tag}_{args.h2h_candidate}.pt"
+    baseline = args.h2h_baseline
+
+    if not candidate.exists():
+        log(f"  [gate] candidate checkpoint missing: {candidate}")
+        payload["error"] = f"candidate missing: {candidate}"
+        return payload
+    if baseline is None:
+        log("  [gate] --h2h-baseline not set; nothing to compare against.")
+        payload["error"] = "no baseline configured"
+        return payload
+    if not Path(baseline).exists():
+        log(f"  [gate] baseline checkpoint missing: {baseline}")
+        payload["error"] = f"baseline missing: {baseline}"
+        return payload
+
+    payload["candidate"] = str(candidate)
+    payload["baseline"] = str(baseline)
+    log(f"  candidate {candidate.name}  ({args.h2h_candidate})")
+    log(f"  baseline  {Path(baseline).name}")
+
+    # --- criterion 1: KL, both terms measured the same way -----------------
+    candidate_kl = float(last_metrics.get("policy_kl", float("nan")))
+    baseline_metrics = {}
+    try:
+        t0 = time.time()
+        baseline_metrics = score_baseline(
+            Path(baseline), val_full_ds, collate_val, device, amp_ctx,
+            batch_size=args.val_batch, workers=args.val_workers,
+            prefetch=args.prefetch_factor, policy_weight=args.policy_weight,
+            value_weight=args.value_weight)
+        log(f"\n  baseline scored on THIS run's val split "
+            f"({baseline_metrics['n']:,} records, {time.time() - t0:.1f}s): "
+            f"KL {baseline_metrics['policy_kl']:.5f} "
+            f"MSE {baseline_metrics['value_mse']:.5f}")
+        log(f"  candidate on the same split: "
+            f"KL {candidate_kl:.5f} "
+            f"MSE {last_metrics.get('value_mse', float('nan')):.5f}")
+    except Exception as exc:                            # noqa: BLE001
+        log(f"  [gate] baseline scoring failed: {type(exc).__name__}: {exc}")
+        payload["baseline_error"] = f"{type(exc).__name__}: {exc}"
+    payload["baseline_metrics"] = baseline_metrics
+    payload["candidate_metrics"] = {
+        "policy_kl": candidate_kl,
+        "value_mse": last_metrics.get("value_mse", float("nan")),
+        "total_loss": last_metrics.get("total_loss", float("nan")),
+    }
+
+    # The engine processes each capture their own CUDA graph ladder (~730 MiB
+    # at 10.9M) and concurrency multiplies that, so hand the VRAM back before
+    # any of them start rather than competing with a dead training graph.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- criterion 2: the match --------------------------------------------
+    sims_label = (f"{args.h2h_sims // 1000}k" if args.h2h_sims >= 1000
+                  else str(args.h2h_sims))
+    event = f"{tag}_vs_{Path(baseline).parent.name}_{sims_label}"
+    match_dir = (args.h2h_out if args.h2h_out is not None
+                 else _PROJECT_ROOT / "benchmarking" / "engine" / "games" /
+                 "v6" / "head2head" / event)
+    match = run_head2head(
+        _PROJECT_ROOT, candidate, Path(baseline), Path(match_dir),
+        games=args.h2h_games, nodes=args.h2h_sims,
+        concurrency=args.h2h_concurrency,
+        candidate_name=f"cand-{tag}", baseline_name="base-20M-ep9",
+        event=event, log=log)
+    payload["match"] = match.to_dict()
+    # Nested, not splatted: MatchResult carries its own `event` field and
+    # JsonlLogger.write's first positional is also called `event`.
+    jsonl.write("head2head", match=match.to_dict())
+
+    # --- the pre-registered bar --------------------------------------------
+    verdict = evaluate_thresholds(
+        candidate_kl, baseline_metrics.get("policy_kl", float("nan")), match)
+    payload["verdict"] = verdict.to_dict()
+    log(format_verdict(verdict, match))
+    jsonl.write("gate_verdict", verdict=verdict.to_dict())
+
+    report = out_dir / f"{tag}_gate_report.json"
+    write_gate_report(report, payload)
+    log(f"\n  gate report -> {report}")
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -970,6 +1113,44 @@ def build_parser() -> argparse.ArgumentParser:
                         "--out-dir by its recorded step (never _best.pt, "
                         "which may be several epochs behind)")
 
+    g = p.add_argument_group("evaluation gates")
+    g.add_argument("--gap-probe", type=int, default=0,
+                   help="records per side of the seen/unseen probe (0 = off). "
+                        "Costs no training data: the two slices are the head "
+                        "and tail of epoch 0's sampler order, which differ "
+                        "only in whether training has reached them yet")
+    g.add_argument("--gap-at-frac", type=float, default=0.25,
+                   help="point in epoch 1 at which the seen/unseen gap is "
+                        "measured; must clear the probe size at both ends")
+    g.add_argument("--gap-every-epoch", dest="gap_every_epoch",
+                   action="store_true", default=True,
+                   help="also report the train-probe-vs-val gap at every epoch "
+                        "boundary - the version that stays meaningful once "
+                        "every record has been seen (default: on)")
+    g.add_argument("--no-gap-every-epoch", dest="gap_every_epoch",
+                   action="store_false")
+    g.add_argument("--h2h-gate", dest="h2h_gate", action="store_true",
+                   default=False,
+                   help="on run completion, play an automated match against "
+                        "--h2h-baseline and evaluate the pre-registered "
+                        "thresholds. OFF by default: this launches a "
+                        "multi-hour external process")
+    g.add_argument("--no-h2h-gate", dest="h2h_gate", action="store_false")
+    g.add_argument("--h2h-baseline", type=Path, default=None,
+                   help="checkpoint to beat; also the KL reference, re-scored "
+                        "on THIS run's val split rather than read off an old log")
+    g.add_argument("--h2h-candidate", type=str, default="best",
+                   choices=("best", "last"),
+                   help="which of this run's checkpoints enters the match")
+    g.add_argument("--h2h-games", type=int, default=200,
+                   help="paired: each opening is played twice with colours "
+                        "reversed, so this is rounded up to an even number")
+    g.add_argument("--h2h-sims", type=int, default=12000)
+    g.add_argument("--h2h-concurrency", type=int, default=2)
+    g.add_argument("--h2h-out", type=Path, default=None,
+                   help="match artifacts directory (default: under "
+                        "benchmarking/engine/games/v6/head2head)")
+
     g = p.add_argument_group("lr range test")
     g.add_argument("--lr-range-test", action="store_true", default=False)
     g.add_argument("--lr-range-steps", type=int, default=500,
@@ -1015,7 +1196,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     # against the project root rather than the CWD, so the script works from
     # anywhere instead of only from the repo root.
     for name in ("shards", "manifest", "out_dir", "resume", "config",
-                 "lr_range_plot"):
+                 "lr_range_plot", "h2h_baseline", "h2h_out"):
         v = getattr(args, name, None)
         if v is None or (name == "resume" and str(v) == "latest"):
             continue          # 'latest' is a sentinel, resolved after out_dir
@@ -1293,6 +1474,57 @@ def main(argv=None) -> int:
                 model_config=model_config.to_dict(),
                 train_config=sanitize_config(vars(args)))
 
+    # --- seen/unseen probe -------------------------------------------------
+    # Built from epoch 0's order, so it describes the order training will
+    # actually follow. Costs no training data - see gates.SeenUnseenProbe.
+    gap_probe = None
+    if args.gap_probe:
+        gap_probe = SeenUnseenProbe(sampler, args.gap_probe, args.gap_at_frac)
+        if gap_probe.valid:
+            log(f"\nSeen/unseen probe: {gap_probe.n_probe:,} records/side, "
+                f"measured at {args.gap_at_frac * 100:.0f}% of epoch 1")
+            log(f"      seen = head of epoch-0 order (trained by then), "
+                f"unseen = tail (not yet reached)")
+        else:
+            log(f"\n[WARN] --gap-probe {args.gap_probe:,} does not fit around "
+                f"--gap-at-frac {args.gap_at_frac}: each side is "
+                f"{gap_probe.n_probe / gap_probe.n_total:.3f} of the epoch, so "
+                f"the slices would overlap the measurement point. Probe "
+                f"DISABLED - lower --gap-probe or move --gap-at-frac to the "
+                f"middle of the epoch.")
+            gap_probe = None
+    # A fixed train slice for the epoch-boundary gap, which stays meaningful
+    # after epoch 1 when 'unseen training record' no longer exists.
+    train_probe_idx = (train_idx[:args.gap_probe] if args.gap_every_epoch
+                       and args.gap_probe else None)
+
+    # --- gate preflight, at MINUTE ZERO ------------------------------------
+    # run_head2head preflights itself, but that happens ~17 hours in. A typo'd
+    # baseline path or a missing opening book is worth discovering now, while
+    # it costs nothing to fix. Deliberately a WARNING and not fatal: a run whose
+    # gate cannot fire still produces the checkpoints, and killing it here would
+    # throw away the expensive half over the cheap one.
+    if args.h2h_gate:
+        problems = list(head2head_preflight(
+            _PROJECT_ROOT,
+            out_dir / f"{tag}_{args.h2h_candidate}.pt",   # written later, skipped
+            Path(args.h2h_baseline) if args.h2h_baseline else Path("<unset>")))
+        problems = [p for p in problems if "candidate" not in p]
+        if args.h2h_baseline is None:
+            problems.append("--h2h-gate is on but --h2h-baseline is not set")
+        if problems:
+            log(f"\n[WARN] head-to-head gate preflight found "
+                f"{len(problems)} problem(s) - the gate will be SKIPPED at the "
+                f"end of this run unless they are fixed before then:")
+            for p in problems:
+                log(f"        {p}")
+        else:
+            log(f"\nGate preflight OK: cutechess, opening book, uci wrapper and "
+                f"baseline all resolve")
+            log(f"      on completion: {args.h2h_games} paired games @ "
+                f"{args.h2h_sims:,} sims vs {Path(args.h2h_baseline).name}, "
+                f"then the >=5% KL / >=100 ELO bar")
+
     # --- interrupt handling ----------------------------------------------
     interrupted = {"flag": False}
 
@@ -1495,6 +1727,25 @@ def main(argv=None) -> int:
                         f"pred_std {vm['val_value_pred_std']:.4f} "
                         f"({vm['val_seconds']:.1f}s, n={vm['val_n']:,})")
 
+                # seen/unseen gap - once, partway through epoch 1, while the
+                # tail of this epoch's order is still genuinely untouched.
+                if gap_probe is not None and gap_probe.due(
+                        epoch, (w + 1) / steps_per_epoch):
+                    gap = gap_probe.measure(
+                        model, train_ds, collate_val, device, amp_ctx,
+                        batch_size=args.val_batch, workers=args.val_workers,
+                        prefetch=args.prefetch_factor,
+                        policy_weight=args.policy_weight,
+                        value_weight=args.value_weight)
+                    gap["step"] = step
+                    gap["epoch"] = epoch
+                    log(format_gap_report(
+                        gap, f"Seen/unseen gap at step {step:,} "
+                             f"({gap['n_probe']:,}/side, {gap['seconds']:.1f}s)"))
+                    log(f"  reference: the 20M ep9 run's gap is ~2%; with 4.5x "
+                        f"the unique data this is expected to shrink toward 0")
+                    jsonl.write("seen_unseen_gap", **sanitize_config(gap))
+
                 if args.ckpt_every and step % args.ckpt_every == 0:
                     _save("step", out_dir / f"{tag}_step{step}.pt", last_metrics)
                     # Keep _last.pt meaning "the newest resumable state". If it
@@ -1560,6 +1811,33 @@ def main(argv=None) -> int:
                     f"loss was scaled by {cov_ratio:.3f}x. Re-run with "
                     f"--coverage {cov_r:.6f}, or check that select_subset is "
                     f"being applied.")
+            # The durable generalisation gap: a fixed slice of TRAIN against
+            # the val split, both scored deterministically. Unlike the epoch-1
+            # head/tail construction this stays meaningful for all 4 epochs,
+            # and it is the quantity the ~2% quoted for 20M ep9 refers to.
+            if train_probe_idx is not None:
+                t0 = time.time()
+                seen = probe_metrics(
+                    model, train_ds, train_probe_idx, collate_val, device,
+                    amp_ctx, batch_size=args.val_batch,
+                    workers=args.val_workers, prefetch=args.prefetch_factor,
+                    policy_weight=args.policy_weight,
+                    value_weight=args.value_weight)
+                held = {"policy_kl": metrics["policy_kl"],
+                        "value_mse": metrics["value_mse"],
+                        "total_loss": metrics["total_loss"]}
+                egap = relative_gap(held, seen)
+                egap.update({"epoch": epoch + 1, "step": step,
+                             "n_probe": len(train_probe_idx),
+                             "seconds": time.time() - t0,
+                             "construction": "fixed train slice vs val split"})
+                log(format_gap_report(
+                    egap, f"Epoch {epoch + 1} train/val gap "
+                          f"({len(train_probe_idx):,} train records vs "
+                          f"{metrics['n']:,} val, {egap['seconds']:.1f}s)"))
+                jsonl.write("train_val_gap", **sanitize_config(egap))
+                metrics["train_val_gap_rel"] = egap["total_loss_gap_rel"]
+
             jsonl.write("epoch", **sanitize_config(metrics))
 
             _save("epoch", out_dir / f"{tag}_ep{epoch + 1}.pt", metrics)
@@ -1616,9 +1894,20 @@ def main(argv=None) -> int:
     log(f"  samples/s overall {samples_seen / max(1e-9, total_time):,.0f}  "
         f"tokens/s {samples_seen * args.seq_len / max(1e-9, total_time) / 1e6:.2f}M")
     log("=" * 96)
+
+    # --- automated gate ----------------------------------------------------
+    # Runs on completion, with no human in the loop. Deliberately AFTER the
+    # run_end accounting above is computed but before it is written, so the
+    # verdict lands in the same jsonl record as the run it judges.
+    gate_payload = None
+    if args.h2h_gate:
+        gate_payload = run_gate(args, out_dir, tag, val_full_ds, collate_val,
+                                device, amp_ctx, last_metrics, jsonl)
+
     jsonl.write("run_end", **{**sanitize_config(last_metrics),
                               "step": step, "samples": samples_seen,
-                              "seconds": total_time, "best_val": best_val})
+                              "seconds": total_time, "best_val": best_val,
+                              "gate": gate_payload or {}})
     jsonl.close()
     return 0
 

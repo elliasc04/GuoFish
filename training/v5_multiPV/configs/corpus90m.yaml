@@ -1,0 +1,157 @@
+# GuoFish v5 - multi-PV student, run "corpus90m": 90M x 4 epochs.
+#
+#   python training/v5_multiPV/train_v5.py --config training/v5_multiPV/configs/corpus90m.yaml
+#
+# Explicit CLI flags override anything here. Keys are the argparse dests
+# (underscores, no leading --); an unknown key is a hard error rather than a
+# silent no-op, so a typo cannot quietly leave a default in place.
+#
+# WHAT CHANGES FROM base.yaml, AND WHAT MUST NOT
+# ==============================================
+# Changed:  the corpus (30M-target shards -> 90M), epochs 9 -> 4, the manifest
+#           that travels into every checkpoint, and the evaluation gates.
+# UNCHANGED and deliberately so: effective batch 1024, max_lr 3.5e-4, the
+#           d384x6 shape, and the whole precision/compile stack. The LR was
+#           range-tested at effective batch 1024 for THIS net; moving either
+#           would make the two runs incomparable, which is the entire point of
+#           changing only the data.
+
+# --- data -------------------------------------------------------------------
+shards:            data/processed/multipv_90m
+manifest:          data/multiPV/manifests/dataset_manifest_90m.json
+
+# 0 = ALL 90,076,117 train records. base.yaml took a 10M prefix of a seeded
+# global permutation because it wanted a representative SUBSET; here the subset
+# is the corpus, so the permutation only fixes the order and select_subset
+# returns the whole thing.
+#
+# This lands the schedule at 87,965 optimizer steps/epoch x 4 = 351,860, against
+# the 351,562 the brief projected from a round 90.0M. The 0.08% difference is
+# the 76,117 real records that a round number would have thrown away, and the
+# step count is DERIVED (plan_epoch -> len(windows) -> x epochs), never written
+# down - so it stays correct if the corpus is ever rebuilt at a different size.
+subset:            0
+subset_seed:       20260802        # seeds WHICH records; separate from `seed`
+mirror_prob:       0.5             # train-time colour mirror, per sample
+
+# VALIDATION MIRRORING IS OFF, AND MUST STAY OFF FOR EVERY SUBSEQUENT RUN.
+# Stochastic val augmentation makes val loss incomparable across runs, and this
+# run's val KL is one half of a pre-registered threshold.
+val_mirror_prob:   0.0
+
+temperature:       null            # null = use the stored policy target (T=30)
+revalue:           false           # use the stored float16 value target as-is
+
+# 8 workers, MEASURED on the 90M shards rather than inherited. The 20M corpus
+# (10.5 GiB) sat entirely in page cache; 32 GiB on a 31.8 GiB box cannot, so
+# every access is a random NVMe read and the old figure did not transfer. It
+# holds up anyway - with the real sampler and collate at micro-batch 512:
+#     20M corpus, 8 workers   19,193 samples/s   (control, page-cached)
+#     90M corpus, 8 workers   18,441 samples/s
+#     90M corpus, 12 workers  30,972 samples/s
+# against a GPU demand of ~6,100. 3x headroom at 8 workers, so the run stays
+# GPU-bound and no loader refactor is warranted. 12 workers is the lever if a
+# cold cache ever bites, but it is NOT the default: worker RAM comes straight
+# out of the page cache this corpus is competing for.
+workers:           8
+val_workers:       4
+prefetch_factor:   2
+drop_last:         true
+
+# --- model (~10.9M params) --------------------------------------------------
+# d384x6, unchanged. vocab_size 43 is 41 active token IDs (0-40) plus the two
+# reserved rows documented in data/pgn_parallel.py - NOT a double count of the
+# four state tokens. tests/test_vocab.py pins the bands pairwise-disjoint.
+d_model:           384
+num_layers:        6
+nhead:             6
+head_dim:          64
+dim_feedforward:   1536
+vocab_size:        43
+seq_len:           68
+dropout:           0.1
+activation:        gelu
+final_norm:        true
+smolgen:           false
+
+# --- optimisation -----------------------------------------------------------
+# 4 epochs, not 9. The regime trades passes for unique records to cut value-head
+# poisoning in deep MCTS: 4.5x the data at 44% of the epochs.
+epochs:            4
+
+micro_batch:       512
+accum_steps:       2               # effective batch 1024 - UNCHANGED
+max_lr:            0.00035         # UNCHANGED; range-tested at this batch
+pct_start:         0.1
+div_factor:        25.0
+final_div_factor:  10000.0
+weight_decay:      0.01
+beta1:             0.9
+beta2:             0.999
+adam_eps:          1.0e-8
+grad_clip:         1.0
+policy_weight:     1.0
+value_weight:      1.0
+policy_norm:       const
+
+coverage:          null            # null = MEASURE it on the selected records
+coverage_samples:  200000
+max_steps:         0
+seed:              20260802
+
+# --- precision --------------------------------------------------------------
+amp:               bf16
+tf32:              true
+matmul_precision:  high
+compile:           true            # +10%, and the difference between ~17 h and
+                                   # ~22 h over four epochs
+
+# --- logging / checkpointing ------------------------------------------------
+out_dir:           models/guofish5_90M
+log_every:         50
+val_every:         2000            # ~44 val points/epoch at 87,965 steps
+val_subset:        20000
+val_batch:         1024
+
+# 10000, not base.yaml's 5000. An epoch is now 87,965 steps rather than 9,766,
+# so 5000 would checkpoint ~18x per epoch; at 10000 it is ~29 minutes of wall
+# clock between resumable states, and the writes stay off the NVMe that is now
+# streaming a 32 GiB working set.
+ckpt_every:        10000
+keep_step_ckpts:   3
+mirror_subset:     10000
+drift_window:      200
+drift_tol:         0.05
+
+# --- evaluation gates -------------------------------------------------------
+# Seen/unseen: 200k records per side. The two slices are the head and tail of
+# epoch 0's sampler order, so they differ only in whether training has reached
+# them - no record is withheld. 200k/side is 0.22% of the epoch at each end,
+# comfortably clear of the 25% measurement point.
+gap_probe:         200000
+gap_at_frac:       0.25
+gap_every_epoch:   true            # train-slice vs val at every boundary; the
+                                   # version that survives epoch 1, and the one
+                                   # comparable to the 20M ep9 ~2% figure
+
+# Head-to-head on completion. 200 paired games (100 openings x2 colours) at
+# 12,000 sims. At v5's ~13,900 delivered sims/s this is roughly 3 h serial,
+# ~2.5-3 h at concurrency 2 - budget it on top of the ~17 h of training.
+h2h_gate:          true
+h2h_baseline:      models/guofish5_20M/v5_10.9M_ep9.pt
+h2h_candidate:     best
+h2h_games:         200
+h2h_sims:          12000
+h2h_concurrency:   2
+
+# --- LR range test (terminal mode: --lr-range-test) -------------------------
+# Not re-run for this corpus: the test measures the LOSS SURFACE of this net at
+# effective batch 1024, and neither the net nor the batch changed.
+lr_range_steps:    500
+lr_range_min:      1.0e-5
+lr_range_max:      5.0e-3
+lr_range_smooth:   0.9
+lr_range_div:      4.0
+lr_range_diverge:  4.0
+lr_range_slope_window: 10
+lr_range_min_span: 0.05

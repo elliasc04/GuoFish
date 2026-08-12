@@ -29,7 +29,8 @@ import torch
 
 
 def masked_log_softmax(logits: torch.Tensor, legal_mask: torch.Tensor,
-                       allow_empty: bool = True) -> tuple:
+                       allow_empty: bool = True,
+                       extra_legal: Optional[torch.Tensor] = None) -> tuple:
     """log-softmax restricted to the legal moves.
 
     Returns (log_probs, mask_bool). Illegal entries of `log_probs` are exactly
@@ -39,8 +40,33 @@ def masked_log_softmax(logits: torch.Tensor, legal_mask: torch.Tensor,
     none are expected in this corpus but a single one turns the whole batch into
     NaN). Such a row falls back to unmasked softmax; it is a has_policy=0 record
     by construction, so it contributes nothing either way.
+
+    `extra_legal` is a second bool mask UNIONED into the legal set, and exists
+    for one specific corpus defect. `legal_idx` is a fixed-width field of
+    MAX_LEGAL=128 entries and Pass B TRUNCATES it, so a position with more than
+    128 legal moves stores an incomplete legal set. When one of the PV moves
+    falls outside the 128 that were kept, the target carries mass at an index
+    this mask calls illegal - log q is -inf there, and the record's KL is +inf.
+
+    That is a storage artifact, not a claim about chess: the target came from a
+    multi-PV search that only ever proposes legal moves, so any index with
+    target mass IS legal and the stored mask is simply missing it. Unioning the
+    target's support back in repairs the lossy field from the reliable one.
+
+    Measured incidence in data/processed/multipv_90m: 1 record in 452,405 on
+    the val split and ~1 per million policy records on train - every one of them
+    with n_legal == 128 exactly. Rare enough to have gone unnoticed, and fatal
+    anyway, because a single +inf makes the MEAN KL over a whole split +inf.
+    The 20M run shows it in 45 separate log windows.
+
+    For every record whose target support already sits inside the legal set -
+    which is all but ~1e-6 of them - `mask | support` IS `mask`, so this is
+    bit-identical to not passing it. It cannot quietly change a healthy record.
     """
     mask = legal_mask if legal_mask.dtype == torch.bool else legal_mask > 0
+    if extra_legal is not None:
+        mask = mask | (extra_legal if extra_legal.dtype == torch.bool
+                       else extra_legal > 0)
     if allow_empty:
         empty = ~mask.any(dim=-1, keepdim=True)
         if bool(empty.any()):
@@ -54,18 +80,33 @@ def masked_log_softmax(logits: torch.Tensor, legal_mask: torch.Tensor,
 def policy_kl_per_sample(logits: torch.Tensor, target: torch.Tensor,
                          legal_mask: torch.Tensor,
                          has_policy: Optional[torch.Tensor] = None,
-                         check_support: bool = False) -> tuple:
+                         check_support: bool = False,
+                         repair_truncated_legal: bool = True) -> tuple:
     """KL(target || model) per sample, (B,).
 
     `target` is the dense 4096 distribution (~0.95 over PV moves, 0.05 spread
     over legal moves) and is all-zero where has_policy=0. No argmax is taken
     anywhere: the whole distribution is the label.
-    """
-    log_q, mask = masked_log_softmax(logits, legal_mask)
 
+    `repair_truncated_legal` unions the target's support into the legal mask,
+    which makes the KL finite for the ~1e-6 of records whose 128-entry
+    `legal_idx` was truncated past one of their own PV moves. See
+    masked_log_softmax. Default ON: without it a single such record makes the
+    mean KL over its whole split +inf, and this run's val KL is one half of a
+    pre-registered threshold. Pass False to reproduce the pre-repair numbers.
+    """
     support = target > 0
+    log_q, mask = masked_log_softmax(
+        logits, legal_mask, extra_legal=support if repair_truncated_legal else None)
+
     if check_support:
-        leaked = (support & ~mask)
+        # Deliberately against the RAW legal mask, not the repaired one. The two
+        # are different questions: the repair asks "can this record produce a
+        # finite KL", check_support asks "did the converter emit mass outside
+        # the legal set at all" - and the answer to the second must not become
+        # 'no' just because the first was switched on.
+        raw = legal_mask if legal_mask.dtype == torch.bool else legal_mask > 0
+        leaked = (support & ~raw)
         if bool(leaked.any()):
             rows = torch.nonzero(leaked.any(dim=-1)).flatten().tolist()
             raise AssertionError(
