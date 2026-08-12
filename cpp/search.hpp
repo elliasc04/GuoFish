@@ -201,6 +201,24 @@ struct SearchConfig {
     // that by itself: pondering lives above this layer.
     double ponder_decay = 1.0;
 
+    // C11b. T in `softmax(logits / T)`, applied at the root and at every
+    // interior node alike. 1.0f is the identity, is the default, and SKIPS the
+    // divide — see `apply_policy_temperature` in cpp/evaluator.hpp for the
+    // three properties that depend on that (divide not reciprocal, bit-identity
+    // at 1.0, and float rather than double).
+    //
+    // THE ONE `float` IN A STRUCT OF `double`s, and that is the point. The
+    // reference divides a float32 tensor by a Python float, which torch's
+    // weak-scalar rule performs in float32; a double here would promote every
+    // logit, divide in double and round back, which is a different number.
+    //
+    // TWO PATHS REFUSE IT RATHER THAN IGNORE IT. The replay dump replays
+    // priors that were softmaxed elsewhere, so a temperature could not reach
+    // them; and the Gate 1 equivalence build replays a T = 1.0 reference dump,
+    // where a non-identity temperature would be a silent mismatch. Both throw
+    // at construction or at search entry — see the constructor.
+    float policy_temperature = 1.0f;
+
     // C8. Run the full-tree structural diff after every compaction, even in a
     // build with asserts off.
     //
@@ -1252,6 +1270,36 @@ public:
         if (config.max_tree_depth < 1) {
             throw std::invalid_argument("guofish::ReplaySearch: max_tree_depth must be >= 1");
         }
+        // C11b. It DIVIDES the logits, so zero and negatives are not
+        // "unusual settings" — they are a division by zero and an inverted
+        // policy. The reference validates it the same way and with the same
+        // parenthetical (SearchParams.__post_init__).
+        if (!(config.policy_temperature > 0.0f)) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch: policy_temperature must be > 0 (it divides the "
+                "logits), got " + std::to_string(config.policy_temperature));
+        }
+#ifdef GUOFISH_VALUE_SUM_DOUBLE
+        // C11b requirement 5: THE EQUIVALENCE BUILD ASSERTS T = 1.0, it does
+        // not document it.
+        //
+        // This is the build Gate 1 runs, and Gate 1 replays priors from a
+        // reference dump recorded at POLICY_TEMPERATURE = 1.0. Those priors are
+        // already post-softmax, so a temperature set here would not reach them
+        // and would not change a single node of the tree — the run would pass
+        // while claiming to have been sharpened. That is the silent mismatch,
+        // and a build whose entire purpose is bit-exactness against Python is
+        // the worst possible place to leave one available.
+        if (config.policy_temperature != 1.0f) {
+            throw std::invalid_argument(
+                "guofish::ReplaySearch: the Gate 1 equivalence build "
+                "(GUOFISH_VALUE_SUM=double) accepts only policy_temperature = 1.0, got " +
+                std::to_string(config.policy_temperature) +
+                ".\n  Gate 1 replays priors a T = 1.0 reference already softmaxed; a "
+                "temperature set here would be silently ignored rather than applied. "
+                "Build with GUOFISH_VALUE_SUM=q32 to search at a temperature.");
+        }
+#endif
         if (config.cache_slots != 0) {
             cache_.emplace(config.cache_slots, config.cache_shards);
         }
@@ -2877,9 +2925,26 @@ private:
         }
 
         live_priors_.resize(packed.size());
+        // C11b. THE TEMPERATURE IS APPLIED HERE AND NOWHERE ELSE, and that one
+        // fact is requirement 3 of the brief.
+        //
+        // Every live expansion in the process arrives at this line. The
+        // dispatcher calls it directly after a batch crossing; the serial
+        // descent reaches it through `evaluate_and_expand`; and the ROOT
+        // reaches it through `evaluate_and_expand` too, because C10 unified the
+        // root onto the interior path (see expand_root). So there is no second
+        // place a temperature could be applied differently, which means the
+        // root and every interior node are softmaxed at the same sharpness.
+        //
+        // That is not a nicety. The reference's root/interior split — GPU
+        // softmax at the root, CPU softmax everywhere else, two answers for one
+        // position — is the defect C10 measured at 1.9e-9 and unified away. A
+        // temperature threaded into the interior path alone would re-create
+        // exactly that inconsistency under a new name and at a far larger
+        // magnitude, which is the worse version of a defect already paid for.
         gather_softmax_canonical(evaluator_->policy_row(eval_row), packed.data(),
                                  generation.data(), packed.size(), live_scratch_,
-                                 live_priors_.data());
+                                 live_priors_.data(), config_.policy_temperature);
         const NetworkValue value(static_cast<double>(evaluator_->value_at(eval_row)));
 
         expand(node, packed.data(), live_priors_.data(), packed.size(), packed, raw,
@@ -2904,6 +2969,21 @@ private:
         if (evaluator_ == nullptr && dump_.empty()) {
             throw std::logic_error(std::string("guofish::ReplaySearch::") + entry +
                                    ": no replay dump loaded and no live evaluator installed");
+        }
+        // C11b. The replay path never reaches `gather_softmax_canonical` — its
+        // priors were softmaxed by whatever produced the dump — so a
+        // temperature set here would be accepted and then have no effect. That
+        // is the same failure the equivalence-build assert exists for, one
+        // build wider, and the answer is the same: refuse loudly. Checked once
+        // per search rather than per node, which costs nothing.
+        if (evaluator_ == nullptr && config_.policy_temperature != 1.0f) {
+            throw std::invalid_argument(
+                std::string("guofish::ReplaySearch::") + entry +
+                ": policy_temperature is " + std::to_string(config_.policy_temperature) +
+                " but this search has no live evaluator.\n  The replay dump holds "
+                "priors that were already softmaxed, so a temperature could only be "
+                "ignored here, never applied. Install an evaluator with "
+                "set_evaluator(), or leave policy_temperature at 1.0.");
         }
     }
 

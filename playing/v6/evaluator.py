@@ -62,15 +62,36 @@ import torch
 
 import guofish_core
 
-# The v5 model contract, imported from the reference rather than restated. It is
-# three equalities — seq_len 68, cls_index 67, policy_size 4096 — and every one of
-# them is an input-format assumption whose violation means silently evaluating a
-# position the network never saw in that form. `core.mctsv4` owns the check
-# because it owns the tokenizer that produces the format.
+# THE FORMAT CONTRACT, TAKEN FROM THE C++ CORE RATHER THAN FROM `core.mctsv4`.
 #
-# This is the ONLY thing this module takes from the reference, and it deliberately
-# does not import the reference's search.
-from core.mctsv4 import AUTOCAST_DTYPE, POLICY_SIZE, SEQ_LENGTH, require_v5_config
+# It used to be imported from the reference, on the reasoning that whoever owns
+# the tokenizer owns the contract. That reasoning is now inverted: `cpp/tokens.hpp`
+# owns the tokenizer the engine actually runs (`kSeqLength`, `kIdxCls`), and
+# `cpp/evaluator.hpp` owns the policy gather (`kPolicySize`), and both are
+# compile-time constants baked into the extension. `guofish_core` re-exports them,
+# so reading them from there means this module cannot disagree with the buffers it
+# is wrapping — which is what the disagreement would actually corrupt.
+#
+# `core.mctsv4` is being retired with the Python search; nothing here imports it
+# any more, and nothing here imports a Python MCTS at all.
+SEQ_LENGTH = guofish_core.SEQ_LENGTH
+POLICY_SIZE = guofish_core.POLICY_SIZE
+
+# The precision v5 was trained under and every forward here runs in. Restated
+# rather than imported for the same reason as above; `playing/v6/graphs.py` pins
+# the identical value and tests/test_c10b_graphs.py compares the two paths
+# bit-for-bit, so a drift between them cannot go unnoticed.
+AUTOCAST_DTYPE = torch.bfloat16
+
+# The smallest embedding table that can answer every token id the C++ tokenizer
+# emits. `cpp/tokens.hpp` tops out at `kTokenCls = 40`, so 41 rows is the floor
+# and both shipped generations carry 43.
+#
+# Checked because the failure mode is silent: `nn.Embedding` with an index past
+# the table does an out-of-bounds DEVICE-SIDE read, which returns garbage priors
+# (or trips an async IMA thousands of launches later) rather than raising
+# anything a caller could attribute.
+MIN_VOCAB_SIZE = 41
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = REPO_ROOT / "models" / "guofish5_20M" / "v5_10.9M_best.pt"
@@ -86,24 +107,113 @@ DEFAULT_SWITCH_INTERVAL = guofish_core.DEFAULT_SWITCH_INTERVAL
 POISON_BITS = 0x7FC0
 
 
+def require_engine_contract(model: torch.nn.Module) -> int:
+    """Refuse any model whose I/O does not match the buffers C++ will hand it.
+
+    REPLACES `core.mctsv4.require_v5_config`, and it is deliberately a WEAKER
+    check against a DIFFERENT thing.
+
+    The old gate asked "is this the v5 multi-PV student?", answered by duck-typing
+    on a `ModelConfig` attached to the module. That question was right for
+    `core.mctsv4`, which is specialised to that student — but it is the wrong
+    question here, and it was refusing models this engine can actually run. The
+    C++ core never sees the model: it writes 68 int32s, reads back 4096 bf16
+    logits and one float, and is indifferent to what happened in between. So the
+    only thing worth refusing is a model that breaks THAT, and carrying a
+    ModelConfig is not it.
+
+    Concretely, the legacy `ChessTransformerV2` (guofish2..guofish4) satisfies
+    every equality below and has no `.config` at all, so the old gate rejected a
+    net whose tensors are shape-for-shape identical to the one it accepted.
+
+    What is checked, and why each one is silent if it is not:
+
+      seq_length   the module's own advertised token count. Both generations set
+                   it (`ChessTransformerV5.__init__` calls the spelling
+                   "load-bearing" for exactly this reason). A mismatch means C++
+                   fills 68 columns of a row the model reads as some other width.
+      vocab_size   see MIN_VOCAB_SIZE — an out-of-range embedding index is a
+                   device-side garbage read, not an exception.
+      cls_index    CHECKED ONLY ON v5, because only v5 exposes it. V2 hardcodes
+        policy_size 67 and 4096 as literals inside `forward`, so there is no
+                   attribute to disagree with; its shapes are pinned by the class
+                   instead, and `load_state_dict(strict=True)` is what enforces
+                   them.
+
+    Returns the model's `seq_length`. Raises ValueError on any mismatch — never
+    warns: every equality here is an input-format assumption, and a violated one
+    means silently evaluating a position the network never saw in that form.
+    """
+    name = type(model).__name__
+
+    seq_length = getattr(model, "seq_length", None)
+    if seq_length is None:
+        raise ValueError(
+            f"{name} does not advertise `seq_length`, so there is nothing to "
+            f"check the {SEQ_LENGTH}-token board encoding against. Every module "
+            f"`playing.v6.chess_transformer_v2.load_model` returns sets it; a "
+            f"module that does not was built some other way.")
+    if seq_length != SEQ_LENGTH:
+        raise ValueError(
+            f"{name}.seq_length={seq_length}, but the C++ tokenizer emits "
+            f"{SEQ_LENGTH} tokens per position (guofish_core.SEQ_LENGTH, from "
+            f"cpp/tokens.hpp kSeqLength). The input buffer is [max_batch, "
+            f"{SEQ_LENGTH}] and cannot be reshaped for this model.")
+
+    embedding = getattr(model, "embedding", None)
+    vocab_size = getattr(embedding, "num_embeddings", None)
+    if vocab_size is not None and vocab_size < MIN_VOCAB_SIZE:
+        raise ValueError(
+            f"{name}'s embedding table has {vocab_size} rows, but the C++ "
+            f"tokenizer emits ids up to {MIN_VOCAB_SIZE - 1} (cpp/tokens.hpp "
+            f"kTokenCls). Indexing past the table is an out-of-bounds device "
+            f"read that returns garbage priors instead of raising.")
+
+    # v5 only: it publishes these, so checking them is free. `getattr` rather
+    # than a v5 test, so a future generation that publishes them is checked too.
+    for attr, expected, why in (
+        ("cls_index", guofish_core.SEQ_LENGTH - 1,
+         "the value head pools from this slot; cpp/tokens.hpp writes kTokenCls there"),
+        ("policy_size", POLICY_SIZE,
+         "priors are indexed from_square*64 + to_square"),
+    ):
+        actual = getattr(model, attr, None)
+        if actual is not None and actual != expected:
+            raise ValueError(
+                f"{name}.{attr}={actual}, expected {expected} ({why}).")
+
+    return int(seq_length)
+
+
 def load_default_model(model_path: Path | None = None,
                        device: torch.device | None = None) -> tuple[torch.nn.Module,
                                                                     torch.device]:
-    """The v5 student on the best available device, through playv5's loader.
+    """Either supported generation on the best available device.
 
-    Routed through `playing.v5.playv5.load_model` rather than a second loader so
-    the port cannot end up evaluating a checkpoint the reference would have
-    loaded differently — the dtype selection, the value_scale attachment and the
-    CPU int8 path all live there.
+    Routed through `playing.v6.chess_transformer_v2.load_model`, which picks the
+    architecture off the checkpoint's own metadata — v5 students
+    (training/v5_multiPV) and the legacy ChessTransformerV2 that guofish2..
+    guofish4 are. There is no flag to get wrong.
+
+    That loader used to be `playing.v5.playv5.load_model`, which is the same code
+    but reached through a module whose import executes `import core.mctsv3` and
+    `import core.mctsv4` so that ITS `build_mcts` can route between two Python
+    MCTS implementations. v6 drives the C++ core and uses neither, so the whole
+    legacy search tree was arriving as a side effect of asking for a loader.
+
+    `log=` is left at its default `print` here; `Engine.ensure_ready` wraps this
+    call in `contextlib.redirect_stdout` and re-emits each line on stderr, which
+    keeps the UCI stream clean without this layer needing to know it is under a
+    protocol.
     """
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    from playing.v5.playv5 import load_model
+    from playing.v6.chess_transformer_v2 import load_model
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(Path(model_path) if model_path else DEFAULT_MODEL, device)
-    require_v5_config(model)
+    require_engine_contract(model)
     return model, device
 
 
@@ -121,7 +231,7 @@ class TorchEvaluator:
                  graph_sizes=None):
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
-        require_v5_config(model)
+        require_engine_contract(model)
 
         self.model = model
         self.device = device
@@ -345,12 +455,15 @@ def build(max_batch: int, *, model_path: Path | None = None,
 
 
 __all__ = [
+    "AUTOCAST_DTYPE",
     "DEFAULT_MODEL",
     "DEFAULT_SWITCH_INTERVAL",
+    "MIN_VOCAB_SIZE",
     "POISON_BITS",
     "POLICY_SIZE",
     "SEQ_LENGTH",
     "TorchEvaluator",
     "build",
     "load_default_model",
+    "require_engine_contract",
 ]

@@ -150,6 +150,21 @@ def _parse_optional_int(raw: str) -> Optional[int]:
     return int(lowered)
 
 
+def _parse_optional_float(raw: str) -> Optional[float]:
+    """A float, or None for "unset". Mirrors `_parse_optional_int`'s spellings.
+
+    "0" maps to None rather than to 0.0, which is safe because the only field
+    using this is `value_scale` and `EngineConfig.validate` refuses a
+    non-positive one anyway. It is also what makes the round trip work:
+    `_format_option_value(None)` advertises `default 0`, and a GUI that echoes
+    that default straight back must not thereby set a value.
+    """
+    lowered = raw.strip().lower()
+    if lowered in ("", "none", "off", "0"):
+        return None
+    return float(lowered)
+
+
 def _parse_optional_path(raw: str) -> Optional[Path]:
     stripped = raw.strip()
     return Path(stripped) if stripped and stripped.lower() != "none" else None
@@ -168,6 +183,15 @@ INFO_INTERVAL_S = 0.25
 # added to the engine and not to the protocol" is defect 1 in its purest form.
 OPTIONS: tuple[Option, ...] = (
     Option("ModelPath", "model_path", "string", _parse_optional_path),
+    # `type string` for the same reason every float option here is: UCI spin is
+    # integer-only. Read ONCE, when the checkpoint loads, so it only has an
+    # effect if it is set before the first `isready`.
+    #
+    # Leaving it unset is the normal case for BOTH generations: a v5 checkpoint
+    # carries its own calibration and the legacy guofish2..guofish4 nets fall
+    # back to `playv6.LEGACY_VALUE_SCALE`, which is the same constant their value
+    # head was trained against. This exists to override that, not to enable it.
+    Option("ValueScale", "value_scale", "string", _parse_optional_float),
     Option("MaxBatch", "max_batch", "spin", int, "min 1 max 1024"),
     Option("Graphs", "graphs", "check", _parse_bool),
     Option("Pin", "pin", "check", _parse_bool),
@@ -871,8 +895,32 @@ class UCIEngine:
                 if command == "go":
                     # Never leave a `go` unanswered: Cutechess waits forever and
                     # scores it as a loss on time with no diagnosis in the PGN.
+                    #
+                    # ANNOUNCED ON BOTH STREAMS, and that is the point of this
+                    # block rather than an afterthought to it. The move goes to
+                    # stdout because the protocol demands one; the fact that it
+                    # was NOT SEARCHED goes to stderr, because nothing else can
+                    # carry it. A first-legal-move answer is a real move in a
+                    # legal position and Cutechess records it beside a plausible
+                    # score, so the PGN, the result and the ELO are all silent
+                    # about it — a fixed-node T4 arm scored 647 of these and
+                    # published an ELO-per-doubling with the sign flipped. The
+                    # only reason that was diagnosable at all is that the
+                    # exception itself was logged; the move was not, so no
+                    # `[bestmove]` line existed to grep and the engine's own
+                    # artifact disagreed with the PGN about what it had played.
+                    #
+                    # `info string` as well as `[bestmove]`: stderr is per-arm
+                    # and easy to lose, and a GUI or a log parser that never
+                    # opens it still sees the disclaimer inline.
                     fallback = next(iter(self.board.legal_moves), None)
-                    log(f"bestmove {fallback.uci()}" if fallback else "bestmove 0000")
+                    uci = fallback.uci() if fallback else "0000"
+                    err(f"[bestmove] bestmove {uci} NOT SEARCHED — first legal "
+                        f"move, answering a {type(exc).__name__} from `go` "
+                        f"(see the traceback above) fen={self.board.fen()}")
+                    log(f"info depth 0 string UNSEARCHED fallback={uci} "
+                        f"reason={type(exc).__name__}")
+                    log(f"bestmove {uci}")
 
         self.engine.close()
         return 0

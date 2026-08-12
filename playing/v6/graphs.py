@@ -62,10 +62,16 @@ import time
 
 import torch
 
-# The token width and the autocast dtype are the model's contract, imported from
-# the reference rather than restated for the same reason playing/v6/evaluator.py
-# imports them: a disagreement here is a silently mis-shaped input.
-from core.mctsv4 import AUTOCAST_DTYPE, SEQ_LENGTH
+import guofish_core
+
+# The token width and the autocast dtype are the boundary's contract, taken from
+# the same places playing/v6/evaluator.py takes them and for the same reason: a
+# disagreement here is a silently mis-shaped input. `SEQ_LENGTH` comes from the
+# C++ constant that actually governs (cpp/tokens.hpp kSeqLength, re-exported by
+# guofish_core) rather than from `core.mctsv4`, which is retired along with the
+# Python search.
+SEQ_LENGTH = guofish_core.SEQ_LENGTH
+AUTOCAST_DTYPE = torch.bfloat16
 
 # The position padding rows are filled with. Any legal position works — the rows
 # are never read — but it must be FIXED, so that a padded batch costs the same

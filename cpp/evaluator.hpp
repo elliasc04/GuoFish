@@ -153,6 +153,59 @@ inline void softmax_in_place(float *values, std::size_t count) noexcept {
     }
 }
 
+// C11b. Policy temperature: T divides the LOGITS before the softmax.
+//
+// `softmax(l / T)` is not an approximation of `P^(1/T)` — it is the same
+// function. With P = softmax(l), P_i^(1/T) = exp(l_i/T) / Z^(1/T), and the
+// constant Z^(1/T) divides out in the renormalisation. The reference
+// (core.mctsv4.MCTSNode.expand) says the same thing in its own docstring and
+// does it on logits for the same reason: raising an already-tiny bf16-derived
+// probability to a large power underflows to exactly 0, and a logit divide
+// does not.
+//
+// THREE PROPERTIES OF THIS FUNCTION ARE LOAD-BEARING, IN DESCENDING ORDER OF
+// HOW EASY THEY ARE TO LOSE.
+//
+// 1. IT DIVIDES. Not `scratch[i] *= 1.0f / temperature`. C10a established that
+//    every Gate 2 cell reproduces bit-for-bit on MSVC 19.51 and Clang 18.1.3,
+//    down to per-row `exact` counts, and a precomputed reciprocal inserts a
+//    rounding step whose result is not guaranteed identical across toolchains:
+//    `x * fl(1/T)` and `fl(x/T)` differ in the last ulp for most (x, T). One
+//    division per logit — 26-38 of them per expansion, against a batch that
+//    just crossed a GPU boundary — is not a cost worth that.
+//
+// 2. T == 1.0f SKIPS THE DIVIDE ENTIRELY. Division by 1.0f is exact in
+//    IEEE-754, so the guard buys no accuracy; what it buys is the ability to
+//    say that the temperature-absent path and the T = 1.0 path are THE SAME
+//    INSTRUCTIONS, not merely the same answer. Gate 1 and the frozen
+//    `POLICY_TEMPERATURE = 1.0` config stay valid without being re-run on that
+//    basis. The reference guards it identically, and for the identical reason.
+//
+// 3. THE DIVIDE IS IN float, BECAUSE THE REFERENCE'S IS. `legal_logits` is a
+//    float32 tensor over there and `policy_temperature` is a Python float;
+//    torch's weak-scalar rule converts the scalar to float32 and divides in
+//    float32. A `double` temperature here would promote each logit, divide in
+//    double and round back — deterministic, but a different number, and Gate 2
+//    would be measuring a function the reference does not compute. Hence
+//    `SearchConfig::policy_temperature` is the one `float` in a struct of
+//    `double`s, which is deliberate and is not a slip.
+//
+// Applied AFTER the scatter into generation order rather than during it. The
+// divide is elementwise, so the two are bit-identical; a separate guarded loop
+// is what makes property 2 a branch a reader can see rather than a condition
+// buried in the gather.
+inline void apply_policy_temperature(float *values, std::size_t count,
+                                     float temperature) noexcept {
+    assert(values != nullptr);
+    assert(temperature > 0.0f);
+    if (temperature == 1.0f) {
+        return;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        values[i] /= temperature;
+    }
+}
+
 // Gather this node's legal logits out of one 4096-wide bf16 policy row,
 // softmax them in the order the moves were GENERATED, and write the resulting
 // probabilities out in CANONICAL order. See the file header for why those are
@@ -164,9 +217,12 @@ inline void softmax_in_place(float *values, std::size_t count) noexcept {
 //   `scratch`     caller-owned, resized here; lives across leaves so a steady
 //                 state performs no allocation.
 //   `priors`      out, canonical order, `count` floats.
+//   `temperature` C11b. Divides the logits; 1.0f is the identity and skips the
+//                 divide. See apply_policy_temperature.
 inline void gather_softmax_canonical(const std::uint16_t *policy_row, const std::uint16_t *packed,
                                      const std::uint16_t *generation, std::size_t count,
-                                     std::vector<float> &scratch, float *priors) {
+                                     std::vector<float> &scratch, float *priors,
+                                     float temperature = 1.0f) {
     assert(policy_row != nullptr && packed != nullptr && generation != nullptr);
     assert(priors != nullptr);
     scratch.resize(count);
@@ -179,6 +235,8 @@ inline void gather_softmax_canonical(const std::uint16_t *policy_row, const std:
         assert(g < count);
         scratch[g] = bf16_to_float(policy_row[policy_index(packed[k])]);
     }
+
+    apply_policy_temperature(scratch.data(), count, temperature);
 
     softmax_in_place(scratch.data(), count);
 

@@ -2097,12 +2097,18 @@ private:
 // If it were a reimplementation the gate would be measuring the wrong function.
 py::tuple gather_softmax(const std::string &fen,
                          py::array_t<std::uint16_t, py::array::c_style | py::array::forcecast>
-                             policy_row) {
+                             policy_row,
+                         float temperature) {
     if (policy_row.ndim() != 1 ||
         static_cast<std::size_t>(policy_row.shape(0)) != guofish::kPolicySize) {
         throw py::value_error("guofish_core.gather_softmax: policy_row must be a 1-D array of " +
                               std::to_string(guofish::kPolicySize) +
                               " bf16 bit patterns (dtype uint16)");
+    }
+    if (!(temperature > 0.0f)) {
+        throw py::value_error(
+            "guofish_core.gather_softmax: temperature must be > 0 (it divides the logits), got " +
+            std::to_string(temperature));
     }
 
     chess::Board board;
@@ -2119,7 +2125,7 @@ py::tuple gather_softmax(const std::string &fen,
     std::vector<float> scratch;
     std::vector<float> priors(packed.size());
     guofish::gather_softmax_canonical(policy_row.data(), packed.data(), generation.data(),
-                                      packed.size(), scratch, priors.data());
+                                      packed.size(), scratch, priors.data(), temperature);
 
     std::vector<std::string> moves;
     moves.reserve(packed.size());
@@ -2972,7 +2978,7 @@ PYBIND11_MODULE(guofish_core, m) {
                          double fpu_tree, double virtual_loss, int max_tree_depth,
                          std::size_t arena_capacity, std::size_t cache_slots,
                          std::size_t cache_shards, double ponder_decay,
-                         bool verify_compaction) {
+                         bool verify_compaction, float policy_temperature) {
                  guofish::SearchConfig config;
                  config.c_init = c_init;
                  config.c_base = c_base;
@@ -2986,6 +2992,7 @@ PYBIND11_MODULE(guofish_core, m) {
                  config.cache_shards = cache_shards;
                  config.ponder_decay = ponder_decay;
                  config.verify_compaction = verify_compaction;
+                 config.policy_temperature = policy_temperature;
                  return config;
              }),
              py::arg("c_init") = 1.43, py::arg("c_base") = 19652.0, py::arg("c_factor") = 1.0,
@@ -2994,7 +3001,13 @@ PYBIND11_MODULE(guofish_core, m) {
              py::arg("arena_capacity") = static_cast<std::size_t>(1u << 21),
              py::arg("cache_slots") = static_cast<std::size_t>(0),
              py::arg("cache_shards") = guofish::kDefaultCacheShards,
-             py::arg("ponder_decay") = 1.0, py::arg("verify_compaction") = false)
+             py::arg("ponder_decay") = 1.0, py::arg("verify_compaction") = false,
+             // C11b. APPENDED, not inserted. Every call site in the repo passes
+             // keywords, but a positional one elsewhere would silently receive
+             // this value in another field's slot, and a search running at the
+             // wrong virtual loss because a parameter was added in the middle is
+             // precisely the class of failure Gate 2b's first run was.
+             py::arg("policy_temperature") = 1.0f)
         .def_readwrite("c_init", &guofish::SearchConfig::c_init)
         .def_readwrite("c_base", &guofish::SearchConfig::c_base)
         .def_readwrite("c_factor", &guofish::SearchConfig::c_factor)
@@ -3023,7 +3036,24 @@ PYBIND11_MODULE(guofish_core, m) {
                        "asserts off. Builds with asserts on run it unconditionally. Scope §7 "
                        "names this as the mitigation for ping-pong fixup bugs, so it is engine "
                        "behaviour rather than a test fixture; the flag is how a Release build "
-                       "opts in. Costs one extra O(nodes) pass per apply_move.");
+                       "opts in. Costs one extra O(nodes) pass per apply_move.")
+        .def_readwrite("policy_temperature", &guofish::SearchConfig::policy_temperature,
+                       "C11b. T in softmax(logits / T), applied at the ROOT and at every "
+                       "interior node alike — there is exactly one live expansion path and "
+                       "this is threaded into it, so the root/interior sharpness split the "
+                       "reference has cannot reappear here. T < 1 sharpens, T > 1 flattens, "
+                       "1.0 is the identity and skips the divide so the temperature-absent "
+                       "path and the T = 1.0 path are the same instructions.\n\n"
+                       "It DIVIDES rather than multiplying by a precomputed reciprocal: "
+                       "cross-toolchain bit-identity (measured on MSVC 19.51 and Clang "
+                       "18.1.3, C10a) is worth more than one division per logit.\n\n"
+                       "A `float`, alone among these fields, because the reference divides a "
+                       "float32 tensor by a Python float and torch's weak-scalar rule does "
+                       "that in float32. A double would round twice and compute a different "
+                       "number.\n\n"
+                       "Must be > 0. Refused outright on a search with no live evaluator (the "
+                       "replay dump's priors are already softmaxed, so it could only be "
+                       "ignored) and in the GUOFISH_VALUE_SUM=double equivalence build.");
 
     // -----------------------------------------------------------------------
     // C9 — concurrency
@@ -3230,6 +3260,7 @@ PYBIND11_MODULE(guofish_core, m) {
                                "What sys.getswitchinterval() returned before it did.");
 
     m.def("gather_softmax", &gather_softmax, py::arg("fen"), py::arg("policy_row"),
+          py::arg("temperature") = 1.0f,
           "Gate 2's probe: (canonical UCI moves, priors) for one position and one recorded "
           "4096-wide bf16 policy row (dtype uint16).\n\n"
           "This is the PRODUCTION gather, not a restatement of it — the same function the "
@@ -3237,7 +3268,13 @@ PYBIND11_MODULE(guofish_core, m) {
           "GENERATION-order logits, then permute the probabilities into canonical order; never "
           "gather in sorted order. `torch.softmax` is not permutation-invariant (scope §2.6 "
           "measured 109/200 permutations reproducing bit-identical priors, max delta 3e-7), so "
-          "sorting before the softmax changes the priors on a large fraction of nodes.");
+          "sorting before the softmax changes the priors on a large fraction of nodes.\n\n"
+          "C11b. `temperature` divides the logits before the softmax and defaults to 1.0, "
+          "which skips the divide entirely — so the default call is bit-identical to the "
+          "pre-C11b one and Gate 2's recorded figures stand without being re-measured. "
+          "Passing a temperature here drives the SAME code the search drives, which is what "
+          "lets the Gate 2 extension over T in {0.7, 1.0, 1.5} be a statement about the "
+          "engine rather than about a test helper.");
 
     m.def("generation_order", &generation_order, py::arg("fen"),
           "The position's legal moves as normalised UCI, in chess-library's GENERATION "

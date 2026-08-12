@@ -141,6 +141,33 @@ DECISION_SOURCES = ("search", "book", "tablebase")
 # `q_to_centipawns` for what it does to the reported ceiling.
 VALUE_CLAMP = 0.995
 
+# The centipawn calibration BOTH generations were trained against, used when a
+# checkpoint carries none of its own.
+#
+# NOT A GUESS, AND NOT v5's NUMBER BORROWED FOR v4. It is one project-wide
+# constant that predates both, and it is written down in four places:
+#
+#   data/csv_parallel.py:29        CP_SCALE, the v2-era pipeline — the one that
+#                                  fed data/eval_data_processing.py and
+#                                  training/train.py, i.e. guofish2..guofish4
+#   data/multiPV/labels.py:44      VALUE_SCALE, the v5 multi-PV pipeline
+#   data/multiPV/fit_value_scale.py  re-examined against our own data and
+#                                  explicitly LOCKED here on 2026-08-02
+#   benchmarking/player/acpl_elo_estimator.py:49  Q_TO_CP_SCALE, which inverts
+#                                  it with atanh exactly as q_to_centipawns does
+#
+# Both generations' value heads were therefore trained on tanh(cp / 290.6806)
+# with the same +-2000cp clip; it is the Lc0 WDL calibration, chosen so that the
+# value approximates expected score rather than being a fit on GuoFish data. The
+# legacy guofish2..guofish4 checkpoints omit `value_scale` only because the v2-era
+# checkpoint writer predates the field — NOT because they used a different scale.
+#
+# So falling back to it is recovering a documented constant, not inventing one,
+# and it is what puts a v4-vs-v5 match on ONE reported scale. `_resolve_value_scale`
+# still announces every use of the fallback, because "the checkpoint said so" and
+# "the engine assumed the project default" are different claims.
+LEGACY_VALUE_SCALE = 290.6806
+
 
 def err(msg: str) -> None:
     """stderr, flushed. Never stdout: stdout is the UCI stream."""
@@ -259,6 +286,16 @@ class EngineConfig:
     graphs: bool = True
     pin: bool = True
     switch_interval: float = DEFAULT_SWITCH_INTERVAL
+
+    # An explicit centipawn calibration for `q_to_centipawns` to invert. None
+    # means "resolve it normally" — the checkpoint's own value if it has one,
+    # else LEGACY_VALUE_SCALE. See `Engine._resolve_value_scale`.
+    #
+    # Setting this OVERRIDES a checkpoint that carries its own, which is the only
+    # reason it is a knob at all: the two automatic sources already agree at
+    # 290.6806 for everything shipped, so the flag exists for recalibration
+    # experiments and for a checkpoint whose recorded scale is not trusted.
+    value_scale: Optional[float] = None
 
     # --- parallelism (C9/C10b) -------------------------------------------
     # W. `in_flight` (K) is derived from max_outstanding rather than set
@@ -389,6 +426,14 @@ class EngineConfig:
                 f"in-flight path, so W*K could not reach the count asked for.")
         if self.max_batch < 1:
             raise ConfigError(f"max_batch must be >= 1, got {self.max_batch}")
+        # atanh's argument is bounded; the SCALE multiplying it is not, but it
+        # must be a positive, finite number or every reported score is nonsense.
+        # 0 would report every position as 0.00 regardless of Q; a negative would
+        # report a won position as lost, which is worse than either.
+        if self.value_scale is not None and not self.value_scale > 0.0:
+            raise ConfigError(
+                f"value_scale must be > 0 (score cp = value_scale * atanh(q)), "
+                f"got {self.value_scale}")
         if self.affinity not in guofish_core.AFFINITY_POLICIES:
             raise ConfigError(
                 f"affinity={self.affinity!r} is not one of "
@@ -520,7 +565,9 @@ class EngineConfig:
         """The same thing grouped, for a human reading a Cutechess debug log."""
         return [
             f"[config] {self.as_kv()}",
-            f"[config] model      : {self.model_path or DEFAULT_MODEL}",
+            f"[config] model      : {self.model_path or DEFAULT_MODEL} "
+            f"value_scale="
+            f"{f'checkpoint, else {LEGACY_VALUE_SCALE:.4f}' if self.value_scale is None else f'{self.value_scale:.4f} (OVERRIDE)'}",
             f"[config] evaluator  : max_batch={self.max_batch} graphs={self.graphs} "
             f"pin={self.pin} switch_interval={self.switch_interval:g}",
             f"[config] parallel   : threads(W)={self.threads} in_flight(K)={self.in_flight} "
@@ -767,6 +814,10 @@ class Engine:
         self.evaluator = None
         self.search = None
         self.value_scale: Optional[float] = None
+        # Which of `_resolve_value_scale`'s three sources supplied it: "config",
+        # "checkpoint" or "legacy-default". On the [init] line so a run's own log
+        # says whether its scale was recorded or assumed.
+        self.value_scale_source: str = "unresolved"
         self.model = None
         self.device = None
         self._ready = False
@@ -835,14 +886,7 @@ class Engine:
         for line in buf.getvalue().splitlines():
             err(f"[load_model] {line}")
 
-        value_scale = getattr(self.model, "value_scale", None)
-        if value_scale is None:
-            raise RuntimeError(
-                f"{cfg.model_path or DEFAULT_MODEL} carries no value_scale, so "
-                f"'score cp' has no calibration to invert. Every train_v5 "
-                f"checkpoint writes one; a checkpoint without it did not come "
-                f"from that pipeline.")
-        self.value_scale = float(value_scale)
+        self.value_scale = self._resolve_value_scale()
 
         self.evaluator = live_evaluator.TorchEvaluator(
             self.model, self.device, cfg.max_batch,
@@ -870,9 +914,79 @@ class Engine:
             err("[init] capture=eager (graphs disabled)")
         err(f"[init] pinned={self.evaluator.pinned} "
             f"topology={guofish_core.ReplaySearchQ32.topology()['source']}")
+        # WHICH GENERATION ACTUALLY LOADED, named rather than inferred. The
+        # architecture is chosen from the checkpoint's own metadata, so the only
+        # way a reader knows whether a run was the v5 student or a legacy
+        # guofish2..guofish4 net is if the engine says so — and a v4-vs-v5 match
+        # is exactly the comparison where getting that backwards would invalidate
+        # the result. `seq_length` is on the line because it is the one contract
+        # both generations advertise and `require_engine_contract` checks.
+        parameters = sum(p.numel() for p in self.model.parameters())
+        err(f"[init] architecture={type(self.model).__name__} "
+            f"params={parameters / 1e6:.1f}M seq_length={self.model.seq_length} "
+            f"policy_size={guofish_core.POLICY_SIZE} "
+            f"value_scale={self.value_scale:.4f} source={self.value_scale_source}")
         err(f"[eval] score cp = {self.value_scale:.4f} * atanh(q), saturating at "
             f"+-{q_to_centipawns(1.0, self.value_scale)} cp "
             f"(|q| clamped to {VALUE_CLAMP})")
+
+    def _resolve_value_scale(self) -> float:
+        """The constant `q_to_centipawns` inverts, and where it came from.
+
+        Three sources, in this order:
+
+          1. `EngineConfig.value_scale`, if set. AN EXPLICIT INSTRUCTION WINS
+             OVER THE CHECKPOINT, because the case it exists for is a checkpoint
+             whose own number is not trusted, and a flag that silently lost to
+             the file would be a flag that does nothing on exactly the models
+             somebody bothered to set it for. Overriding a checkpoint that HAD a
+             value is logged with both numbers, because a stale flag left over
+             from one run is otherwise invisible in the next.
+          2. the checkpoint's own `value_scale`, attached by
+             `chess_transformer_v2.load_model` when the file carries it. Every
+             train_v5 checkpoint writes one unconditionally.
+          3. LEGACY_VALUE_SCALE — for the guofish2..guofish4 checkpoints, whose
+             v2-era writer predates the field. See that constant for why this is
+             recovering a documented project-wide calibration rather than
+             assuming one: the v2 pipeline trained against the identical number.
+
+        EVERY PATH IS ANNOUNCED, including the ordinary one, because
+        `score cp = value_scale * atanh(q)` is what Cutechess `-resign score=`
+        and every adjudication threshold are read against. Which of the three
+        supplied it is exactly the kind of thing that has to be in the run's own
+        log rather than reconstructed afterwards.
+        """
+        from_checkpoint = getattr(self.model, "value_scale", None)
+        override = self.config.value_scale
+        model_name = type(self.model).__name__
+
+        if override is not None:
+            if from_checkpoint is not None:
+                err(f"[eval] value_scale OVERRIDDEN: {override:.4f} replaces the "
+                    f"{float(from_checkpoint):.4f} carried by "
+                    f"{self.config.model_path or DEFAULT_MODEL}. Every reported "
+                    f"'score cp' is on the override's scale.")
+            else:
+                err(f"[eval] value_scale {override:.4f} supplied by configuration "
+                    f"(source=config); {model_name} carries none of its own.")
+            self.value_scale_source = "config"
+            return float(override)
+
+        if from_checkpoint is not None:
+            err(f"[eval] value_scale {float(from_checkpoint):.4f} from the "
+                f"checkpoint (source=checkpoint).")
+            self.value_scale_source = "checkpoint"
+            return float(from_checkpoint)
+
+        err(f"[eval] value_scale {LEGACY_VALUE_SCALE:.4f} assumed "
+            f"(source=legacy-default): {model_name} is a legacy "
+            f"guofish2..guofish4 net whose v2-era checkpoint writer predates the "
+            f"field. This is the SAME Lc0 WDL calibration its value head was "
+            f"trained against (data/csv_parallel.py CP_SCALE) and the same one "
+            f"the v5 pipeline uses (data/multiPV/labels.py VALUE_SCALE), so v4 "
+            f"and v5 report on one scale. Pass --value-scale to override.")
+        self.value_scale_source = "legacy-default"
+        return float(LEGACY_VALUE_SCALE)
 
     def reconfigure(self, config: EngineConfig) -> None:
         """Adopt a new configuration.
@@ -1604,7 +1718,17 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     """
     g = parser.add_argument_group("model / evaluator")
     g.add_argument("--model", "--checkpoint", dest="model_path", type=Path, default=None,
-                   help=f"v5 checkpoint (default: {DEFAULT_MODEL})")
+                   help="v5 student or legacy guofish2..guofish4 checkpoint; the "
+                        "architecture is read off the file, not from a flag "
+                        f"(default: {DEFAULT_MODEL})")
+    g.add_argument("--value-scale", type=float, default=None,
+                   help="centipawn calibration inverted by score cp = "
+                        "value_scale * atanh(q), OVERRIDING the checkpoint's own. "
+                        "Omit for the normal resolution: the checkpoint's value "
+                        "if it has one, else the project-wide Lc0 WDL constant "
+                        "290.681 that both the v2-era and v5 label "
+                        "pipelines trained against. The source is logged at "
+                        "[eval] and on the [init] architecture line")
     g.add_argument("--max-batch", type=int, default=EngineConfig.max_batch,
                    help="dispatcher batch ceiling and the evaluator's buffer rows "
                         f"(default: {EngineConfig.max_batch}, the measured knee)")
