@@ -569,6 +569,20 @@ def main() -> int:
     parser.add_argument("--positions", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=4)
     parser.add_argument("--serial-repeats", type=int, default=1)
+    # WHICH CHECKPOINT THE TABLE DESCRIBES. Defaulted to None, i.e. the shipped
+    # v5 student, so every figure already in BENCH.md reproduces unchanged.
+    #
+    # It is a flag at all because the C10b tables are architecture-specific and
+    # were not labelled as such: the knee, the W x K selection and the capture
+    # ladder were all measured on the 10.9M student, and none of them transfers
+    # to the 25.6M legacy net (8 layers x 512 against 6 x 384) whose forward has
+    # a different fixed-to-per-row cost ratio. A grid run against another
+    # checkpoint has to be able to say so, which is why the resolved path is
+    # logged with the platform and build lines rather than left implicit.
+    parser.add_argument("--model", type=Path, default=None,
+                        help="checkpoint to measure (default: the shipped v5 "
+                             "student, which is what every C10b table in "
+                             "BENCH.md was measured on)")
     parser.add_argument("--max-batch", type=int, default=128)
     parser.add_argument("--virtual-loss", type=float, default=2.5)
     parser.add_argument("--workers", type=int, nargs="+", default=[2, 4, 6, 8])
@@ -614,7 +628,7 @@ def main() -> int:
             f"Pass --allow-instrumented to override.")
         return 1
 
-    model, device = live_evaluator.load_default_model()
+    model, device = live_evaluator.load_default_model(args.model)
     # C11b. See tools/bench_provenance.py: every artifact records the resolved
     # book/Syzygy state, and "not applicable" is a resolved state. This harness
     # drives guofish_core directly, so no number below can contain a
@@ -630,6 +644,12 @@ def main() -> int:
     for line in bench_provenance.require_recorded_state(feature_state):
         log(f"bypass   : {line}")
     log(f"device   : {torch.cuda.get_device_name(0)}, torch {torch.__version__}")
+    # Provenance, on the same footing as the platform and build lines: a W x K
+    # table is only meaningful for the forward it was measured against, and the
+    # C10b tables predate this line by being implicitly about one checkpoint.
+    log(f"model    : {args.model or live_evaluator.DEFAULT_MODEL} "
+        f"({type(model).__name__}, "
+        f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params)")
 
     evaluator = live_evaluator.TorchEvaluator(model, device, args.max_batch,
                                               graphs=args.graphs,
@@ -639,7 +659,13 @@ def main() -> int:
     log(f"topology : {guofish_core.ReplaySearchQ32.topology()['source']}")
     log("")
 
-    payload = {"args": vars(args) | {"json_out": None},
+    # Paths are stringified rather than left to `json.dumps(default=float)`,
+    # which raises on a WindowsPath and takes the whole run's results with it
+    # AFTER every cell has been measured. Only reachable once `--model` is
+    # passed — the default is None — so it stayed latent until a harness
+    # measured a second checkpoint.
+    payload = {"args": {k: (str(v) if isinstance(v, Path) else v)
+                        for k, v in vars(args).items()} | {"json_out": None},
                "build": dict(build),
                "device": torch.cuda.get_device_name(0),
                "capture": (evaluator.graph_report.describe()
