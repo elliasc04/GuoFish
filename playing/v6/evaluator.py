@@ -185,6 +185,45 @@ def require_engine_contract(model: torch.nn.Module) -> int:
     return int(seq_length)
 
 
+def hoist_norm_parameter_casts(model: torch.nn.Module) -> int:
+    """Store every LayerNorm's affine parameters in fp32. Returns how many.
+
+    C12. **This changes no bit of any output, and that is checked rather than
+    argued** — `tests/test_c10b_graphs.py` compares the whole Gate 2 corpus's
+    raw bf16 policy words at every captured shape, and BENCH.md C12-6 records
+    the before/after as bit-identical at shapes 24 and 128.
+
+    WHY IT IS FREE. `torch.amp.autocast` keeps `layer_norm` on its fp32 list, so
+    every call widens the input AND both affine parameters to fp32 before the
+    kernel runs — Nsight Compute confirms the kernel is
+    `vectorized_layer_norm_kernel<float, float>`. The input's cast is real work
+    on a [count x 68, 384] activation and cannot be avoided without changing the
+    numerics. The parameters' casts are 26 launches of 384 elements each, one
+    per parameter per forward, recomputing a constant. bf16 -> fp32 is an exact
+    widening, so precomputing it stores exactly the bits the runtime cast would
+    have produced, and autocast then finds the tensor already in its target dtype
+    and does nothing.
+
+    WHAT IT BUYS. 26 of the forward's ~151 kernel launches, each a grid of ONE
+    block — i.e. 1/48th of this device's SMs — measured at 9.5% of device time at
+    shape 24 (BENCH.md C12-2). Removing them is 1.024x on the graphed forward's
+    device time at shape 24 and 1.009x at 128; the gap between the two is the
+    point, because shape 24 is what the engine ships at.
+
+    CALLED BEFORE CAPTURE, from `TorchEvaluator.__init__`. A graph records the
+    kernels it was captured with, so hoisting afterwards would leave the casts
+    baked into the graph and change nothing at all.
+    """
+    hoisted = 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.LayerNorm) and module.elementwise_affine:
+            if module.weight.dtype != torch.float32:
+                module.weight.data = module.weight.data.float()
+                module.bias.data = module.bias.data.float()
+                hoisted += 1
+    return hoisted
+
+
 def load_default_model(model_path: Path | None = None,
                        device: torch.device | None = None) -> tuple[torch.nn.Module,
                                                                     torch.device]:
@@ -228,10 +267,17 @@ class TorchEvaluator:
     def __init__(self, model: torch.nn.Module, device: torch.device, max_batch: int,
                  *, switch_interval: float = DEFAULT_SWITCH_INTERVAL, pin: bool = True,
                  graphs: bool = True, graph_method: str = "cudagraph",
-                 graph_sizes=None):
+                 graph_sizes=None, hoist_norm_casts: bool = True):
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
         require_engine_contract(model)
+
+        # C12, and BEFORE capture — see hoist_norm_parameter_casts. The flag
+        # exists for the same reason `graphs=` and `pin=` do: so the A/B that
+        # justified it stays reproducible, and so a future regression can be
+        # bisected against it rather than reasoned about.
+        self.hoisted_norm_casts = (
+            hoist_norm_parameter_casts(model) if hoist_norm_casts else 0)
 
         self.model = model
         self.device = device
@@ -259,6 +305,17 @@ class TorchEvaluator:
         self._policy_t = torch.from_numpy(self._policy_np).view(torch.bfloat16)
         self._value_t = torch.from_numpy(self._value_np)
         assert self._policy_t.data_ptr() == torch.from_numpy(self._policy_np).data_ptr()
+
+        # C12. The same argument as GraphedForward._build_view_cache, on the host
+        # side: `self._input_t[:count]` and the two output slices are three
+        # Python objects and three dispatcher round trips per batch, inside the
+        # GIL-held callback, for views that alias storage which by construction
+        # never moves. There are only `max_batch` of each, so they are built here
+        # instead of on every crossing.
+        self._row_views = {
+            count: (self._input_t[:count], self._policy_t[:count],
+                    self._value_t[:count])
+            for count in range(1, self.max_batch + 1)}
 
         self._use_autocast = device.type == "cuda"
 
@@ -314,12 +371,13 @@ class TorchEvaluator:
         `count`, so the padded rows' outputs have no name here to be copied out
         by accident.
         """
+        rows_in, policy_out, value_out = self._row_views[count]
         if self.graph is not None:
-            policy, value = self.graph.run(count, self._input_t[:count],
+            policy, value = self.graph.run(count, rows_in,
                                            poison=self.poison_unused_rows)
         else:
             tokens = self._device_tokens[:count]
-            tokens.copy_(self._input_t[:count], non_blocking=self.pinned)
+            tokens.copy_(rows_in, non_blocking=self.pinned)
             with torch.no_grad():
                 with torch.amp.autocast_mode.autocast(device_type="cuda",
                                                       dtype=AUTOCAST_DTYPE,
@@ -327,13 +385,23 @@ class TorchEvaluator:
                     policy, value = self.model(tokens)
         if self.poison_unused_rows:
             self._policy_np[count:] = POISON_BITS
-        # bf16 -> bf16, exactly the reference's `policy_logits.cpu()`. The copy is
-        # the D2H sync point, so nothing below needs an explicit synchronize.
-        self._policy_t[:count].copy_(policy)
-        # bf16 -> float32, which is an exact widening: the reference's
+        # C12. THE VALUE COPY IS ISSUED FIRST AND ASYNCHRONOUSLY, AND THE ORDER
+        # IS THE OPTIMISATION. Both copies run on the same stream, so the policy
+        # copy below — which is blocking — also completes this one. Two blocking
+        # copies cost two `cudaStreamSynchronize` round trips, and on WDDM a
+        # round trip is ~50 us against 96 bytes of actual payload at 24 rows
+        # (BENCH.md C12-3 measures the `value` phase at 59 us per crossing).
+        # Reordering makes it one round trip and copies exactly the same bytes.
+        #
+        # bf16 -> float32 is an exact widening: the reference's
         # `values_cpu[i].item()` produces the same number through the same
         # promotion, just one element at a time.
-        self._value_t[:count].copy_(value)
+        value_out.copy_(value, non_blocking=True)
+        # bf16 -> bf16, exactly the reference's `policy_logits.cpu()`. Blocking,
+        # and therefore the D2H sync point for BOTH copies — nothing below needs
+        # an explicit synchronize, and nothing may be added below that assumes
+        # otherwise.
+        policy_out.copy_(policy)
 
     def padded_batch(self, count: int) -> int:
         """The shape `count` rows are actually evaluated at. `count` if ungraphed."""
@@ -427,6 +495,11 @@ class TorchEvaluator:
         # lets a bench build a second evaluator without capturing on top of the
         # first one's ~560 MiB.
         self.graph = None
+        # C12. BEFORE the three tensors, and it is not cosmetic: every entry
+        # holds a view onto the same C++-owned memory, so leaving the cache
+        # populated would keep the buffers alive past `close()` and defer the
+        # `cudaHostUnregister` this method exists to sequence.
+        self._row_views = {}
         self._input_t = None
         self._policy_t = None
         self._value_t = None

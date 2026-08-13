@@ -1161,6 +1161,32 @@ struct ParallelStats {
     std::int64_t worker_waits = 0;       // times a worker had to wait for a drain
     std::int64_t hook_wait_ns = 0;       // total time the batch hook spent waiting
     std::int64_t wall_ns = 0;
+
+    // C11c. THE TWO WAYS `delivered < requested` BECOMES LEGITIMATE.
+    //
+    // Every C10 BENCH table admits a row only after asserting
+    // `delivered == requested`. Pondering breaks that in two places — a
+    // `ponderhit` converts a running search to a timed one and the clock can
+    // expire mid-budget, and an unbounded ponder can fill the arena — so the
+    // outcome has to be able to SAY which happened. A short row that says
+    // nothing is the failure mode the delivered-sims discipline exists to
+    // prevent; a short row that names its cause is a row a harness can reject.
+    //
+    // `deadline_hit` is set by whichever worker first observed the mutable
+    // deadline had passed. `arena_exhausted` is set by the expander when
+    // `try_allocate` returned kNoNode, and `arena_exhausted_at` is the arena's
+    // node count at that instant — the number the `info string arena exhausted
+    // at N nodes` line carries, and the one a sizing report compares against
+    // the predicted `arena_nodes`.
+    bool deadline_hit = false;
+    bool arena_exhausted = false;
+    std::int64_t arena_exhausted_at = 0;
+    // The active arena's peak occupancy across every reset it has seen. Not
+    // per-search — see NodeArena::high_water — which is the figure the arena
+    // sizing verification wants: the peak of either ping-pong half.
+    std::int64_t arena_high_water = 0;
+    std::int64_t arena_capacity = 0;
+
     int workers = 0;
     int in_flight = 0;
     std::int64_t max_outstanding = 0;
@@ -1466,6 +1492,9 @@ public:
         // a mating move found by a previous call does not stop this one before
         // it starts.
         mating_move_ = kNoMove;
+        arena_exhausted_.store(false, std::memory_order_relaxed);
+        arena_exhausted_at_.store(0, std::memory_order_relaxed);
+        deadline_hit_.store(false, std::memory_order_relaxed);
         if (!root_expanded_) {
             expand_root();
         }
@@ -1477,10 +1506,116 @@ public:
             if (mating_move_.load(std::memory_order_relaxed) != kNoMove) {
                 break;
             }
+            // C11c. THE SERIAL ABORT POINT, the same three conditions the
+            // parallel one checks and in the same order. The exhaustion check is
+            // not optional here even though the serial path is not the one
+            // pondering runs on: `run_simulation` below returns WITHOUT backing
+            // anything up when the arena refused the children, so a loop that
+            // did not check would spin to `num_simulations` doing nothing.
+            if (arena_exhausted_.load(std::memory_order_relaxed) || deadline_passed()) {
+                break;
+            }
             run_simulation(serial_);
         }
         return stats_;
     }
+
+    // ---- C11c: the mutable deadline ----------------------------------------
+    //
+    // WHY THIS EXISTS AT ALL, given that `Engine.search_move` already cuts the
+    // budget into wall-clock slices and reads a Python deadline between them.
+    //
+    // Because `ponderhit` has to convert an INFINITE search into a TIMED one
+    // without stopping it. Stopping and restarting would discard the tree, which
+    // is the entire point of having pondered; and the slice boundary is the
+    // wrong granularity for the conversion — a 50 ms slice means the engine can
+    // overshoot the allotted time by up to a slice on a clock that may only have
+    // granted it a few hundred milliseconds.
+    //
+    // So the two clocks divide the work, and neither duplicates the other:
+    //
+    //   * the C++ deadline aborts the slice that is RUNNING, within one
+    //     simulation of the instant it passes;
+    //   * the Python deadline decides not to START another slice, and owns the
+    //     reporting.
+    //
+    // THE EPOCH. `std::steady_clock` and Python's `time.monotonic()` are both
+    // monotonic and are NOT the same epoch on Windows. Nothing here ever
+    // converts between them: `set_deadline_in` takes a DURATION and adds it to
+    // this clock's own now(), so a caller never has to name an absolute instant
+    // in a clock it cannot read. `steady_now_ns()` is exposed for the one caller
+    // that wants to measure this clock against itself.
+    //
+    // NOT RESET BY `search_parallel`, and that is deliberate. The host arms it
+    // before the slice loop and clears it in a `finally`; resetting it at the
+    // top of every slice would make it unsettable, since the host sets it once
+    // and the loop calls `search_parallel` many times. The cost is that a host
+    // which forgets to clear leaves the next search pre-expired — which is why
+    // `deadline_remaining_ns()` exists and why the resolved value is on the
+    // engine's telemetry line.
+    static constexpr std::int64_t kNoDeadline = 0;
+
+    static std::int64_t steady_now_ns() noexcept {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    // Absolute, in this clock's own epoch. Callable from ANOTHER THREAD while
+    // `search_parallel` is in flight — that is the requirement it exists for —
+    // and it is one relaxed-ordering store on a lock-free atomic, so it neither
+    // blocks nor can be blocked by the search.
+    void set_deadline_ns(std::int64_t absolute_ns) noexcept {
+        deadline_ns_.store(absolute_ns, std::memory_order_release);
+    }
+
+    // The form every caller should use: a duration from now. A negative or zero
+    // duration is an already-expired deadline rather than an error — that is what
+    // a `ponderhit` on a flagged clock means, and answering it with the best move
+    // the ponder already found is the correct behaviour.
+    void set_deadline_in(double seconds) noexcept {
+        const auto delta = static_cast<std::int64_t>(seconds * 1e9);
+        std::int64_t when = steady_now_ns() + delta;
+        // kNoDeadline is 0 and means "none", so the one instant that cannot be
+        // spelled is nudged rather than silently disabling the deadline.
+        if (when == kNoDeadline) {
+            when = 1;
+        }
+        set_deadline_ns(when);
+    }
+
+    void clear_deadline() noexcept { set_deadline_ns(kNoDeadline); }
+
+    std::int64_t deadline_ns() const noexcept {
+        return deadline_ns_.load(std::memory_order_acquire);
+    }
+
+    // Nanoseconds until the deadline, or 0 if there is none. Negative once it
+    // has passed, so a caller can tell "expired" from "unset".
+    std::int64_t deadline_remaining_ns() const noexcept {
+        const std::int64_t when = deadline_ns();
+        return when == kNoDeadline ? 0 : when - steady_now_ns();
+    }
+
+    // C11c. Did an allocation fail during the last search, and at what size.
+    //
+    // STICKY WITHIN A SEARCH AND CLEARED AT THE TOP OF THE NEXT ONE. The host
+    // slices a move into many `search_parallel` calls and ORs these across the
+    // slices, because "this move degraded" is the statement a game log and a
+    // benchmark row both need — not "the seventh slice degraded".
+    bool arena_exhausted() const noexcept {
+        return arena_exhausted_.load(std::memory_order_acquire);
+    }
+
+    std::int64_t arena_exhausted_at() const noexcept {
+        return arena_exhausted_at_.load(std::memory_order_acquire);
+    }
+
+    // The arena's capacity in nodes, so a caller can turn the high-water figure
+    // below into a utilisation percentage without having to remember what it
+    // configured. `arena_high_water()` — which already existed, and which takes
+    // the peak of BOTH ping-pong halves — is the numerator.
+    std::size_t arena_capacity() const noexcept { return arena_.capacity(); }
 
     // ---- C9: W workers, K in flight each ----------------------------------
 
@@ -1560,6 +1695,13 @@ public:
         }
 
         mating_move_.store(kNoMove, std::memory_order_relaxed);
+        // C11c. Per-CALL, not per-move. The host ORs them across the slices of a
+        // move; see arena_exhausted() for why that split is the right one. The
+        // DEADLINE is conspicuously not reset here — the host owns it, and the
+        // comment on set_deadline_ns says why.
+        arena_exhausted_.store(false, std::memory_order_relaxed);
+        arena_exhausted_at_.store(0, std::memory_order_relaxed);
+        deadline_hit_.store(false, std::memory_order_relaxed);
         if (!root_expanded_) {
             expand_root();
         }
@@ -1569,6 +1711,8 @@ public:
         par_.in_flight = pc.in_flight;
         par_.max_outstanding = pc.max_outstanding();
         par_.affinity = affinity_policy_name(pc.affinity);
+        par_.arena_capacity = static_cast<std::int64_t>(arena_.capacity());
+        par_.arena_high_water = static_cast<std::int64_t>(arena_high_water());
 
         const int existing = arena_.visit_count(root_);
         target_ = num_simulations - existing;
@@ -2301,7 +2445,28 @@ private:
     // the label is padded to the width of "C++      " so the two lists line up
     // under each other, and tests/test_c5_gate1_quiet.py pins that layout by
     // asserting on the literal headings.
-    void expand(std::uint32_t node, const std::uint16_t *moves, const float *priors,
+    //
+    // C11c MAKES THIS RETURN A BOOL, and the false case is the most important
+    // line in that chunk. `false` means the arena could not hold this node's
+    // children; NOTHING was written, the node is left exactly as it was found,
+    // and every caller unwinds without backing anything up.
+    //
+    // It is not an exception, and the reason is the deployment one rather than a
+    // stylistic one: an unbounded ponder on a slow opponent clock will
+    // eventually fill any arena, and during live play an exception is a lost
+    // game while a slightly weaker move is not. `ponder_max_sims` is the primary
+    // bound; this is the backstop for the position that beats the estimate.
+    //
+    // WHAT IT DELIBERATELY DOES NOT DO is mark the node expanded with no
+    // children. That is the `bestmove 0000` defect C6 made unrepresentable —
+    // NodeArena::set_children throws on `count == 0` precisely so it cannot be
+    // spelled — and re-creating it here under the name "degradation" would
+    // trade a crash for a silently broken tree. The node stays Unexpanded (a
+    // serial caller never claimed it) or is released back to Unexpanded (the
+    // dispatcher, which holds a PENDING claim), so it is a leaf that has simply
+    // not been evaluated yet, which is a state the tree already has a meaning
+    // for.
+    bool expand(std::uint32_t node, const std::uint16_t *moves, const float *priors,
                 std::size_t count, const std::vector<std::uint16_t> &packed,
                 const std::vector<std::uint16_t> &raw, const char *source_phrase,
                 const char *source_label, const LeafDiag &diag, SearchStats &stats) {
@@ -2324,7 +2489,13 @@ private:
                 "\n  " + source_label + ": " + uci_list(moves, count));
         }
 
-        const std::uint32_t offset = arena_.allocate(packed.size());
+        // C11c. try_allocate, not allocate: the non-throwing form. See the
+        // header above for why the failure is a condition rather than a bug.
+        const std::uint32_t offset = arena_.try_allocate(packed.size());
+        if (offset == kNoNode) {
+            note_arena_exhausted();
+            return false;
+        }
         for (std::size_t k = 0; k < packed.size(); ++k) {
             const std::uint32_t child = offset + static_cast<std::uint32_t>(k);
             arena_.set_move(child, packed[k]);
@@ -2334,6 +2505,45 @@ private:
         }
         arena_.set_children(node, offset, static_cast<std::uint16_t>(packed.size()));
         ++stats.expansions;
+        return true;
+    }
+
+    // Record the first allocation failure of this search and stop the descent.
+    //
+    // FIRST ONLY, for `arena_exhausted_at_`: W workers plus the dispatcher can
+    // all fail within the same microsecond, and the interesting number is the
+    // occupancy when the arena RAN OUT, not whichever thread stored last. The
+    // flag itself is idempotent, so the two are stored in that order — the size
+    // before the flag — and read in the opposite one.
+    void note_arena_exhausted() noexcept {
+        bool expected = false;
+        if (arena_exhausted_.compare_exchange_strong(expected, true,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+            arena_exhausted_at_.store(static_cast<std::int64_t>(arena_.size()),
+                                      std::memory_order_release);
+        }
+    }
+
+    // C11c. Has the mutable deadline passed? The parallel abort point and the
+    // serial loop both ask this and nothing else does.
+    //
+    // ONE `steady_clock::now()` PER SIMULATION when a deadline is armed, and
+    // none at all when one is not — the unset case is a single relaxed load that
+    // compares equal to kNoDeadline and returns. At the shipping throughput that
+    // is ~14k clock reads a second against a ~25 ns read, i.e. 0.035% of one
+    // core, which buys abort latency measured in simulations instead of in
+    // 50 ms slices.
+    bool deadline_passed() noexcept {
+        const std::int64_t when = deadline_ns_.load(std::memory_order_acquire);
+        if (when == kNoDeadline) {
+            return false;
+        }
+        if (steady_now_ns() < when) {
+            return false;
+        }
+        deadline_hit_.store(true, std::memory_order_release);
+        return true;
     }
 
     // ParallelMCTS._expand_root: expand, seed one visit, seed the value.
@@ -2417,16 +2627,39 @@ private:
         // a root cache hit is bit-identical to the fresh evaluation it replaces.
         // See DECISIONS.md, C10, for the divergence and its measured size.
         NetworkValue root_value(0.0);
+        bool expanded = false;
         if (evaluator_ != nullptr) {
             const EvalRow row(root_parsed_);
-            root_value = evaluate_and_expand(root_, row, packed, raw, generation, diag,
-                                             cache_hit_, stats_);
+            const LeafEval leaf = evaluate_and_expand(root_, row, packed, raw, generation, diag,
+                                                      cache_hit_, stats_);
+            root_value = leaf.value;
+            expanded = leaf.expanded;
         } else {
             const ReplayDump::Entry &entry =
                 lookup(EvalRow(root_parsed_).key(), /*at_root=*/true, diag);
-            expand(root_, entry.moves, entry.priors, entry.count, packed, raw, "the replay dump",
-                   "golden   ", diag, stats_);
+            expanded = expand(root_, entry.moves, entry.priors, entry.count, packed, raw,
+                              "the replay dump", "golden   ", diag, stats_);
             root_value = NetworkValue(entry.value);
+        }
+        // C11c. THE ONE EXPANSION THAT MAY NOT DEGRADE.
+        //
+        // Everywhere else an arena refusal costs a simulation and the search
+        // returns the best move it already has. There is no "already have" at
+        // the root: an unexpanded root has no children to choose between, so
+        // degrading here would mean answering `bestmove 0000` from a legal
+        // position — the defect C6 spent a chunk making unrepresentable. It is
+        // also not reachable by any configuration the engine accepts:
+        // `arena_capacity` is validated at >= 1024 and a position has at most
+        // kMaxLegalMoves = 218 moves, so the root plus its children always fit
+        // in a fresh arena. Reaching it means the arena was not fresh, which is
+        // a bug in the caller rather than a budget that ran out.
+        if (!expanded) {
+            throw std::runtime_error(
+                "guofish::ReplaySearch::expand_root: the arena could not hold the root's " +
+                std::to_string(packed.size()) + " children (" + std::to_string(arena_.size()) +
+                " of " + std::to_string(arena_.capacity()) +
+                " nodes used). Graceful degradation covers interior nodes only: a root with no "
+                "children cannot produce a move at all. Reset the arena or raise its capacity.");
         }
         // ASSIGNED, not accumulated. `_expand_root` writes `root.visit_count = 1`
         // and `root.value_sum = ...`, and until C8 the distinction could not be
@@ -2750,8 +2983,19 @@ private:
         // cpp/keys.hpp for why that is a requirement and not a tidiness.
         const EvalRow row(parsed);
         const LeafDiag diag = diag_of(d, parsed);
-        const NetworkValue nn_value =
+        const LeafEval leaf =
             evaluate_and_expand(node, row, packed, raw, d.generation, diag, cache_hit_, *d.stats);
+
+        // C11c. The arena refused this node's children. Repay and leave, backing
+        // nothing up and counting no simulation: the leaf is exactly as it was
+        // found, and `search()`'s loop breaks on the flag this set rather than
+        // descending onto it again. `delivered < requested` is now a legitimate
+        // outcome and `parallel_stats().arena_exhausted` is how a caller knows.
+        if (!leaf.expanded) {
+            repay(d);
+            return;
+        }
+        const NetworkValue nn_value = leaf.value;
 
         // === Mode 2: the tablebase value override ===
         //
@@ -2811,17 +3055,37 @@ private:
     // handed. The cache probe, the dump lookup and the cache insert all use
     // `row.key()`; nothing here recomputes it. See EvalRow in cpp/keys.hpp for
     // why that is a requirement and not a tidiness.
-    NetworkValue evaluate_and_expand(std::uint32_t node, const EvalRow &row,
-                                     const std::vector<std::uint16_t> &packed,
-                                     const std::vector<std::uint16_t> &raw,
-                                     const std::vector<std::uint16_t> &generation,
-                                     const LeafDiag &diag, CachedEval &scratch,
-                                     SearchStats &stats) {
+    //
+    // C11c CARRIES THE EXPANSION'S SUCCESS OUT ALONGSIDE THE VALUE, because the
+    // arena can now refuse. `LeafEval::expanded == false` means the node was
+    // left untouched and the caller must unwind without a backup; the value is
+    // meaningless in that case and is not read. A bool return would have hidden
+    // it in an out-parameter, and an exception would have been the thing the
+    // whole mechanism exists to avoid.
+    //
+    // NOTE THE CACHE INSERT STILL HAPPENS ON A FAILED EXPANSION on the live
+    // path. That is correct: the network really did evaluate this position, the
+    // entry is keyed by the position and not by the tree, and the next search —
+    // after `apply_move` has compacted the arena — gets it for free. Throwing
+    // the evaluation away would make an exhausted arena cost GPU work as well
+    // as tree growth.
+    struct LeafEval {
+        NetworkValue value;
+        bool expanded;
+    };
+
+    LeafEval evaluate_and_expand(std::uint32_t node, const EvalRow &row,
+                                 const std::vector<std::uint16_t> &packed,
+                                 const std::vector<std::uint16_t> &raw,
+                                 const std::vector<std::uint16_t> &generation,
+                                 const LeafDiag &diag, CachedEval &scratch,
+                                 SearchStats &stats) {
         if (cache_.has_value() && cache_->probe(row.key(), scratch)) {
             ++stats.cache_hits;
-            expand(node, scratch.moves.data(), scratch.priors.data(), scratch.moves.size(), packed,
-                   raw, "the transposition cache", "cache    ", diag, stats);
-            return scratch.value;
+            const bool ok =
+                expand(node, scratch.moves.data(), scratch.priors.data(), scratch.moves.size(),
+                       packed, raw, "the transposition cache", "cache    ", diag, stats);
+            return LeafEval{scratch.value, ok};
         }
         if (cache_.has_value()) {
             ++stats.cache_misses;
@@ -2861,8 +3125,9 @@ private:
             synthetic_.evaluate(row.key(), parsed, packed.data(), packed.size(),
                                 synthetic_priors_);
             const NetworkValue value(SyntheticEvaluator::value_of(parsed));
-            expand(node, packed.data(), synthetic_priors_.data(), packed.size(), packed, raw,
-                   "the stand-in evaluator", "stand-in ", diag, stats);
+            const bool ok =
+                expand(node, packed.data(), synthetic_priors_.data(), packed.size(), packed, raw,
+                       "the stand-in evaluator", "stand-in ", diag, stats);
             if (cache_.has_value()) {
                 // `insert` takes the move count as a uint16, and the move list
                 // came from movegen, so it is bounded by kMaxLegalMoves — but
@@ -2875,15 +3140,15 @@ private:
                                static_cast<std::uint16_t>(packed.size()));
                 ++stats.cache_inserts;
             }
-            return value;
+            return LeafEval{value, ok};
         }
         if (entry == nullptr) {
             // The named failure, unchanged. lookup() re-does the find so the
             // message stays in one place.
             lookup(row.key(), /*at_root=*/false, diag);
         }
-        expand(node, entry->moves, entry->priors, entry->count, packed, raw, "the replay dump",
-               "golden   ", diag, stats);
+        const bool ok = expand(node, entry->moves, entry->priors, entry->count, packed, raw,
+                               "the replay dump", "golden   ", diag, stats);
         const NetworkValue nn_value(entry->value);
 
         // The insert takes the NETWORK's value, before any tablebase override —
@@ -2892,7 +3157,7 @@ private:
             cache_->insert(row.key(), nn_value, entry->moves, entry->priors, entry->count);
             ++stats.cache_inserts;
         }
-        return nn_value;
+        return LeafEval{nn_value, ok};
     }
 
     // C10. Turn one evaluated row into this node's children.
@@ -2909,11 +3174,11 @@ private:
     // to the widest move list the search will see and never allocate again.
     // Single-threaded by construction: the dispatcher is the only expander
     // (scope §2.2), and in a serial search the caller is the only thread.
-    NetworkValue expand_from_live_row(std::uint32_t node, NNKey key, std::size_t eval_row,
-                                      const std::vector<std::uint16_t> &packed,
-                                      const std::vector<std::uint16_t> &raw,
-                                      const std::vector<std::uint16_t> &generation,
-                                      const LeafDiag &diag, SearchStats &stats) {
+    LeafEval expand_from_live_row(std::uint32_t node, NNKey key, std::size_t eval_row,
+                                  const std::vector<std::uint16_t> &packed,
+                                  const std::vector<std::uint16_t> &raw,
+                                  const std::vector<std::uint16_t> &generation,
+                                  const LeafDiag &diag, SearchStats &stats) {
         assert(evaluator_ != nullptr);
         assert(generation.size() == packed.size());
         if (generation.size() != packed.size()) {
@@ -2947,8 +3212,8 @@ private:
                                  live_priors_.data(), config_.policy_temperature);
         const NetworkValue value(static_cast<double>(evaluator_->value_at(eval_row)));
 
-        expand(node, packed.data(), live_priors_.data(), packed.size(), packed, raw,
-               "the live evaluator", "network  ", diag, stats);
+        const bool ok = expand(node, packed.data(), live_priors_.data(), packed.size(), packed, raw,
+                               "the live evaluator", "network  ", diag, stats);
 
         // The NETWORK's value, before any tablebase override — the same
         // discipline the replay path documents at its own insert, and for the
@@ -2960,7 +3225,7 @@ private:
                            static_cast<std::uint16_t>(packed.size()));
             ++stats.cache_inserts;
         }
-        return value;
+        return LeafEval{value, ok};
     }
 
     // A search needs exactly one source of network answers, and starting without
@@ -3568,6 +3833,15 @@ private:
         par_.select_collisions = collisions_;
         par_.worker_waits = waits_;
         par_.worker_terminals = par_.delivered - par_.queued_leaves;
+        // C11c. Why this search stopped short, if it did. Read AFTER the join,
+        // so every worker's and the dispatcher's stores have happened-before
+        // this thread — no extra synchronisation is needed beyond the join
+        // itself.
+        par_.deadline_hit = deadline_hit_.load(std::memory_order_acquire);
+        par_.arena_exhausted = arena_exhausted_.load(std::memory_order_acquire);
+        par_.arena_exhausted_at = arena_exhausted_at_.load(std::memory_order_acquire);
+        par_.arena_high_water = static_cast<std::int64_t>(arena_high_water());
+        par_.arena_capacity = static_cast<std::int64_t>(arena_.capacity());
 
         if (error_) {
             std::exception_ptr error = error_;
@@ -3720,6 +3994,25 @@ private:
                 // the loop, so the simulation that set it is counted and the
                 // next one never starts.
                 if (mating_move_.load(std::memory_order_relaxed) != kNoMove) {
+                    break;
+                }
+                // C11c. THE ABORT POINT, and both new conditions live here
+                // rather than anywhere else — the brief's requirement 1 and
+                // requirement 3 name the same line on purpose.
+                //
+                // Leaving the loop is all either condition does. It is NOT
+                // `aborted_`: that flag means "an exception is in flight, unwind
+                // and rethrow", and both of these are ordinary completions that
+                // must return the best move found so far. A worker that stops
+                // here has repaid nothing and holds nothing — the previous
+                // iteration's RAII unwind already ran — so the tree is
+                // consistent the instant it leaves, and the leaves other workers
+                // still have in flight drain through the dispatcher exactly as
+                // they would at the end of any search.
+                if (arena_exhausted_.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (deadline_passed()) {
                     break;
                 }
 
@@ -4118,27 +4411,69 @@ private:
         const LeafDiag diag{&item.parsed, item.halfmove_clock, item.fullmove_number,
                             item.path_moves.data(), item.path_moves.size()};
         NetworkValue nn_value(0.0);
+        bool expanded = true;
         if (evaluator_ != nullptr) {
             const std::size_t slot = live_slot_[index];
             if (slot == kNoEvalRow) {
                 ++dispatch_stats_.cache_hits;
                 CachedEval &hit = live_hits_[index];
-                expand(item.node, hit.moves.data(), hit.priors.data(), hit.moves.size(),
-                       item.packed, item.raw, "the transposition cache", "cache    ", diag,
-                       dispatch_stats_);
+                expanded = expand(item.node, hit.moves.data(), hit.priors.data(),
+                                  hit.moves.size(), item.packed, item.raw,
+                                  "the transposition cache", "cache    ", diag, dispatch_stats_);
                 nn_value = hit.value;
             } else {
                 if (cache_.has_value()) {
                     ++dispatch_stats_.cache_misses;
                 }
-                nn_value = expand_from_live_row(item.node, live_keys_[index], slot, item.packed,
-                                                item.raw, item.generation, diag, dispatch_stats_);
+                const LeafEval leaf =
+                    expand_from_live_row(item.node, live_keys_[index], slot, item.packed,
+                                         item.raw, item.generation, diag, dispatch_stats_);
+                nn_value = leaf.value;
+                expanded = leaf.expanded;
             }
         } else {
             const EvalRow row(item.parsed);
-            nn_value = evaluate_and_expand(item.node, row, item.packed, item.raw, item.generation,
-                                           diag, dispatch_cache_, dispatch_stats_);
+            const LeafEval leaf =
+                evaluate_and_expand(item.node, row, item.packed, item.raw, item.generation,
+                                    diag, dispatch_cache_, dispatch_stats_);
+            nn_value = leaf.value;
+            expanded = leaf.expanded;
         }
+
+        // C11c. THE ARENA REFUSED. Unwind this leaf completely and deliver
+        // nothing.
+        //
+        // Three things have to happen, in this order, and each of them is the
+        // reason a "just mark it expanded with no children" shortcut is wrong:
+        //
+        //   1. REPAY the virtual loss. Ownership of the repayment moved into
+        //      this leaf when the worker submitted it (see
+        //      run_simulation_parallel's `applied.swap`), so nobody else can.
+        //      A loss left applied is a permanent bias on the path it sits on,
+        //      and C8's audit would find it as stranded virtual loss.
+        //   2. RELEASE the PENDING claim, putting the node back to Unexpanded.
+        //      It is a leaf that has not been evaluated yet — a state the tree
+        //      already understands — and not a terminal, and not an expanded
+        //      node with no children.
+        //   3. DO NOT back up and DO NOT count a delivered simulation. The
+        //      simulation was claimed in `issued_` and produced nothing, which
+        //      is exactly what makes `delivered < requested` and what
+        //      `arena_exhausted` exists to explain.
+        //
+        // The workers are already stopping: `note_arena_exhausted` set the flag
+        // that their abort point reads. The leaves still in flight arrive here
+        // and unwind the same way, which is what "let in-flight simulations
+        // complete" means when there is no room to complete them in.
+        if (!expanded) {
+            repay_list(item.applied);
+            item.applied.clear();
+            arena_.release_pending(item.node);
+            outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+            item.node = kNoNode;
+            item.in_use.store(false, std::memory_order_release);
+            return;
+        }
+
         const double backup_value =
             apply_tablebase(nn_value, item.parsed, item.halfmove_clock, dispatch_stats_);
 
@@ -4334,6 +4669,27 @@ private:
     std::atomic<std::uint64_t> drain_epoch_{0};
     std::atomic<bool> aborted_{false};
     int target_ = 0;
+
+    // --- C11c ----------------------------------------------------------------
+    //
+    // THE ONLY THREE PIECES OF MUTABLE STATE THE CHUNK ADDS, and all three are
+    // atomics that are written by one thread and read by several.
+    //
+    // `deadline_ns_` is the only one written from OUTSIDE the search — that is
+    // the whole point of it — and it outlives a `search_parallel` call by
+    // design, because the host arms it once and the slice loop enters the search
+    // many times. See set_deadline_ns.
+    //
+    // `arena_exhausted_` and `deadline_hit_` are per-call and are cleared at the
+    // top of both entry points. They are `atomic<bool>` rather than plain bools
+    // for the ordinary reason: W workers and the dispatcher all touch them, and
+    // an unsynchronised bool read concurrently with a write is a data race
+    // whether or not any hardware would ever tear it. TSan is the acceptance
+    // criterion here, not intuition.
+    std::atomic<std::int64_t> deadline_ns_{kNoDeadline};
+    std::atomic<bool> deadline_hit_{false};
+    std::atomic<bool> arena_exhausted_{false};
+    std::atomic<std::int64_t> arena_exhausted_at_{0};
 
     std::mutex mutex_;
     std::condition_variable worker_cv_;

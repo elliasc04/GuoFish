@@ -133,6 +133,15 @@ def build_command(args, out_dir: Path) -> list[str]:
     if args.book_seed is not None:
         engine_args += ["--book-seed", str(args.book_seed)]
 
+    # C11c. Pondering is a HOST-SIDE feature and needs BOTH halves turned on:
+    # the engine has to advertise and honour the handshake (`--ponder`), and
+    # cutechess has to actually issue `go ponder` (its per-engine `ponder`
+    # flag, which defaults off). Wiring only one is the failure mode worth
+    # naming — with only the engine flag, nothing ponders and the run silently
+    # measures the ponder-off configuration under a ponder-on label.
+    if args.ponder:
+        engine_args += ["--ponder"]
+
     if args.mode == "nodes":
         # `tc=inf nodes=N` makes cutechess send `go nodes N` with no clock, and
         # `timemargin` is what stops it adjudicating a long think as a loss.
@@ -142,6 +151,19 @@ def build_command(args, out_dir: Path) -> list[str]:
     else:
         guofish_clock = [f"tc={args.tc}"]
         stockfish_clock = [f"tc={args.tc}"]
+
+    # C11c. FIXED-NODE IS MEANINGLESS WITH PONDERING and the brief says so: a
+    # ponder runs on the opponent's clock, and `tc=inf nodes=N` has no clock to
+    # run on. Refused rather than quietly accepted, because a `--ponder
+    # --mode nodes` run would produce a plausible-looking artifact describing a
+    # configuration that never pondered.
+    if args.ponder and args.mode == "nodes":
+        raise SystemExit(
+            "tools/smoke_c11.py: --ponder requires --mode clock. Fixed-node "
+            "play sends `go nodes N` with tc=inf, so there is no opponent "
+            "clock to ponder on and the run would measure nothing.")
+    if args.ponder:
+        guofish_clock += ["ponder"]
 
     # One `arg=` per argument, never joined: an argument containing a space
     # would otherwise be split and the engine would launch on its defaults.
@@ -386,6 +408,13 @@ def main(argv=None) -> int:
                         help="C11b. 0 (the engine's default) always plays the "
                              "highest-weight entry; any other value seeds "
                              "weighted-random selection")
+    parser.add_argument("--ponder", action="store_true",
+                        help="C11c: turn pondering on for guofish, on BOTH "
+                             "sides of the handshake (the engine's --ponder "
+                             "and cutechess's per-engine `ponder` flag). "
+                             "Requires --mode clock. Gate 5 must NOT use this: "
+                             "the 2687.7 anchor was measured with ponder off "
+                             "and the strength gate has to match it.")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--verify-only", type=Path, default=None,
                         help="skip the match and verify an existing run directory")

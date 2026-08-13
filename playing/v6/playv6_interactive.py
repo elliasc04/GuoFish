@@ -32,14 +32,36 @@ The command surface is deliberately identical, so muscle memory carries over:
 
 WHAT IS DIFFERENT, AND WHY
 ==========================
-1. NO PONDERING. playv5 searched in the background while the human thought, via
-   `mcts_engine.ponder_start/ponder_stop`. The v6 `Engine` exposes no such pair —
-   pondering lives in `uci_wrapper_v6.py`, which owns the threads and the
-   `ponderhit` conversion that make it answerable. Reproducing it here would mean
-   running a search thread while the main thread blocks in `input()`, which is
-   the exact configuration `playv6.preimport_torch` documents as a Windows
-   deadlock hazard. `--ponder` is accepted (it is an `EngineConfig` field) and
-   has no effect in this frontend; a game plays identically with or without it.
+1. PONDERING IS ON THE CURRENT POSITION, NOT ON A PREDICTED REPLY (C11c).
+   `--ponder` now does something here: `Session.start_ponder` runs a search on a
+   background thread while the human thinks, and `stop_ponder` ends it before
+   any other engine call. It was a no-op until C11c, and the shape it has taken
+   is the opposite of the UCI one.
+
+   `uci_wrapper_v6.py` ponders the position the GUI names, which ALREADY
+   INCLUDES the predicted reply, and discards the tree when the prediction was
+   wrong. That is right against another engine, whose reply a search predicts
+   well. It is wrong against a human, whose reply it predicts badly — and the
+   parent-root form has no miss case at all: pondering the position the human is
+   ABOUT TO MOVE FROM puts visits under every legal reply, so whichever one they
+   play, `set_position` extends the tree into a subtree that is already partly
+   searched. The brief calls this out as the one place the alternative it
+   rejects for UCI is the right design, precisely because the hit rate would
+   otherwise be poor.
+
+   `start_ponder(board, predicted_move=...)` still offers the UCI form for a
+   caller that has a prediction worth betting on. Nothing in this frontend
+   passes one.
+
+   ON THE DEADLOCK HAZARD, which this docstring used to cite as the reason not
+   to do this at all: C11's deadlock is `import torch` failing to return while
+   another thread blocks on a pipe, and it is an INITIALISATION-ORDER bug. It
+   fires once, at startup, and `main()` below imports torch and calls
+   `ensure_ready()` before the first prompt — so no ponder thread can exist
+   until both have happened. A search thread running against a main thread
+   blocked in `input()` is thereafter the same GIL picture the UCI wrapper has
+   had since C11, with the two roles swapped: `input()` releases the GIL exactly
+   as `readline()` does.
 
 2. THE TREE SURVIVES YOUR MOVE. `Engine.set_position` extends the existing tree
    whenever the move list it is handed is the previous one plus new moves, so
@@ -70,6 +92,7 @@ from __future__ import annotations
 import argparse
 import io
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -92,6 +115,7 @@ from playing.v6.playv6 import (  # noqa: E402
     apply_switch_interval,
     config_from_args,
     err,
+    force_utf8_streams,
     preimport_torch,
 )
 
@@ -444,6 +468,142 @@ class Session:
         self.human_side = chess.WHITE
         self.outcomes: list[SearchOutcome] = []
 
+        # --- C11c: background pondering --------------------------------------
+        #
+        # ONE THREAD AT A TIME AND NEVER MORE. `_ponder_thread` is non-None for
+        # exactly the interval between `start_ponder` and `stop_ponder`, and
+        # every engine call the main thread makes goes through `stop_ponder`
+        # first — see `engine_move`, `play` and `_sync_position`. That is the
+        # whole of the concurrency discipline here: the `Engine` is not
+        # thread-safe and is never touched by two threads at once. What IS safe
+        # from another thread is `interrupt_slice`, which is how `stop_ponder`
+        # gets the search to return promptly instead of running out its ceiling.
+        self._ponder_thread: Optional[threading.Thread] = None
+        self._ponder_stop = threading.Event()
+        self._ponder_outcome: Optional[SearchOutcome] = None
+        # Cumulative, for the end-of-game summary. Ponder simulations are never
+        # folded into the per-move delivered counts — same discipline as the
+        # UCI surface, and for the same reason: they ran on the human's clock.
+        self.ponder_sims_total = 0
+
+    # --- C11c: pondering on the human's clock ----------------------------
+
+    def start_ponder(self, board: chess.Board,
+                     predicted_move: Optional[chess.Move] = None) -> bool:
+        """Search in the background while the human thinks. C11c requirement 7.
+
+        `predicted_move=None` — the only form this frontend uses — ponders
+        `board` ITSELF: the position the human is about to move from. Every
+        legal reply is a child of that root, so the visits this puts down are
+        under whichever move they actually play and there is NO MISS CASE. Pass
+        a `predicted_move` to get the UCI form instead (ponder the position
+        after it), which is better when the prediction is good and wasted when
+        it is not.
+
+        Returns False without starting anything when there is nothing worth
+        pondering: pondering is off, a ponder is already running, the game is
+        over, or the position is a book or tablebase hit — the last being C11c
+        requirement 6, and as true here as it is over UCI. The move is already
+        determined; searching it would spend the human's whole think on a
+        result a lookup will overrule.
+
+        Never raises into the caller's prompt loop. A frontend that dropped the
+        human into a traceback because a background nicety failed would be
+        worse than one that never pondered.
+        """
+        # READ OFF THE CONFIG, NOT THE ARGPARSE NAMESPACE. `EngineConfig` is
+        # the one object that knows what the engine is running with — it is
+        # validated, it is what `describe()` logs, and it is what a future
+        # setoption-equivalent would change. `self.args` is the command line,
+        # which is only the same thing until something else sets a knob.
+        if not self.engine.config.ponder or self._ponder_thread is not None:
+            return False
+        if board.is_game_over():
+            return False
+
+        target = board.copy()
+        if predicted_move is not None:
+            if predicted_move not in target.legal_moves:
+                return False
+            target.push(predicted_move)
+            if target.is_game_over():
+                return False
+
+        # Requirement 6, and it has to be probed against the position that would
+        # actually be searched — which is `target`, not `board`, when a
+        # prediction was supplied.
+        try:
+            uci, source = self.engine.bypass_move(target)
+        except Exception:                                        # noqa: BLE001
+            uci, source = None, "search"
+        if uci is not None:
+            if self.args.telemetry:
+                err(f"[ponder] skipped: {source} answers {target.fen()} with "
+                    f"{uci}; the move is already determined")
+            return False
+
+        moves = [m.uci() for m in target.move_stack]
+        self._ponder_stop.clear()
+        self._ponder_outcome = None
+
+        def run() -> None:
+            try:
+                self.engine.set_position(self.base_fen, moves)
+                self._ponder_outcome = self.engine.search_move(
+                    budget=(int(self.engine.search.root_visits)
+                            + self.engine.config.ponder_max_sims_resolved),
+                    deadline=None,
+                    nominal=None,
+                    budget_source="ponder",
+                    should_stop=self._ponder_stop.is_set,
+                    # No per-slice callback: there is no `info` stream here and
+                    # printing under the human's prompt would corrupt the line
+                    # they are typing on.
+                    on_slice=None,
+                    allow_bypass=False,
+                    # A ponder decides no move; tallying it would corrupt the
+                    # end-of-game decision counts.
+                    count_decision=False,
+                )
+            except Exception as exc:                             # noqa: BLE001
+                # Reported, never propagated: this thread has no caller to
+                # raise into and a failed ponder must not end the game.
+                err(f"[ponder] background search failed "
+                    f"({type(exc).__name__}: {exc}); pondering is off for this "
+                    f"move")
+
+        self._ponder_thread = threading.Thread(target=run, name="ponder",
+                                               daemon=True)
+        self._ponder_thread.start()
+        return True
+
+    def stop_ponder(self) -> Optional[SearchOutcome]:
+        """End the background search and JOIN it. Idempotent; never raises.
+
+        Joining rather than merely signalling is the point. Every caller is
+        about to touch the `Engine`, which is not thread-safe, so "the ponder
+        has been asked to stop" is not a safe state to proceed from — only "the
+        ponder thread has exited" is.
+
+        The stop is delivered two ways because one of them is slow on its own:
+        `_ponder_stop` is read between slices, and `interrupt_slice` aborts the
+        slice already running. Without the second, this would block for up to
+        `slice_seconds` after every human move.
+        """
+        thread = self._ponder_thread
+        if thread is None:
+            return None
+        self._ponder_stop.set()
+        self.engine.interrupt_slice()
+        thread.join()
+        self._ponder_thread = None
+        outcome = self._ponder_outcome
+        if outcome is not None:
+            self.ponder_sims_total += outcome.delivered
+            if self.args.telemetry:
+                err(f"[ponder] {outcome.telemetry()}")
+        return outcome
+
     # --- engine ---------------------------------------------------------
 
     def engine_move(self) -> bool:
@@ -454,6 +614,12 @@ class Session:
         lookup answered — so this frontend cannot disagree with the engine about
         whether a move was searched, which is the whole point of that field.
         """
+        # C11c. DEFENSIVE, and idempotent when nothing is running. The prompt
+        # loop already stops the ponder before it gets here, but `engine_move`
+        # is also reached from `ask_first_move` and the PGN preload path, and
+        # `Engine` is not thread-safe: "no ponder thread is inside the engine"
+        # has to be true at every entry, not only at the one that is obvious.
+        self.stop_ponder()
         if self.board.is_game_over():
             return False
         self.engine.set_position(self.base_fen,
@@ -541,6 +707,15 @@ class Session:
                   f"{rate:,.0f} delivered sims/s "
                   f"(bypassed {counts['bypassed']} moves, "
                   f"{counts['excluded_wall_s']:.2f}s excluded){RESET}")
+        # C11c. REPORTED SEPARATELY AND NEVER FOLDED INTO THE RATE ABOVE.
+        # Ponder simulations ran on the human's clock, in wall time this
+        # session never measured, so adding them to the numerator of a
+        # sims/s figure would inflate it by however long the human thought.
+        # They are worth showing because they are real search that went into
+        # the moves played — just not into the throughput.
+        if self.ponder_sims_total:
+            print(f"{DIM}[game] pondered {self.ponder_sims_total:,} extra "
+                  f"simulations on your clock (not in the rate above){RESET}")
 
     # --- game over ------------------------------------------------------
 
@@ -642,6 +817,12 @@ class Session:
 
     def play(self, pgn_preload: Optional[list[chess.Move]]) -> None:
         """One game. Returns normally only via RestartGame or QuitSession."""
+        # C11c. `new_game()` drops the tree AND the transposition cache; a
+        # ponder thread still inside the search would be reading both. Nothing
+        # should reach here with one running — RestartGame is raised from inside
+        # the prompt's `finally` — but "should" is not a synchronisation
+        # primitive.
+        self.stop_ponder()
         self.engine.new_game()
         self.board = chess.Board(self.base_fen)
         self.outcomes = []
@@ -682,7 +863,25 @@ class Session:
         while True:
             if self.finished():
                 self.end_game()
-            raw = prompt(f"{GREEN}Your move: {RESET}")
+            # C11c. THE HUMAN'S CLOCK, spent on the position they are about to
+            # move from rather than on a guess about which move that will be.
+            # See `start_ponder`: every legal reply is a child of this root, so
+            # there is no prediction to get wrong.
+            #
+            # Started immediately before the prompt and stopped immediately
+            # after it, so the search runs for exactly as long as the human
+            # takes and the `Engine` is single-threaded again before anything
+            # else touches it.
+            self.start_ponder(self.board)
+            try:
+                raw = prompt(f"{GREEN}Your move: {RESET}")
+            finally:
+                # A `finally`, because `prompt` raises RestartGame and
+                # QuitSession as control flow. A ponder thread left running
+                # into `new` or `quit` would race `engine.new_game()` and
+                # `engine.close()` — the second of which drops the search
+                # object the thread is inside.
+                self.stop_ponder()
             if not raw:
                 continue
             if raw.lower() in _UNDO_WORDS:
@@ -727,6 +926,11 @@ class Session:
 
 def main(argv: Optional[list[str]] = None) -> int:
     # FIRST STATEMENT, before any thread exists — playv6.apply_switch_interval.
+    # C11c. Before any line is written: the streams are pipes under a
+    # harness and Windows picks cp1252 for them, while every reader in
+    # this repo opens the captured log as UTF-8. See
+    # playv6.force_utf8_streams for the run this cost a verdict.
+    force_utf8_streams()
     before, after = apply_switch_interval()
 
     parser = argparse.ArgumentParser(

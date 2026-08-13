@@ -89,7 +89,8 @@ import guofish_core  # noqa: E402
 
 from playing.v6.playv6 import (  # noqa: E402
     ConfigError, Engine, EngineConfig, SearchOutcome, add_config_arguments,
-    apply_switch_interval, config_from_args, err, preimport_torch,
+    apply_switch_interval, config_from_args, err, force_utf8_streams,
+    preimport_torch,
 )
 
 ENGINE_NAME = "GuoFish v6"
@@ -214,7 +215,16 @@ OPTIONS: tuple[Option, ...] = (
 
     Option("CacheEntries", "cache_entries", "spin", int, "min 0 max 100000000"),
     Option("CacheShards", "cache_shards", "spin", int, "min 0 max 65536"),
-    Option("ArenaCapacity", "arena_capacity", "spin", int, "min 1024 max 200000000"),
+    # C11c. BOTH ARE OPTIONAL-VALUED NOW, and 0 is the UCI spelling of "unset"
+    # that `_parse_optional_int` already uses for FixedSims. Unset means the
+    # computed default — `60 x (sims_per_move + ponder_max_sims)` and
+    # `sims_per_move / ponder_decay` respectively — so a GUI that raises
+    # DefaultSims gets an arena sized for it without also having to know the
+    # formula. The `min 0` is what makes "reset to default" expressible.
+    Option("ArenaCapacity", "arena_capacity", "spin", _parse_optional_int,
+           "min 0 max 200000000"),
+    Option("PonderMaxSims", "ponder_max_sims", "spin", _parse_optional_int,
+           "min 0 max 100000000"),
     Option("PonderDecay", "ponder_decay", "string", float),
     Option("VerifyCompaction", "verify_compaction", "check", _parse_bool),
 
@@ -346,9 +356,27 @@ class UCIEngine:
         self._commands: "queue.Queue[str]" = queue.Queue()
         self._last_info = 0.0
         self._last_config_kv: Optional[str] = None
-        # Set on the main thread when a `go ponder` starts; read by _should_stop.
-        self._pending_ponder_params: Optional[GoParams] = None
-        self._ponder_deadline: Optional[float] = None
+
+        # --- C11c: the ponder state machine ----------------------------------
+        #
+        # `_pondering` IS THE STATE. Set on the main thread for the whole of a
+        # `go ponder` — the search phase AND the idle wait that follows it — and
+        # read by the reader thread, which is what makes `ponderhit` with no
+        # ponder in flight distinguishable from a real one, and what tells the
+        # reader that a `position` arriving now is a discontinuity to stop on
+        # rather than an ordinary command to queue.
+        self._pondering = threading.Event()
+        # Set by the reader when ANY of stop / ponderhit / quit arrives. It is
+        # what the idle wait blocks on, so a ponder that has already spent its
+        # simulation ceiling costs nothing while it waits for the GUI to say
+        # which way the prediction went — and answers in microseconds when it
+        # does, rather than on a polling interval.
+        self._ponder_verdict = threading.Event()
+        # THE `bestmove` LEDGER. Exactly one per `go`, which the protocol
+        # requires and which the error path below would otherwise break: an
+        # exception thrown after the move was already sent used to produce a
+        # second one. Reset at the top of every `go`.
+        self._bestmove_sent = False
 
     # --- identification and options ---------------------------------------
 
@@ -553,17 +581,25 @@ class UCIEngine:
             # `bestmove 0000` is the protocol's null move and is one of the four
             # things the smoke run counts. It is emitted here and nowhere else,
             # and only for a position with no legal move at all.
+            #
+            # C11c: even for a `go ponder`. A finished position cannot be
+            # pondered and hanging until the GUI notices is the failure mode
+            # this whole chunk is tested through a pipe to prevent.
             err(f"[go] {self.board.fen()} is over ({self.board.result()}); "
                 f"there is no move to make")
             err(f"[bestmove] bestmove 0000 (game already over) "
                 f"fen={self.board.fen()}")
-            log("bestmove 0000")
+            self._send_bestmove("bestmove 0000")
             return
 
         # A `go` with no preceding `position` is legal UCI: the engine is
         # expected to search whatever position it holds, which is the start
         # position until told otherwise.
         self.engine.set_position(self._base_fen, self._moves)
+
+        if params.ponder:
+            self.handle_go_ponder(params)
+            return
 
         budget, deadline, nominal, source, plan = self._plan(params)
         err(f"[go] {plan}")
@@ -582,9 +618,192 @@ class UCIEngine:
         finally:
             self._searching.clear()
 
-        # A ponder search that was converted by `ponderhit` has already had its
-        # deadline applied inside `_should_stop`; one that ended on `stop`
-        # reports a move anyway, which is what the GUI expects.
+        err(outcome.telemetry())
+        self._emit_info(outcome, final=True)
+        self._emit_bestmove(outcome)
+
+    # --- C11c: pondering ---------------------------------------------------
+
+    def handle_go_ponder(self, params: GoParams) -> None:
+        """`go ponder`: search the opponent's clock, answer stop or ponderhit.
+
+        THE ONE PROTOCOL RULE THAT SHAPES ALL OF THIS: an engine that is
+        pondering MUST NOT send `bestmove` until the GUI has said `ponderhit` or
+        `stop`. Not when the simulation ceiling is reached, not when the arena
+        fills, not when a mate is found. So the method is two phases and an idle
+        wait between them, rather than one search whose end is the move's end.
+
+          phase 1   search the given position — which ALREADY INCLUDES the
+                    predicted reply, per standard UCI — with no clock and a
+                    ceiling of `ponder_max_sims`. No `info` is emitted.
+          wait      block on `_ponder_verdict` until the GUI speaks. Costs
+                    nothing and answers in microseconds; a ponder that spent its
+                    ceiling in 200 ms of a 30 s opponent think sits here for the
+                    other 29.8 s.
+          phase 2   ONLY on `ponderhit`: continue on the SAME TREE with the real
+                    clock, as a second `search_move` against a higher target.
+                    The tree is not rebuilt, nothing is promoted, and no visit
+                    is decayed — this is the same position it has been searching
+                    all along and the GUI has just confirmed it.
+
+        WHY PHASE 2 IS A SECOND CALL rather than a deadline dropped into the
+        first one. Budget accounting has to start at the ponderhit instant: the
+        node ceiling for the real move is `ponder_max_sims` further on, and the
+        wall clock the sims/s figure divides by is the post-hit one. Two calls
+        make both of those structural instead of remembered, and they are what
+        put `ponder_sims` and `search_sims` in the outcome as separate numbers.
+        The TREE is what carries across, which is the entire point of pondering,
+        and it carries because `search_move` never touches it — it just calls
+        `search_parallel` at a higher absolute target, exactly as the slice loop
+        inside one call already does.
+
+        A MISS discards nothing here. `stop` is answered with a bestmove the GUI
+        throws away, and the discontinuity arrives as the GUI's next `position`,
+        which `Engine.set_position` resolves the ordinary way — extending the
+        tree if the new line is this one plus moves, rebuilding it otherwise.
+        Salvaging the pondered subtree on a miss was considered and rejected;
+        see DECISIONS.md, C11c.
+        """
+        # `_pondering` was set by the READER when it saw the `go ponder` line,
+        # not here — see `_reader`, and the ponderhit-immediately-after-go race
+        # it exists to close. This method only clears it.
+        ponder_outcome: Optional[SearchOutcome] = None
+        bypass_uci: Optional[str] = None
+        bypass_source = "search"
+        try:
+            # Requirement 6. The ponder position already includes the predicted
+            # move, so if the book or the tablebase answers it the move is
+            # ALREADY DETERMINED and searching it is pure waste — the whole of
+            # the opponent's clock spent computing something a lookup will
+            # overrule. Cheap, and it composes with C11b's decision source
+            # because it is the same probe the real search would do.
+            bypass_uci, bypass_source = self.engine.bypass_move(self.board)
+            if bypass_uci is not None:
+                err(f"[ponder] NOT pondering {self.board.fen()}: "
+                    f"{bypass_source} answers it with {bypass_uci}. The move is "
+                    f"already determined, so the opponent's clock buys nothing.")
+            else:
+                budget, _, nominal, source, plan = self._plan(params)
+                err(f"[go] {plan}")
+                self._last_info = 0.0
+                self._searching.set()
+                try:
+                    ponder_outcome = self.engine.search_move(
+                        budget=budget,
+                        deadline=None,
+                        nominal=nominal,
+                        budget_source=source,
+                        should_stop=self._should_stop_pondering,
+                        # Requirement 5. NO `info` DURING PONDER. Formatting an
+                        # info line is pure-Python work holding the GIL, and
+                        # C10c measured what that costs at the wrong switch
+                        # interval — 4 sims/s, an engine that has stopped. The
+                        # interval fix is already mandatory so this is defence
+                        # in depth rather than correctness, but GUIs discard
+                        # ponder info and it buys nothing.
+                        on_slice=None,
+                        # Already probed above; probing again would charge the
+                        # same lookup to a search that will not use it.
+                        allow_bypass=False,
+                        # A ponder decides no move. Tallying it would
+                        # double-count every pondered move in the per-game
+                        # figures a benchmark artifact carries.
+                        count_decision=False,
+                    )
+                finally:
+                    self._searching.clear()
+                err(f"[ponder] {ponder_outcome.telemetry()}")
+
+            # THE IDLE WAIT. Phase 1 can end on the ceiling, on the arena, on a
+            # mate or on the GUI; only the last of those is permission to speak.
+            if not self._ponder_verdict.is_set():
+                err("[ponder] search phase over; waiting for ponderhit/stop "
+                    "(the protocol forbids a bestmove before the GUI speaks)")
+                self._ponder_verdict.wait()
+        finally:
+            # PHASE 2 IS NOT A PONDER. Cleared before the hit is even read, so
+            # the timed search below is an ordinary search as far as the reader
+            # is concerned: `ponderhit` arriving during it is the protocol error
+            # it is, and `position` arriving during it is not a ponder
+            # discontinuity.
+            self._pondering.clear()
+
+        hit = self._ponderhit.is_set() and not self._quit.is_set()
+        self._ponderhit.clear()
+
+        # ONE CANONICAL VERDICT LINE PER RESOLVED PONDER, and exactly one.
+        #
+        # The ponder-hit rate is the number that decides whether the rejected
+        # salvage-on-miss design is ever worth revisiting (see DECISIONS.md,
+        # C11c), so it has to be recoverable from an ordinary match log rather
+        # than from an instrumented run nobody will do again. Machine-readable
+        # and greppable: `tools/bench_c11c_ponder.py` counts these.
+        err(f"[ponder] verdict={'hit' if hit else 'miss'} "
+            f"ponder_sims={ponder_outcome.delivered if ponder_outcome else 0} "
+            f"ponder_wall_ms={(ponder_outcome.wall_s * 1000) if ponder_outcome else 0.0:.1f} "
+            f"bypassed={bypass_source if bypass_uci else 'no'} "
+            f"quit={self._quit.is_set()}")
+
+        if not hit:
+            # A MISS, or a `stop`, or `quit`. The GUI discards this bestmove; it
+            # is sent because the protocol owes exactly one per `go` and a
+            # silent `go` is a game lost on time with no diagnosis.
+            err(f"[ponder] MISS/stop: answering the go with the move the ponder "
+                f"had. quit={self._quit.is_set()}")
+            if bypass_uci is not None:
+                self._send_bestmove(f"bestmove {bypass_uci}")
+                return
+            if ponder_outcome is None:
+                # Nothing ran at all — a `stop` that beat the search's first
+                # slice. Answer from the position rather than not at all.
+                fallback = next(iter(self.board.legal_moves), None)
+                self._send_bestmove(
+                    f"bestmove {fallback.uci()}" if fallback else "bestmove 0000")
+                return
+            self._emit_info(ponder_outcome, final=True)
+            self._emit_bestmove(ponder_outcome)
+            return
+
+        # --- ponderhit: the prediction held ---------------------------------
+        if bypass_uci is not None:
+            # The position we were told to ponder is a book or tablebase hit and
+            # the opponent played into it. The move is decided; there is nothing
+            # to time.
+            self.engine.decision_counts[bypass_source] = (
+                self.engine.decision_counts.get(bypass_source, 0) + 1)
+            err(f"[ponderhit] {bypass_source} answers the position directly; "
+                f"no search needed")
+            self._send_bestmove(f"bestmove {bypass_uci}")
+            return
+
+        budget, deadline, nominal, source, plan = self._plan_after_ponderhit(params)
+        err(f"[ponderhit] {plan}")
+        self._last_info = 0.0
+        self._searching.set()
+        try:
+            outcome = self.engine.search_move(
+                budget=budget,
+                deadline=deadline,
+                nominal=nominal,
+                budget_source=source,
+                should_stop=self._should_stop,
+                on_slice=self._emit_info,
+            )
+        finally:
+            self._searching.clear()
+
+        # THE TWO SIM COUNTS, KEPT APART. `delivered` on this outcome is the
+        # post-hit work and nothing else; the ponder's contribution rides
+        # alongside it. Merging them would make the engine look 2-3x faster than
+        # it is on a hit and would make its throughput incomparable with the
+        # ponder-off arm Gate 5 is measured against.
+        if ponder_outcome is not None:
+            outcome.ponder_sims = ponder_outcome.delivered
+            outcome.ponder_wall_s = ponder_outcome.wall_s
+            outcome.arena_exhausted = (outcome.arena_exhausted
+                                       or ponder_outcome.arena_exhausted)
+            outcome.arena_exhausted_at = (outcome.arena_exhausted_at
+                                          or ponder_outcome.arena_exhausted_at)
         err(outcome.telemetry())
         self._emit_info(outcome, final=True)
         self._emit_bestmove(outcome)
@@ -630,12 +849,32 @@ class UCIEngine:
                 err(f"[go] nodes {nodes} exceeds SimCap {cfg.sim_cap}; clamped")
             return budget, deadline, budget, "nodes", f"{note}, {clock_note}"
 
-        if params.ponder or params.infinite:
+        if params.ponder:
+            # C11c. THE PONDER CEILING IS `ponder_max_sims`, NOT `sim_cap`.
+            #
+            # A ponder has no clock of its own — it runs for as long as the
+            # opponent thinks — so the only thing bounding it is this. `sim_cap`
+            # is the wrong bound in both directions: at 60,000 it is twelve
+            # times the default budget, which is how the Python reference came
+            # to hand a 60,000-visit tree to a 2,000-simulation search and
+            # leave it unable to redistribute (scope E6's over-commit defect).
+            #
+            # `ponder_max_sims` is derived from the decay for exactly that
+            # reason — see EngineConfig.ponder_max_sims_resolved — and the
+            # coupling it satisfies is printed on the startup line beside it.
+            cap = cfg.ponder_max_sims_resolved
+            budget = current + cap
+            coupling = ("" if cfg.coupling_holds else
+                        " WARNING: decay x ponder_max_sims exceeds sims_per_move; "
+                        "a hit hands the next search a tree it cannot outvote")
+            return (budget, None, None, "ponder",
+                    f"ponder: up to {cap} new sims (root at {current}), no clock, "
+                    f"ending on ponderhit/stop.{coupling}")
+
+        if params.infinite:
             budget = current + cfg.sim_cap
-            kind = "ponder" if params.ponder else "infinite"
-            return (budget, None, None, kind,
-                    f"{kind}: up to {cfg.sim_cap} new sims, ending on "
-                    f"{'ponderhit/stop' if params.ponder else 'stop'}")
+            return (budget, None, None, "infinite",
+                    f"infinite: up to {cfg.sim_cap} new sims, ending on stop")
 
         if deadline is not None:
             budget = current + cfg.sim_cap
@@ -644,6 +883,55 @@ class UCIEngine:
 
         return (current + cfg.default_sims, None, cfg.default_sims, "default",
                 f"no clock and no nodes: DefaultSims {cfg.default_sims} new sims")
+
+    def _plan_after_ponderhit(self, params: GoParams
+                              ) -> tuple[int, Optional[float], Optional[int], str, str]:
+        """The budget for phase 2, measured FROM THE PONDERHIT INSTANT.
+
+        Both halves of that are requirement 2 of the brief and both are
+        structural here rather than remembered:
+
+          the clock   `_allot` is called NOW, so the allotted time runs from
+                      this instant. The `wtime`/`btime` on the original `go
+                      ponder` line are the numbers the GUI had when it sent it,
+                      which is the best information available and is what every
+                      engine uses.
+          the nodes   the target is `root_visits_now + sim_cap`, so the ponder's
+                      simulations are a BONUS and not a draw against this move's
+                      allocation. Taking `sim_cap` as an absolute ceiling
+                      instead would let a productive ponder arrive with the
+                      budget already spent and return instantly with zero fresh
+                      work — the reference's `existing_visits >= num_simulations`
+                      early return, which is the defect this port is fixing.
+        """
+        cfg = self.config
+        current = int(self.engine.search.root_visits)
+
+        if cfg.fixed_sims is not None:
+            # A fixed-budget arm ignores the clock everywhere else and must
+            # ignore it here too, or a pondered move would be the one move in
+            # the match decided on time.
+            return (current + cfg.fixed_sims, None, cfg.fixed_sims, "fixed",
+                    f"fixed budget {cfg.fixed_sims} FRESH sims on the pondered "
+                    f"tree (root at {current}; clock ignored, FixedSims is set)")
+
+        allotted = self._allot(params)
+        if allotted is None:
+            # A `go ponder` with no clock on it. Legal, and it means the GUI
+            # gave the engine nothing to time against, so the node ceiling is
+            # all there is. Said out loud because a move that ends on nodes when
+            # the operator expected a clock is otherwise invisible.
+            err("[ponderhit] the original 'go ponder' carried no clock; "
+                "running to the node ceiling instead of a deadline")
+            return (current + cfg.sim_cap, None, None, "ponderhit",
+                    f"ponderhit with no clock: up to {cfg.sim_cap} fresh sims "
+                    f"on the pondered tree (root at {current})")
+
+        deadline = time.monotonic() + allotted
+        return (current + cfg.sim_cap, deadline, None, "ponderhit",
+                f"ponderhit: {allotted * 1000:.0f} ms FROM NOW, ceiling "
+                f"{cfg.sim_cap} fresh sims on the pondered tree "
+                f"(root at {current}, {current} inherited from the ponder)")
 
     def _allot(self, params: GoParams) -> Optional[float]:
         """Seconds to spend on this move, or None when there is no clock.
@@ -676,32 +964,27 @@ class UCIEngine:
         return max(0.001, budget - overhead)
 
     def _should_stop(self) -> bool:
-        """Polled between slices. Also converts a ponder into a timed search.
+        """Polled between slices of an ORDINARY search, phase 2 included.
 
-        `ponderhit` means the opponent played the move we were pondering on, so
-        the search continues on the same tree and the clock starts NOW. The
-        conversion happens here rather than in `handle_go` because that method is
-        inside `search_move` at the time and this callback is the only code that
-        runs between slices.
+        `ponderhit` is deliberately not consulted. By the time phase 2 runs the
+        hit has already happened and has already been converted into this
+        search's deadline; a second `ponderhit` is a GUI protocol error, and the
+        reader logs it rather than letting it shorten a search that is now
+        running on a real clock.
         """
-        if self._stop.is_set() or self._quit.is_set():
-            return True
-        if self._ponderhit.is_set():
-            self._ponderhit.clear()
-            allotted = self._allot(self._pending_ponder_params) \
-                if self._pending_ponder_params is not None else None
-            if allotted is None:
-                err("[ponderhit] no clock in the original 'go'; continuing to "
-                    "the node ceiling")
-                self._ponder_deadline = None
-            else:
-                self._ponder_deadline = time.monotonic() + allotted
-                err(f"[ponderhit] converting to a timed search: "
-                    f"{allotted * 1000:.0f} ms from now")
-        if self._ponder_deadline is not None and time.monotonic() >= self._ponder_deadline:
-            err("[ponderhit] allotted time reached")
-            return True
-        return False
+        return self._stop.is_set() or self._quit.is_set()
+
+    def _should_stop_pondering(self) -> bool:
+        """Polled between slices of PHASE 1. Ends on anything the GUI says.
+
+        All three verdicts end the search and none of them decides what happens
+        next — `handle_go_ponder` reads the flags afterwards and chooses. Keeping
+        the decision out of the callback is what makes "ponderhit continues on
+        the same tree" true by construction: this returns, `search_move` returns,
+        and the tree is simply still there.
+        """
+        return (self._stop.is_set() or self._quit.is_set()
+                or self._ponderhit.is_set())
 
     # --- output -----------------------------------------------------------
 
@@ -761,17 +1044,65 @@ class UCIEngine:
             inflation = ("n/a" if outcome.inflation is None
                          else f"{outcome.inflation:.2f}")
             counts = self.engine.decision_counts
+            # C11c. THE DEGRADATION NOTICE, on stdout and on its own line.
+            #
+            # "Emit it as `info string arena exhausted at N nodes`" is the
+            # brief's wording and its reason is worth keeping next to the code:
+            # a silent degradation that only ever surfaces as unexplained
+            # weakness is worse than a crash, because nobody investigates a
+            # crash that did not happen. stderr already carries it on the
+            # `[search]` line; this is the half a GUI or a log parser that never
+            # opens stderr still sees.
+            if outcome.arena_exhausted:
+                # ASCII ONLY, and it is not a style rule. stdout is the UCI
+                # stream: a GUI reads it as a byte-oriented line protocol, and
+                # a cutechess/lichess-bot harness reading the pipe under a
+                # cp1252 console turns a stray em-dash into U+FFFD and then
+                # crashes on printing it. Found exactly that way — the first
+                # run of tools/bench_c11c_ponder.py died with a
+                # UnicodeEncodeError on this line rather than on anything to do
+                # with the arena.
+                log(f"info string arena exhausted at "
+                    f"{outcome.arena_exhausted_at} nodes - this move delivered "
+                    f"{outcome.delivered} simulations of its budget and is NOT "
+                    f"admissible as a benchmark row")
             log(f"info string source={outcome.source} "
                 f"delivered={outcome.delivered} "
                 f"nominal={nominal} inherited={outcome.inherited} "
                 f"delivered_nps={int(outcome.sims_per_s)} "
                 f"nominal_nps={nominal_nps} "
                 f"inflation={inflation} "
+                # C11c. Always both, never merged. See SearchOutcome.
+                f"ponder_sims={outcome.ponder_sims} "
+                f"search_sims={outcome.search_sims} "
+                f"total_sims={outcome.total_sims} "
+                f"arena_exhausted={str(outcome.arena_exhausted).lower()} "
+                f"arena_util={outcome.arena_utilisation:.3f} "
                 f"budget_source={outcome.budget_source} "
                 f"reason={outcome.reason} "
                 f"game_counts search={counts.get('search', 0)} "
                 f"book={counts.get('book', 0)} "
                 f"tablebase={counts.get('tablebase', 0)}")
+
+    def _send_bestmove(self, line: str) -> None:
+        """The ONE place `bestmove` reaches stdout. C11c.
+
+        Exactly one per `go` is a protocol requirement and was previously only a
+        property of the control flow: the error handler in `run()` could not
+        tell whether the move had already gone out, so an exception raised after
+        the emit produced a second one. A GUI reading two `bestmove` lines for
+        one `go` desynchronises for the rest of the game.
+
+        Cleared at the top of every `go`, not here, so a duplicate is DROPPED
+        and reported rather than silently sent.
+        """
+        if self._bestmove_sent:
+            err(f"[bestmove] SUPPRESSED duplicate for this go: {line!r}. "
+                f"Exactly one bestmove per go; the first one has already been "
+                f"sent. This is a bug in the engine, not in the GUI.")
+            return
+        self._bestmove_sent = True
+        log(line)
 
     def _emit_bestmove(self, outcome: SearchOutcome) -> None:
         """Emit the move, and mirror it to stderr.
@@ -793,7 +1124,7 @@ class UCIEngine:
         else:
             line = f"bestmove {outcome.best_move}"
         err(f"[bestmove] {line} fen={self.board.fen()}")
-        log(line)
+        self._send_bestmove(line)
 
     # --- the loop ---------------------------------------------------------
 
@@ -816,7 +1147,8 @@ class UCIEngine:
             line = raw.strip()
             if not line:
                 continue
-            command = line.split()[0].lower()
+            tokens = line.split()
+            command = tokens[0].lower()
 
             if command == "go":
                 # Cleared HERE, on the reader thread, so that a `stop` arriving
@@ -825,19 +1157,79 @@ class UCIEngine:
                 # this thread alone.
                 self._stop.clear()
                 self._ponderhit.clear()
+                self._ponder_verdict.clear()
+                # C11c. `_pondering` IS SET HERE, BY THE READER, AND NOT BY THE
+                # MAIN THREAD WHEN IT GETS ROUND TO THE SEARCH.
+                #
+                # The main thread is an unbounded distance behind stdin — it may
+                # be finishing the previous move — so a `ponderhit` sent
+                # immediately after `go ponder` can arrive before
+                # `handle_go_ponder` has begun. Setting the flag on the thread
+                # that reads the lines is what puts the two in stdin order, and
+                # it is the same argument that already governs `_stop` above.
+                # C11's conformance run tests `stop` IMMEDIATELY after `go` for
+                # exactly this reason; pondering adds a second flag that has to
+                # survive the same ordering.
+                if "ponder" in (t.lower() for t in tokens[1:]):
+                    self._pondering.set()
+                else:
+                    self._pondering.clear()
                 self._commands.put(line)
                 continue
             if command == "stop":
                 self._stop.set()
+                # C11c. THE MISS CRITICAL PATH. Before this, `stop` could not
+                # reach a search already inside `search_parallel`, so its
+                # latency was bounded below by `slice_seconds`. On the ponder
+                # miss path the opponent has already moved and the engine is
+                # burning the engine's OWN clock until it answers, so the
+                # running slice is aborted rather than waited out. See
+                # Engine.interrupt_slice.
+                self.engine.interrupt_slice()
+                self._ponder_verdict.set()
                 continue
             if command == "ponderhit":
+                if not self._pondering.is_set():
+                    # Requirement 4's first illegal transition. ANSWERED, not
+                    # hung and not acted on: converting a search that is not a
+                    # ponder into a timed one would apply a clock the GUI never
+                    # offered, and silently dropping it would hide a GUI bug.
+                    err("[ponderhit] no ponder in flight; ignored. A ponderhit "
+                        "outside a `go ponder` is a GUI protocol error.")
+                    continue
                 self._ponderhit.set()
+                self.engine.interrupt_slice()
+                self._ponder_verdict.set()
                 continue
             if command == "quit":
                 self._quit.set()
                 self._stop.set()
+                self.engine.interrupt_slice()
+                # Releases the ponder idle wait, which would otherwise block the
+                # main thread forever and turn `quit` during a ponder into the
+                # hang this chunk is piped-tested to prevent.
+                self._ponder_verdict.set()
                 self._commands.put("quit")
                 return
+            if command in ("position", "ucinewgame") and self._pondering.is_set():
+                # Requirement 8. THE POSITION DISCONTINUITY. The GUI has moved
+                # on; whatever is being pondered is about to stop being the
+                # position of interest, and holding the opponent's clock to
+                # finish searching it is both useless and — because the main
+                # thread cannot dequeue this command until the ponder ends — a
+                # hang of up to `ponder_max_sims` simulations.
+                #
+                # Stopped rather than dropped: the `go ponder` is still owed
+                # exactly one `bestmove`, which the GUI discards, and the
+                # command is queued behind it so the main thread applies it in
+                # stdin order.
+                err(f"[{command}] arrived mid-ponder; stopping the ponder and "
+                    f"discarding it (the GUI has moved on)")
+                self._stop.set()
+                self.engine.interrupt_slice()
+                self._ponder_verdict.set()
+                self._commands.put(line)
+                continue
             if command == "isready" and self._searching.is_set():
                 # Answered from here because the main thread is inside a search.
                 # The configuration dump is skipped: it is a dozen stderr writes
@@ -847,8 +1239,13 @@ class UCIEngine:
                 continue
             self._commands.put(line)
 
+        # EOF. Same three releases as `quit`, for the same reason: a pipe that
+        # closes while the engine is pondering must not leave the main thread
+        # blocked in the idle wait.
         self._quit.set()
         self._stop.set()
+        self.engine.interrupt_slice()
+        self._ponder_verdict.set()
         self._commands.put("quit")
 
     def run(self) -> int:
@@ -875,10 +1272,19 @@ class UCIEngine:
                 elif command == "position":
                     self.handle_position(args)
                 elif command == "go":
-                    params = GoParams(args)
-                    self._pending_ponder_params = params if params.ponder else None
-                    self._ponder_deadline = None
-                    self.handle_go(params)
+                    # THE LEDGER, reset here and nowhere else: one `bestmove`
+                    # per `go`, counted from the moment the `go` is dispatched.
+                    self._bestmove_sent = False
+                    try:
+                        self.handle_go(GoParams(args))
+                    finally:
+                        # THE BACKSTOP for the ponder state, covering the paths
+                        # `handle_go_ponder` never reaches — a `go ponder` on a
+                        # finished position, and any exception out of the
+                        # search. A `_pondering` left set would make the reader
+                        # treat the GUI's next ordinary `position` as a
+                        # discontinuity to stop a ponder that is not running.
+                        self._pondering.clear()
                 elif command in ("stop", "ponderhit"):
                     # Reached only when they arrive with no search in flight;
                     # the reader thread handles the in-flight case. The spec says
@@ -913,14 +1319,21 @@ class UCIEngine:
                     # `info string` as well as `[bestmove]`: stderr is per-arm
                     # and easy to lose, and a GUI or a log parser that never
                     # opens it still sees the disclaimer inline.
+                    #
+                    # C11c: routed through `_send_bestmove`, so an exception
+                    # raised AFTER the move already went out — which pondering
+                    # makes reachable, since `handle_go_ponder` emits from
+                    # several places — does not produce a second `bestmove` and
+                    # desynchronise the GUI for the rest of the game.
                     fallback = next(iter(self.board.legal_moves), None)
                     uci = fallback.uci() if fallback else "0000"
                     err(f"[bestmove] bestmove {uci} NOT SEARCHED — first legal "
                         f"move, answering a {type(exc).__name__} from `go` "
                         f"(see the traceback above) fen={self.board.fen()}")
-                    log(f"info depth 0 string UNSEARCHED fallback={uci} "
-                        f"reason={type(exc).__name__}")
-                    log(f"bestmove {uci}")
+                    if not self._bestmove_sent:
+                        log(f"info depth 0 string UNSEARCHED fallback={uci} "
+                            f"reason={type(exc).__name__}")
+                    self._send_bestmove(f"bestmove {uci}")
 
         self.engine.close()
         return 0
@@ -942,22 +1355,34 @@ def _format_option_value(value) -> str:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    # FIRST, before the reader thread and before the evaluator exists. Scope
+    # C11c. BEFORE ANY LINE IS WRITTEN. Under Cutechess the streams are pipes
+    # and Windows picks cp1252 for them, while every reader in this repo opens
+    # the captured file as UTF-8 — which silently corrupted the `[book] opened`
+    # line the provenance check reads, and cost a sound 20-game run its verdict.
+    # See playv6.force_utf8_streams.
+    stream_encodings = force_utf8_streams()
+
+    # Then, before the reader thread and before the evaluator exists. Scope
     # §2.1's mitigation, measured in C10 and C10b. See playv6.apply_switch_interval.
     before, after = apply_switch_interval()
 
     parser = argparse.ArgumentParser(
         description="UCI wrapper for the GuoFish v6 C++ engine (C11).",
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    # C11c: `--ponder` moved INTO `add_config_arguments`. It is an
+    # `EngineConfig` field, so defining it here was the one place this file
+    # owned a flag — the exact split C11 exists to have removed — and it left
+    # `playv6_interactive` without one. See playv6.add_config_arguments.
     add_config_arguments(parser)
-    parser.add_argument("--ponder", action="store_true", default=False,
-                        help="advertise and honour the UCI ponder handshake")
     args = parser.parse_args(argv)
 
     if args.switch_interval != after:
         sys.setswitchinterval(args.switch_interval)
     err(f"[init] switch_interval {before:g} -> {sys.getswitchinterval():g} "
         f"(set before any thread was started)")
+    err(f"[init] streams {stream_encodings} -> "
+        f"stdout={sys.stdout.encoding} stderr={sys.stderr.encoding} "
+        f"(C11c: the log a provenance check reads must be UTF-8)")
 
     unmapped = missing_options()
     if unmapped:

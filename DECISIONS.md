@@ -6593,3 +6593,868 @@ either sanitized build. Leaks: see the fixture-cycle entry above.
   in play would need a run with adjudication off, and nothing in the acceptance
   criteria asks for one.
 * **Multi-PV, `searchmoves`, background pondering.** Unchanged from C11.
+
+# C11c — Pondering: the mutable deadline, graceful arena exhaustion, and the UCI ponder state machine (2026-08-13)
+
+## Salvage-on-miss was rejected, and the condition for revisiting it is written down
+
+Standard UCI semantics: `go ponder` names a position that ALREADY INCLUDES the
+predicted reply, so the engine searches it directly, `ponderhit` continues the
+same search, and a miss discards.
+
+The alternative the brief asks to be recorded is to un-apply the ponder move,
+search from the PARENT, and promote whichever child the opponent actually plays.
+It never wastes work on a miss, and in MCTS it costs less than it would in
+alpha-beta because visits already flow to the most promising replies.
+
+Rejected, on one argument: **ponder time is free time.** It runs on the
+opponent's clock, so a miss costs nothing that was otherwise being used. Salvage
+is an optimisation with modest upside, and it re-introduces promotion skew on
+every HIT — the case that is meant to be the good one. The condition for
+revisiting is a conjunction, not either half:
+
+  * the measured miss rate is high, AND
+  * Gate 5-class evidence says the lost work matters.
+
+**Measured this chunk: 36.8% hits, 179 of 486 resolved ponders**, over the
+20-game 10+0.1 smoke against Stockfish at UCI_Elo 1800. The simulations carried
+into a hit were p50 3,209, p90 11,740, max 25,500.
+
+That is a low hit rate, and it is still not an argument for salvage on its own —
+the second half of the conjunction is untested and the cost of a miss remains
+zero by the argument above. `tools/bench_c11c_ponder.py --only hit-rate` recovers
+the figure from an ordinary match log, off the `[ponder] verdict=` line the
+wrapper emits once per resolved ponder, so it can be re-measured on any run
+somebody already did rather than on an instrumented one nobody will repeat.
+
+The one place the rejected design IS right is the human-play frontend, and it is
+used there — see below.
+
+## `sims_per_move` is `sim_cap`, not `default_sims`, and the difference was measured
+
+The brief specifies `ponder_max_sims = sims_per_move / decay` and
+`arena_nodes = 60 x (sims_per_move + ponder_max_sims)` but does not say which
+`EngineConfig` field supplies `sims_per_move`. There are two candidates and they
+differ by 12x.
+
+`default_sims` (5,000) is the per-move budget when the GUI sends NEITHER a clock
+NOR a node count. In a tournament that never happens: every timed search runs to
+`current + sim_cap` and stops on the clock, and every fixed-node arm sends
+`go nodes N`. So `default_sims` describes the one case that does not occur.
+
+It was wired to `default_sims` first, and the first pipe drive of the ponder
+machine — `go ponder wtime 30000` then `ponderhit`, shipping defaults — gave:
+
+| phase | sims | nodes | nodes/sim |
+|---|---:|---:|---:|
+| ponder | 4,999 | 158,504 | 31.7 |
+| ponderhit (cumulative) | 18,881 | 599,995 | 31.8 |
+
+600,000 is exactly `60 x (5,000 + 5,000)`, and the second row is it to five
+digits. **One ordinary ponderhit move on a 30-second clock exhausted the arena
+at the shipping defaults.** That is the graceful-degradation path working, and
+it is not a state to ship in: the backstop exists for the position that beats
+the estimate, not for the median move.
+
+So `sims_per_move = fixed_sims if set else sim_cap`. At the shipping defaults
+that is 60,000, `ponder_max_sims` is 60,000 at the default decay of 1.0, and
+`arena_nodes` is 7,200,000.
+
+**The cost is memory, and it is real rather than reserved.** Measured: 268 MB
+RSS for one 7.2M-node arena, so 536 MB once the standby arena exists after the
+first `apply_move`. That is 5.7x the previous hard-coded 1,200,000 (94 MB). The
+brief's own sanity table already reaches 360 MB at its 15,000-sims/move row and
+calls it nothing, and its asymmetry argument is decisive: over-provisioning
+costs address space, under-provisioning costs a game. `describe()` prints the
+resolved node count and the MB figure, and warns above 1 GB — which a
+`PonderDecay` of 0.25 reaches, at 18M nodes and 1.34 GB, because the decay
+quadruples the ponder cap and nothing about the option that caused it says so.
+
+**A note on the brief's arithmetic.** It says "At the C8 default decay of 0.25";
+the C8 default in this codebase is 1.0, in both `SearchConfig::ponder_decay` and
+`EngineConfig.ponder_decay`. Its 300x-per-sim table is therefore the decay-0.25
+column rather than the shipping one; the shipping multiplier is 120x.
+
+## The formula was verified rather than trusted, and its headroom is thinner than the derivation suggests
+
+Requirement 3d. Three measurements, at increasing realism:
+
+| run | plies | clock | ponder | peak nodes | of 7,200,000 |
+|---|---:|---|---|---:|---:|
+| self-play, forced 100% hit | 40 | 400 ms/move | on | 5,993,742 | 83.2% |
+| self-play, forced 100% hit | 70 | 400 ms/move | on | 4,580,052 | 63.6% |
+| **Cutechess vs Stockfish** | **488 moves, 20 games** | **10+0.1** | **on** | **1,589,189** | **22.1%** |
+
+The self-play rows use a driver that knows both moves and can therefore always
+produce a hit, which is the **worst case** for the arena: every ponder's nodes
+are carried into the timed search. The match row is what a real opponent
+produces at a real clock, and it is where the shipping configuration actually
+lives. **Zero `ARENA_EXHAUSTED` lines across 976 telemetry lines in the match.**
+
+Occupancy PLATEAUS rather than ramping — 44% by ply 10 in the self-play runs,
+then slowly — because `apply_move` compacts the surviving subtree every move.
+The two self-play rows differ because they are different games off a random
+opening, not because 70 plies uses less than 40.
+
+**The honest reading is that the 1.5x safety factor is worth about 1.2-1.6x in
+the forced-hit worst case, not the 1.9x the 60-vs-32 nodes/sim ratio implies**,
+because the peak is a whole-game figure with reuse while the nodes/sim ratio is
+a per-search one. At the real time control there is 4.5x headroom. The formula
+holds and the backstop has never engaged in ordinary play; it is not a figure to
+shave.
+
+A fourth data point for the brief's curve, from this chunk: **31.7–31.8
+nodes/sim** at 5,000–19,000 simulations, which sits at the playtesting end
+(<=32.4) rather than the C8 end (38.9–39.7). Fitting the observed value would
+have produced an arena barely half the size, which is exactly the temptation the
+brief's "fit the conservative low-sim ratio" instruction guards against.
+
+## Arena exhaustion RELEASES the leaf rather than backing it up, and never marks it expanded
+
+Requirement 3 says what must not happen — "Do not mark the failed node
+expanded-with-no-children" — and leaves what SHOULD happen open. Three options:
+
+1. mark it expanded with no children — forbidden, and rightly: it is the
+   `bestmove 0000` defect, and `NodeArena::set_children` throws on `count == 0`
+   precisely so it cannot be spelled;
+2. back the network value up WITHOUT expanding, leaving a visited unexpanded
+   node;
+3. release the PENDING claim, repay the virtual loss, back nothing up, and count
+   no delivered simulation.
+
+**Chosen: 3.** Option 2 is defensible MCTS — a leaf evaluation is a real thing —
+but it leaves the tree in a state the conservation audit does not describe: an
+unexpanded node carrying visits breaks `visits == 1 + sum(children visits)` up
+its parent chain, and C9's audit would report a conservation failure on every
+subsequent search. Option 3 leaves the tree EXACTLY as it was found, so
+`vloss_total == 0` and `conservation_failures == 0` hold through a degraded
+search. Those two assertions are what separate "the search returned a slightly
+weaker move" from "the tree is now wrong", and both are asserted in
+`tests/test_c11c_ponder.py`.
+
+The cache insert still happens on the live path when the expansion fails. The
+network really did evaluate the position, the entry is keyed by the position
+rather than by the tree, and the next search — after `apply_move` has compacted
+— gets it free. Discarding it would make an exhausted arena cost GPU work as
+well as tree growth.
+
+**`expand_root` is the one expansion that may not degrade.** An unexpanded root
+has no children to choose between, so degrading there means answering
+`bestmove 0000` from a legal position. It throws a named error instead, and it
+is unreachable by any accepted configuration: `arena_capacity` is validated at
+>= 1024 and a position has at most 218 legal moves.
+
+## The exhaustion flag is per-CALL in C++ and per-MOVE in Python
+
+The core clears `arena_exhausted_` at the top of every `search()` /
+`search_parallel()`. The host slices one move into many such calls and ORs the
+flag across them, because the statement a game log and a benchmark row both need
+is "this MOVE degraded", not "the seventh slice degraded".
+
+`Engine.search_move` also breaks out of the slice loop on the first occurrence,
+AHEAD of the existing `stalled` check. Ordering matters: an exhausted arena
+delivers a short slice and then a zero one, so testing `stalled` first would
+report "stalled" — a condition with no cause and no remedy — for one that has a
+name, a number and a fix.
+
+## Two clocks, and neither duplicates the other
+
+`Engine.search_move` already cut the budget into wall-clock slices and read a
+Python deadline between them. C11c adds `std::atomic<int64_t> deadline_ns_`,
+read at the workers' existing abort point. They divide the work:
+
+  * the **C++** deadline aborts the slice that is RUNNING, within one simulation;
+  * the **Python** deadline decides not to START another slice, and owns the
+    reporting.
+
+The second alone was not enough. `ponderhit` has to convert an infinite search
+into a timed one without stopping it, and a 50 ms slice boundary is the wrong
+granularity for a conversion the clock may only have granted a few hundred
+milliseconds to.
+
+**Duration, not instant.** `set_deadline_in(seconds)` adds to `steady_clock`'s
+own `now()`, so no caller ever names a time in a clock it cannot read —
+`std::steady_clock` and Python's `time.monotonic()` are both monotonic and are
+NOT the same epoch on Windows. `steady_now_ns()` is exposed for measurement
+against the same clock, and nothing in the engine needs it.
+
+**Not reset by `search_parallel`, and cleared in a `finally`.** The host arms it
+once and the slice loop enters the search many times, so resetting per call
+would make it unsettable. The cost is that a stale deadline would leave the next
+search pre-expired, which is why the disarm is unconditional rather than guarded
+on `deadline is not None` — `interrupt_slice` may have armed it from another
+thread.
+
+**One `steady_clock::now()` per simulation when armed, none when not.** The
+unset case is a single relaxed load compared against `kNoDeadline`. At ~14k
+sims/s against a ~25 ns read that is 0.035% of one core, which buys abort
+latency measured in simulations rather than in slices.
+
+## `interrupt_slice` is the only engine method callable during a search, and it decides nothing
+
+It arms the deadline in the past. That is all. The slice loop still re-reads
+`should_stop()` and the clock afterwards and remains the only thing that chooses
+whether to continue, so an interrupt racing a slice boundary costs at most one
+nearly-empty slice and never a wrong decision.
+
+Before it, `stop` latency was bounded below by `slice_seconds`, because nothing
+could reach a search already inside `search_parallel`. That was tolerable for
+`stop` on a clock the engine had budgeted for. It is not tolerable on the ponder
+MISS path, where the opponent has already moved and the engine is spending its
+OWN clock until it answers.
+
+## `ponderhit` is a SECOND `search_move` call, not a deadline dropped into the first
+
+The tree carries across; the accounting does not. Two calls make both structural
+rather than remembered:
+
+  * **the clock** — `_allot` is called at the hit, so the allotted time runs
+    from that instant;
+  * **the nodes** — the target is `root_visits_now + sim_cap`, so ponder
+    simulations are a BONUS rather than a draw against the move's allocation.
+    Taking `sim_cap` as an absolute ceiling would let a productive ponder arrive
+    with the budget already spent and return instantly with zero fresh work,
+    which is the reference's `existing_visits >= num_simulations` early return —
+    scope E6's over-commit defect, which this port is fixing.
+
+The tree survives because `search_move` never touches it: it calls
+`search_parallel` at a higher absolute target, exactly as its own slice loop
+already does. `SearchOutcome.ponder_sims` and `search_sims` are separate fields
+and are never summed into one figure; `total_sims` exists and is reported
+alongside them, never instead.
+
+## `_pondering` is set by the READER thread, not by the main thread
+
+The main thread is an unbounded distance behind stdin — it may be finishing the
+previous move — so a `ponderhit` sent immediately after `go ponder` can arrive
+before `handle_go_ponder` has begun. Setting the state on the thread that reads
+the lines is what puts the two in stdin order. It is the same argument that
+already governs `_stop`, which C11's conformance run tests by sending `stop`
+IMMEDIATELY after `go`; pondering adds a second flag that has to survive the
+same ordering, and `tests/test_c11c_ponder.py` tests it the same way. A dropped
+ponderhit shows up as a hang, not as a wrong answer.
+
+## `bestmove` now goes through one function with a ledger
+
+Exactly one `bestmove` per `go` was previously a property of the control flow.
+`handle_go_ponder` emits from five places — bypass-on-hit, bypass-on-miss,
+nothing-ran, miss, and the timed phase — and the error handler in `run()` could
+not tell whether the move had already gone out. `_send_bestmove` holds the flag;
+a duplicate is DROPPED and reported rather than silently sent, because a GUI
+reading two `bestmove` lines for one `go` desynchronises for the rest of the
+game and the failure is invisible until a later move is attributed to the wrong
+position.
+
+## A `position` or `ucinewgame` arriving mid-ponder is a discontinuity the READER acts on
+
+Requirement 8. The main thread cannot dequeue the command until the ponder ends,
+so without this the ponder would run out its whole simulation ceiling first — a
+hang of seconds that only a piped test can observe. The reader sets `_stop`,
+interrupts the slice, and releases the idle wait, then queues the command behind
+the `bestmove` the `go ponder` is still owed.
+
+`quit` and EOF do the same three things, for the same reason: the idle wait is a
+`threading.Event.wait()` with no timeout, and a `quit` that did not release it
+would leave the main thread blocked forever with the GPU held.
+
+## Info is suppressed during the ponder phase, not throttled
+
+Requirement 5 offers either. Suppression, because a GUI discards ponder info and
+formatting it is pure-Python work holding the GIL. This is defence in depth —
+`sys.setswitchinterval(0.0005)` is already mandatory and C10d measured the
+adversarial case at p99 20.7 us — but it buys nothing to emit, so it is not
+emitted. The post-`ponderhit` phase emits normally.
+
+## The human-play frontend ponders the CURRENT position, which is the rejected design and is right there
+
+Requirement 7. `Session.start_ponder(board, predicted_move=None)` defaults to
+pondering the position the human is ABOUT TO MOVE FROM. Every legal reply is a
+child of that root, so the visits land under whichever move they play and there
+is no miss case at all.
+
+That is the parent-root form rejected for UCI above, and the reason it is right
+here is the reason it is wrong there: it trades promotion skew on a hit against
+wasted work on a miss, and a human's reply is far less predictable than an
+engine's. The measured 36.8% engine-vs-engine hit rate would be lower still
+against a human. The `predicted_move` parameter offers the UCI form for a caller
+with a prediction worth betting on; nothing in the frontend passes one.
+
+The C11 deadlock is not an obstacle: it is `import torch` failing to return
+while another thread blocks on a pipe, it fires once at startup, and `main()`
+imports torch and calls `ensure_ready()` before the first prompt. A search
+thread against a main thread blocked in `input()` is thereafter the same GIL
+picture the UCI wrapper has had since C11, with the roles swapped.
+
+`Engine` is not thread-safe, so `stop_ponder` JOINS rather than merely
+signalling, and every path that touches the engine calls it first — the prompt's
+`finally` (because `prompt` raises `RestartGame` and `QuitSession` as control
+flow), `engine_move`, and `play`.
+
+## Pondering is skipped when the ponder position is a book or tablebase hit
+
+Requirement 6, in both frontends. The move is already determined, so searching
+it spends the whole of the opponent's clock computing something a lookup will
+overrule. The UCI path still waits for `ponderhit`/`stop` rather than answering
+early — the protocol forbids a `bestmove` before the GUI speaks — and answers
+instantly on the hit. One such skip occurred in the 20-game smoke and is counted
+separately from the hit rate, because a ponder that never happened is neither a
+hit nor a miss.
+
+## `stop` latency: p50 17 ms, p99 31 ms — and the first measurement of it was wrong
+
+Requirement: a histogram, not a mean, per C10d's discipline. C11's baseline for
+`stop` under `go infinite` was 7–109 ms.
+
+The first version of `measure_stop_latency` re-pondered ONE position 25 times and
+produced a monotonically rising series: 7.6 ms on the first sample, 227.5 ms on
+the twenty-fifth. That was not noise and not a tail. Re-pondering the same root
+never advances the position, so the tree accumulated every sample's simulations
+and the end-of-search principal-variation walk — which is O(visited nodes) —
+grew with it. The number described a state no game reaches.
+
+The measurement now WALKS A GAME: each sample plays the previous sample's move,
+`apply_move` compacts, and `root_visits` at the moment of the stop is recorded
+alongside the latency so the correlation is visible rather than hidden inside a
+percentile.
+
+| | ms |
+|---|---:|
+| min | 7.8 |
+| p50 | 17.2 |
+| p90 | 28.2 |
+| p95 | 29.8 |
+| p99 | 30.9 |
+| max | 30.9 |
+
+over 30 samples at root visits from 6,393 to 40,245 (p50 19,763). The tail is
+now well inside C11's, which is `interrupt_slice` doing its job.
+
+## Two sanitizer positive controls, not one
+
+`race_probe` proves ThreadSanitizer is looking at all. `deadline_race_probe`
+proves it is looking at the ACCESS PATTERN the deadline actually has: one thread
+storing a 64-bit integer while another polls it in a loop, written with a plain
+`int64_t` so it must report. A clean TSan run over the real deadline says
+nothing unless the sanitizer can be shown to catch the unsynchronised version of
+the same shape. Measured: `race_probe` produces 2 warnings, `deadline_race_probe`
+produces 1, and the C11c suite produces 0. Neither probe is called by the engine
+and neither may be.
+
+## `arena_capacity` and `ponder_max_sims` became `Optional[int]`, and 0 is the UCI spelling of unset
+
+Both are explicit config fields with computed defaults, which is what the brief
+asks for. `None` means "compute it"; a pinned value overrides and is still
+validated. Over UCI they are `spin ... min 0`, with 0 parsed as unset by the same
+`_parse_optional_int` that already served `FixedSims`, so a GUI's "reset to
+default" round-trips through `_format_option_value(None) == "0"`.
+
+`as_kv()` carries the DECLARED field and the RESOLVED value side by side —
+`arena_capacity=None ... arena_nodes=7200000` — for the same reason
+`effective_outstanding` sits beside `max_outstanding`: a benchmark artifact has
+to be reconcilable against what ran, not against what was asked for.
+
+## Two encoding bugs on the output streams, and the second one cost a sound run its verdict
+
+**First**: the `info string arena exhausted at N nodes` line was written with an
+em-dash. stdout is the UCI stream and is ASCII by protocol; a harness reading the
+pipe with `errors="replace"` under a cp1252 console turns the byte into U+FFFD
+and then dies in `print`. The first run of `tools/bench_c11c_ponder.py` failed
+with a `UnicodeEncodeError` that had nothing to do with the arena. Fixed at the
+source, and the whole `log()` surface swept for others.
+
+**Second, and worse**: on Windows a Python process whose streams are PIPES picks
+its encoding from the locale — cp1252 — while every reader in this repo opens the
+captured file as UTF-8. The engine's configuration lines have carried em-dashes
+since C11b (`[book] opened <path> — <how>`), and cp1252 encodes one as the single
+byte 0x97, which UTF-8 then decodes as U+FFFD.
+
+That is not cosmetic. `tools/bench_provenance.py` matches those lines with a
+regex containing a literal em-dash, and `require_recorded_state()` uses it to
+decide whether a games table may be PUBLISHED AT ALL. **The first C11c 20-game
+ponder smoke passed every one of its four acceptance criteria and then failed its
+provenance check for this reason**: the run was sound and its artifact said the
+book state could not be determined.
+
+`playv6.force_utf8_streams()` pins both streams to UTF-8 and is called first
+thing in all three entry points, before the reader thread and before anything
+writes a line. The re-run passed 13/13. This is a latent C11b defect that
+pondering only surfaced because C11c is the first chunk to read a match log
+programmatically for a number it needed.
+
+## `--ponder` moved into `add_config_arguments`, and adding a sibling flag is what exposed why it had to
+
+`ponder` is an `EngineConfig` field, and `add_config_arguments`'s contract is
+"the full EngineConfig surface as command-line flags". It was nonetheless
+defined in `uci_wrapper_v6.main()` — the one flag that file owned, which is the
+exact split C11 exists to have removed.
+
+The consequence was invisible while it did nothing: `playv6_interactive` never
+defined `--ponder` at all, `config_from_args` therefore never saw it, and the
+frontend's own docstring said the flag "has no effect in this frontend", which
+was true for a reason nobody had noticed.
+
+C11c made it visible twice over. First, `Session.start_ponder` read
+`self.args.ponder` on a namespace that had no such attribute. Second — and this
+is what actually surfaced it — adding `--ponder-max-sims` turned a bare
+`--ponder` into `error: ambiguous option: --ponder could match
+--ponder-max-sims, --ponder-decay`, because argparse resolves by prefix and
+there were suddenly two candidates and no exact match.
+
+Defining it exactly, once, in the shared function fixes all three: the prefix
+resolves, every entry point gets the same flag, and `playv6_interactive`'s
+`--ponder` does what it says. `Session.start_ponder` now reads
+`self.engine.config.ponder` rather than the namespace, because the config is
+the validated object the engine is actually running with and the namespace is
+only the command line.
+
+## Rule 3 and Amendment D — the suite, per platform, with the delta reconciled
+
+Four runs, all green. The four `test_c10_gate2b.py` differential tests are
+deselected in every one of them — a ~2h10m 500-position sweep whose result
+(497/500, 99.4% agreement) is already recorded from C10. That is a DESELECTION,
+stated here rather than hidden in a command line, and it is the only thing not
+executed.
+
+**The justification for not re-running it is bit-identity of the search, not
+cost.** C11c touches the descent in exactly two ways, and neither can change a
+tree at that gate's configuration:
+
+  * The abort point gains two reads. `arena_exhausted_` is a relaxed load of a
+    flag nothing sets while the arena has room, and `deadline_passed()` compares
+    a relaxed load against `kNoDeadline` and returns false without reading the
+    clock, because Gate 2b arms no deadline — it drives `search_parallel`
+    directly and never goes through `Engine.search_move`. Neither read
+    influences selection, expansion or backup.
+  * `expand()` calls `arena_.try_allocate` where it called `arena_.allocate`.
+    `allocate` was a thin throwing wrapper AROUND `try_allocate` — same bump
+    pointer, same CAS, same returned index — so on every path where the arena
+    has room the two are the same operation, and Gate 2b's fixture is sized so
+    it always does.
+
+The rest of `test_c10_gate2b.py` DOES run in all four suites, and it is the only
+pre-existing file that exercises the live evaluator, so the live expansion path
+that `expand()` change sits in is covered on every platform.
+
+| platform / build | passed | skipped | deselected |
+|---|---:|---:|---:|
+| Windows MSVC **Release** (q32) | 1437 | 49 | 4 |
+| Windows MSVC **ASan Debug** (q32, asserts on) | 1438 | 48 | 4 |
+| Linux **Clang ASan+UBSan Debug** | 1397 | 85 | 4 |
+| Linux **Clang TSan Debug** | 1397 | 85 | 4 |
+
+**Every delta reconciles against C11b's recorded baseline, to the test.** C11b
+finished at Windows Release 1401/49, Windows ASan 1402/48, Linux ASan 1375/71.
+C11c adds ONE test file, `tests/test_c11c_ponder.py`, collecting 36 outcomes
+(34 test functions, one of them parametrized three ways):
+
+* **Windows Release: 1401 + 36 = 1437**, skips unchanged at 49.
+* **Windows ASan: 1402 + 36 = 1438**, skips unchanged at 48. The +1 passed /
+  -1 skipped against Release is the pre-existing `GUOFISH_DEBUG_VL` switch: the
+  ASan build is a Debug build, so C8's full-tree virtual-loss audit is compiled
+  in and `test_c8_reuse.py` takes the other of its two branches.
+* **Linux: 1375 + 22 = 1397 passed, 71 + 14 = 85 skipped.**
+
+**The C11c contribution to the cross-platform delta is exactly 14 tests**, all
+of them the `@requires_engine` protocol layer, all skipping on Linux with the
+reason "CUDA is not available; the v6 surface runs the graphed CUDA evaluator
+and has no measured CPU path". Enumerated in full, per Amendment D:
+
+    test_go_ponder_does_not_answer_until_the_gui_speaks
+    test_ponderhit_retains_the_ponder_simulations_and_counts_only_post_hit_work
+    test_a_ponder_miss_discards_the_tree_and_starts_the_next_search_clean
+    test_a_pondering_engine_emits_no_info_lines
+    test_ponderhit_with_no_ponder_in_flight_is_answered_not_acted_on
+    test_ponderhit_arriving_immediately_after_go_ponder_is_not_lost
+    test_stop_during_ponder_answers_promptly
+    test_a_position_arriving_mid_ponder_is_answered_and_ends_the_ponder
+    test_ucinewgame_mid_ponder_is_answered_and_discards_the_tree
+    test_exactly_one_bestmove_is_emitted_per_go_including_on_a_miss
+    test_isready_is_answered_while_pondering
+    test_the_ponder_ceiling_comes_from_ponder_max_sims
+    test_quit_during_a_ponder_exits_cleanly
+    test_an_undersized_arena_still_plays_a_legal_move_over_the_protocol
+
+The other 22 run everywhere, and they are the ones that pin requirements 1 and
+3: the mutable deadline and graceful arena exhaustion are exercised against the
+Gate 1 replay dump and the stand-in evaluator, so they need neither a GPU nor a
+checkpoint and TSan sees all of them.
+
+**No module-scope skip was added.** `tests/test_c11c_ponder.py` marks every
+conditional test individually, with three separately-named reasons (missing
+golden dump, missing python-chess/torch, no CUDA), so a machine that cannot run
+part of it says which part and why rather than collecting nothing. Amendment D's
+one approved exception, `test_reference_defects.py`, is untouched and still
+accounts for the pre-existing five-test Windows/Linux collection gap.
+
+### Sanitizers
+
+| | result |
+|---|---|
+| Windows MSVC ASan | 0 AddressSanitizer errors over the full suite (17m38s) |
+| Linux Clang ASan + UBSan | 0 ASan errors, 0 UBSan runtime errors (7m08s) |
+| LeakSanitizer | 1,422,033 bytes in 1,317 allocations — CPython and numpy, per README_BUILD. **0 leaked allocations name `guofish_core`**, which is the discriminator that file specifies. LSan's non-zero process exit is the documented consequence and not a test failure. |
+| Linux Clang TSan | **0 `WARNING: ThreadSanitizer` over the full suite** (12m12s) |
+
+**TSan's teeth were demonstrated before its clean run was believed**, with two
+positive controls rather than one: `race_probe` produced 2 warnings and
+`deadline_race_probe` — the unsynchronised version of the deadline's own access
+pattern, one thread storing an `int64_t` while another polls it — produced 1.
+`guofish_core.TSAN` was asserted True on the build under test. A clean run
+without both of those is indistinguishable from a sanitizer that was not
+instrumenting the module.
+
+**One near-miss worth recording.** The first Linux ASan attempt reported
+"0 ASan errors, 0 UBSan errors" and was WRONG: the build had silently produced
+no module, because the configure step's output was piped into a `grep` whose
+exit status then masked the failure, and the run that followed died in
+collection with `ModuleNotFoundError: No module named 'guofish_core'` — 20
+collection errors that a `tail` of the leak dump had hidden. A sanitizer run
+that never loaded the code under test reports zero errors in exactly the same
+words as one that found none. The rebuilt run above asserts
+`guofish_core.build_info()` shows `asan: True, ubsan: True` on its first line,
+for the same reason README_BUILD tells you to confirm the ASan runtime was
+staged.
+
+## Rule compliance
+
+1. **No existing test file was modified.** One new file,
+   `tests/test_c11c_ponder.py`. `git status` shows no change under `tests/`
+   other than the addition.
+2. **No golden data was produced or touched.** C11c adds none: its acceptance is
+   behavioural, and the only `golden/` file it reads is the Gate 1 replay dump,
+   read-only, as a source of network answers so the deadline and exhaustion
+   mechanisms can be exercised without a GPU. `tools/drill_c11c_ponder.py`
+   records the SHA-256 of all 23 files in `golden/` before and after and
+   compares them; the run reports `golden/ unchanged: True`.
+3. **Full suite run on both toolchains**, four builds, itemised above.
+4. **Warning-clean** at `/W4` (MSVC) and `-Wall -Wextra` (Clang), on all four
+   builds. No pragmas, no `-Wno-*`.
+5. **ASan + debug asserts**: the suite passes under the MSVC ASan build and the
+   Linux Clang ASan+UBSan build, both with asserts on.
+6. No `#pragma pack`. No `reinterpret_cast` added.
+7. No new third-party dependencies.
+8. Builds and runs on MSVC and Clang.
+9. This file.
+10. Nothing narrowed. Two problems found in the brief's own specification are
+    reported rather than worked around: the `sims_per_move` under-provisioning
+    (measured, fixed, memory cost stated) and the "C8 default decay of 0.25"
+    that is 1.0 in this codebase.
+
+## Mutation drill (Amendment B)
+
+C11c produces no golden data, so the drill mutates the ENGINE rather than a
+recorded reference and asserts that a named test goes red. Each mutation runs
+the target test FIRST as a control — a test that was already failing would make
+a mutation look effective when it changed nothing, which is the one way a
+mutation drill can lie in the reassuring direction.
+
+| mutation | tests it must break | caught |
+|---|---|---|
+| `deadline-never-fires` — `set_deadline_in` is a no-op | 3 deadline tests | 3/3 |
+| `exhaustion-silent` — `arena_exhausted` forced False | degradation telemetry | 1/1 |
+| `merge-the-sim-counts` — `search_sims` returns `total_sims` | sim-count separation | 1/1 |
+| `arena-formula-halved` — as if the observed 32 nodes/sim had been fitted | arena formula | 1/1 |
+| `coupling-unchecked` — `coupling_holds` always True | pinned-cap warning | 1/1 |
+
+**7/7 caught. `golden/` unchanged.** Nothing is patched on disk — the mutations
+are monkeypatches reverted in a `finally`, so `git status` is unchanged by a
+run. `ReplaySearchQ32` is a pybind11 type with read-only method slots, so the
+deadline mutation SUBSTITUTES a subclass whose `set_deadline_in` does nothing
+rather than patching the class; `clear_deadline` is deliberately left working,
+so the tests fail for the reason the mutation names rather than for a second one
+it introduced.
+
+## Operational note for the Lichess arena
+
+**Verify lichess-bot's ponder support before relying on it** — confirm the
+version in use issues `go ponder` and `ponderhit` rather than approximating
+pondering itself, and check its config key against its own documentation. Not
+done in this chunk; it is a deployment step, and nothing here depends on it.
+
+**Cap concurrency at one game when pondering is enabled, or disable pondering
+when concurrency exceeds one.** Pondering multiplies GPU contention by the
+number of games in flight: four simultaneous games pondering means four searches
+against one RTX 5070, each getting a fraction of the throughput while believing
+it has the whole device, so per-game strength FALLS rather than rises. This is a
+configuration decision rather than a code change, and it is the failure mode
+most likely to appear in an arena and least likely to appear in testing — the
+20-game smoke ran at concurrency 1 for exactly this reason.
+
+## What is not done
+
+* **Gate 5 with pondering on**, and it must stay that way. The 2687.7 anchor was
+  measured with ponder off, so the strength gate has to match it.
+  `tools/smoke_c11.py --ponder` refuses `--mode nodes` to stop a fixed-node arm
+  accidentally claiming to have pondered.
+* **Salvage on a ponder miss.** Rejected with the condition for revisiting
+  written down, and the miss rate measured at 63.2% so the first half of that
+  condition is arguably met. The second half — Gate 5-class evidence that the
+  lost work matters — is untested.
+* **A ponder-on vs ponder-off strength comparison.** Nothing here measures what
+  pondering is worth in ELO. The 20-game smoke is a survival test against
+  Stockfish at UCI_Elo 1800 and went 20-0, which says nothing about the margin.
+* **lichess-bot verification**, as above.
+* **A second opinion on the 536 MB default arena.** The formula is the brief's,
+  the base quantity is a judgment call recorded above, and the footprint is
+  5.7x what C11b shipped. It is the right trade by the brief's own asymmetry
+  argument, and it is the one number in this chunk most worth an owner's veto.
+
+# C12 — Performance: profile first, and what the profile ruled out (2026-08-13)
+
+## The chunk's shape changed after Step 1, and this section says why
+
+The brief orders the optimisations by expected value: (a) GPU kernel efficiency
+"largest, plausibly 2–3x", (b) larger batches, (c) dispatcher pipelining, (d) CPU
+lines. After profiling, that order does not survive:
+
+* **(a) is blocked by Gate 2, not by effort**, and C10b had already measured it so.
+  The brief's premise — "fusing the existing bf16 ops preserves the gate" — is false
+  on this model. Halted and scoped per the brief's own instruction; see below.
+* **(b) is blocked on a different unknown than the brief thought.** C10b's tolerance
+  is a *reproducibility* bound and at W=1 it is 0.0% at every K, so it gates nothing.
+  What moves is *flattening*, and that needs a match.
+* **(c)'s ceiling is 1.36x by the corrected busy fraction and 1.11x once decomposed**,
+  because most of the idle is only recoverable through (b).
+* **(d) turned out to be where the shippable work was**, and it was not on the list
+  the brief ranked: the CPU lines it names (compaction, node-init) are not in a
+  single search's budget at all, while the *host side of the callback* is 10% of
+  wall and nobody had measured it.
+
+## Nsight Compute needed administrator rights, and that is a recorded dependency
+
+`ERR_NVGPUCTRPERM`: GPU performance counters are admin-only on this machine
+(`HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak\RmProfilingAdminOnly`
+is unset, i.e. the default of 1). Every other C12 measurement runs unprivileged.
+
+Rather than ask for a machine-wide registry change and a reboot, `tools/run_ncu_c12.ps1`
+was written to be run once from an elevated shell, and it refuses to run from a
+non-elevated one rather than producing an empty report. Parsing the `.ncu-rep` needs no
+privileges, so only collection is gated. The alternative considered and rejected was
+deriving *theoretical* occupancy from the nsys node trace's `registersPerThread` and
+`staticSharedMemory` columns: it would have produced a plausible table with no achieved
+occupancy and no DRAM throughput in it, and the acceptance criterion names both.
+
+## `GPU share` in C10b is not the GPU busy fraction, and the difference is 3x on the answer it was used for
+
+C10b's grid computes `GPU share = call_ns / wall_ns` and its `pipeline ceiling` column as
+the reciprocal, reading 1.08–1.11x. `call_ns` is the time the dispatcher is *blocked
+inside the callback*, which contains the H2D submission, the graph launch, the Python
+frame and the D2H — not just the device's work. Measured against the CUDA trace the
+device is busy 73.6% of the region, so the ceiling is 1.36x.
+
+Both numbers are correct for what they measure. The mistake was using the proxy for a
+decision the proxy cannot make, and it is exactly the mistake the C12 brief anticipated
+when it said the busy fraction "disambiguates the pipelining payoff below by an order of
+magnitude". Recorded rather than silently corrected because C10b's table is published and
+a reader comparing the two would otherwise assume one is wrong.
+
+## The reuse-heavy Gate 4 rows were measuring 220 simulations, and the assertion could not see it
+
+`search_parallel(N)` runs to N **root visits**: `target_ = num_simulations - existing`,
+and `ParallelStats::requested` is that remainder. So on a reused tree
+`delivered == requested` — the guard every C10b table is admitted on — holds at
+220 == 220, and at 0 == 0.
+
+Three things follow, and all three are in BENCH.md C12-4 rather than only here:
+
+1. C10b-3e's reuse-heavy rows divide ~220 simulations by a 2.3 ms wall that is mostly
+   fixed per-call cost. Their 22,924–177,657 spread at W=8/K=4 is a 220-sample, not
+   instability in the engine.
+2. It does not match production. `uci_wrapper_v6.py` uses `budget = current + sim_cap`
+   for timed and infinite searches; only `go nodes N` is absolute.
+3. The fix is an assertion, not a comment: `tools/bench_c12.py` requires
+   `delivered > 0`.
+
+**C12's own first table published a zero in that cell**, because the arm that reproduces
+C10b's spelling was built with the *new* spelling — a tree with 80,510 inherited visits
+measured against an absolute target of 20,000. Each arm now plays its whole game its own
+way. It is written down because a benchmark that got the same class of thing wrong twice
+in two chunks is a fact about the API, not about the two authors: a budget parameter whose
+meaning changes with the tree's history is a trap, and the next person will fall in it
+too.
+
+`bench_c10b.py` is deliberately **not** edited. It produced a published table; editing it
+would destroy the ability to reproduce that table and see the difference.
+
+## What shipped, and why these three and not the obvious fourth
+
+Three host-side changes, 1.065x combined, bit-identical output (BENCH.md C12-6).
+
+**Hoisting the LayerNorm parameter casts.** Autocast keeps `layer_norm` in fp32, so each
+forward widens 26 affine tensors of 384 elements at grid (1,1,1) — one block, i.e. 1/48th
+of the device — recomputing a constant. bf16 → fp32 is exact, so precomputing it stores
+the same bits. It must happen **before capture**; afterwards the casts are already
+recorded in the graph.
+
+The flag `hoist_norm_casts=True` is kept rather than making it unconditional, for the same
+reason `graphs=` and `pin=` are flags: the A/B that justified it stays runnable, and a
+future regression can be bisected against it instead of argued about.
+
+**Caching the tensor views.** The alternative — leaving them — was defended in C10b on the
+grounds that slicing copies nothing. It does not copy, and it does cost: five Python
+objects and five dispatcher round trips per crossing, inside the GIL-held callback. The
+views alias storage that CUDA graph capture *already requires* never to move, so a cached
+view cannot go stale; if it could, the graph would already be replaying against the wrong
+addresses.
+
+**Reordering the two D2H copies** so the async one is issued first and the blocking one
+completes both. This is one `cudaStreamSynchronize` instead of two, and on WDDM a round
+trip is ~50 µs against 96 bytes of payload.
+
+**The obvious fourth was tried and rejected.** Issuing both copies non-blocking and then
+calling `torch.cuda.current_stream().synchronize()` measures **0.982x** — slower than the
+baseline — because constructing the `Stream` object costs more than the round trip saved.
+Caching the stream object gets it to 0.985x, still slower. The ordering trick achieves the
+same single synchronisation with no Python at all. Recorded because "issue both async then
+sync once" is the version anyone would write first.
+
+## The view cache does not short-circuit `pad_to` or `replay`, and that is not tidiness
+
+`tools/drill_c10b_graphs.py` mutates `GraphedForward.pad_to` (`round-down`) and
+`GraphedForward.replay` (`stale-replay`) and asserts the suite catches both. A `run()`
+that inlined the cached shape and called `self._graphs[p].replay()` directly would leave
+those mutations unexercised — the drill would keep reporting the suite has teeth while the
+suite no longer bit down. So the cache is keyed on what `pad_to` *returns*, and `replay`
+is still called as a method.
+
+`outputs()` falls back to slicing when the cache misses, rather than raising `KeyError`.
+`padded < count` is unreachable through a correct `pad_to` and reachable through the
+mutated one; the fallback makes that mutation produce the same shape mismatch it produced
+before the cache existed, so it fails the test it is aimed at rather than a different one.
+
+## Item (b): the tolerance C10b set does not gate what the brief thought it gated
+
+The brief blocks item (b) on "C10b's absolute root-stability tolerance", and C10b-3g set
+that at 10% run-to-run TV. Every K from 8 to 128 passes it — at **0.0%** — because W=1 is
+deterministic and run-to-run TV measures reproducibility, not sharpness.
+
+The quantity that actually moves is top-move share: 71.2% at K=24, 60.8% at K=64, 46.9% at
+K=128, for 1.09x and 1.17x respectively. C10b-3g declined K=32 for 2.4 points at a 1.74x
+Gate 4 margin; at 1.92x with the stretch met, the same principle declines K=64 by more.
+
+**K stays 24, and the decision is handed to C13 with the exchange rate attached.** The
+brief's own text says this belongs to a time-controlled match. What is new is that the
+match now has a specific pair to run (K=24 vs K=64) and a specific price to beat.
+
+## Item (c): declined on a decomposition, not on a ceiling
+
+The corrected 1.36x ceiling is not reachable by pipelining, because 13.1 of the 22.7 idle
+points are C++ descent/backup that only exist because the single worker has all its leaves
+outstanding. Overlapping those means more leaves in flight — item (b), with item (b)'s
+price. The dispatcher stages themselves are 10.3%, so pipelining alone caps at 1.11x, and
+that is an upper bound assuming perfect overlap.
+
+Against a C++ change to `search.hpp` with TSan and determinism consequences, on an engine
+already past the stretch target, it is not worth it. Noted for the record: the brief's
+stated prerequisite (pinned output buffers) turned out to be **already done** —
+`_pin_buffers` registers all three spans, not just the input — so the hazard it warns about
+does not exist here and never did.
+
+## Item (a): halted, with the ruling written down rather than made
+
+`docs/c12_kernel_fusion_scope.md` is the scope request the brief asks for. The substance
+is that every remaining variant of item (a) fails Gate 2, and C10b's measurement of
+Inductor (68% of policy words differing) is the proof. The brief's precision clause draws
+the line in the wrong place: it is not precision that breaks the gate, it is any change to
+the accumulation order, and fusion is exactly that.
+
+Three options are costed there. Option B — adopt Inductor, regenerate the golden from the
+fused forward — is worth ~1.19x and is the one that needs an owner. It is a Global Rule 2
+question (golden data comes from the Python reference; a torch.compile'd module is not the
+reference) before it is a performance question, and an agent should not answer it by
+noticing that 19% is a lot.
+
+## Rule 3 and Amendment D — the suite, per platform, with the delta reconciled
+
+| | Windows / MSVC 19.51 Release | Linux / Clang 18.1.3 Debug (WSL2) |
+|---|---:|---:|
+| **passed** | **1,437** | **1,397** |
+| skipped | 49 | 85 |
+| deselected | 4 | 4 |
+| collected | 1,490 | 1,485 |
+| failed | **0** | **0** |
+| wall | 122.8 s | 145.8 s |
+
+Windows: `python -m pytest tests/ -q -p no:randomly -rs --deselect ...` (4 deselections below).
+Linux: `bash build/linux.sh ~/gf-c12 && bash build/pytest-linux.sh ~/gf-c12 tests/ -q ...`.
+Raw output in `runs/c12/suite_windows.txt`, `runs/c12/suite_windows_rs.txt` and
+`runs/c12/suite_linux.txt`; the collected-ID diff is `runs/c12/collect_{win,linux}.txt`.
+
+### The four deselections, and why they are deselections and not skips
+
+`tests/test_c10_gate2b.py::{test_every_search_delivered_the_budget,
+test_the_engines_agree_on_at_least_99_percent_of_moves, test_every_disagreement_is_a_near_tie,
+test_the_margin_distribution_explains_the_agreement_rate}` — the 500-position differential.
+C10g measured it at **3 h 29 m** on an ASan build and 53 minutes for the reference arm, and it
+is the dominant term in the suite's runtime. C12 changed no C++ and no search behaviour: the
+root visit vector is bit-identical pre- and post-change (BENCH.md C12-6), so the differential
+cannot have moved. C10's recorded result stands and is not re-derived.
+
+They are **deselected on the command line rather than skipped in the file**, so the count is
+visible as `4 deselected` in both platforms' summaries and no test file was touched (Rule 1).
+
+### The cross-platform delta, itemised
+
+Windows passes 40 tests that Linux does not, and Linux passes 1 that Windows does not. Every
+one is accounted for:
+
+| # | where | reason | Windows | Linux |
+|---:|---|---|---|---|
+| 5 | `tests/test_reference_defects.py` | module-scope `pytest.importorskip("torch")` | 5 pass | **not collected**; reported as 1 module-level skip |
+| 36 | `test_c10_gate2b.py` (9), `test_c10b_graphs.py` (13), `test_c11c_ponder.py` (14) | `torch is not importable` — the WSL2 venv is numpy + pytest + python-chess only, and has no CUDA | 36 pass | 36 skip, per-test |
+| 1 | `tests/test_c8_reuse.py:760` | `GUOFISH_DEBUG_VL` — the virtual-loss audit is compiled in on the Linux **Debug** build and not on the Windows **Release** one | 1 skip | **1 passes** |
+| 48 | `tests/test_c6_gate1_full.py:623` | "this corpus predates the census columns" — a golden-file property, identical on both | 48 skip | 48 skip |
+
+Arithmetic: 1,437 − 5 − 36 + 1 = **1,397**, and 49 − 1 + 36 + 1 = **85**. Both sides close
+exactly, which is what Amendment D asks for.
+
+**`test_reference_defects.py` is the standing Amendment D exception**, and it is the one
+module-scope skip in the tree. The rule bans module-scope skips because C7's silently skipped
+242-test file made a Rule 3 report meaningless. This file is the deliberate exception: it is a
+test *of the Python reference*, the reference *is* python-chess + torch + `core.mctsv4`, and
+Amendment A already pins the golden data to Windows / Python 3.13.7 / python-chess 1.11.2 — so
+the reference is a Windows artifact and this is where it is checked. The argument is written
+into the file at the skip. It is enumerated here anyway, test by test, because an approved
+exception that stops being counted is how the next C7 happens.
+
+The five: `test_dirichlet_idempotence`, `test_ep_cache_key`,
+`test_equivalence_determinism[0.0]`, `test_equivalence_determinism[2.5]`, `test_terminal_guard`.
+
+### What the Linux arm does and does not certify this chunk
+
+It certifies that C12 broke nothing in the C++ core — which is the weakest possible claim,
+because **C12 changed no C++ at all**. The three shipped changes are in
+`playing/v6/evaluator.py` and `playing/v6/graphs.py`, both of which import torch, and every
+test that exercises them is in the 36 that skip on Linux. The Linux arm is therefore a
+regression check on the unchanged half, and the changed half is certified on Windows only.
+
+That is not a gap C12 introduced and it is not one this chunk can close: the WSL2 box has no
+CUDA and the changes are CUDA-graph changes. It is stated so that nobody reads "1,397 passed on
+Linux" as evidence about the callback.
+
+## Rule compliance
+
+* **Rule 1/2** — no test and no golden file touched. `tools/bench_c12.py`,
+  `tools/profile_c12.py`, `tools/nsys_report_c12.py`, `tools/ncu_report_c12.py` and
+  `tools/run_ncu_c12.ps1` are new tools; `bench_c10b.py` is untouched on purpose.
+* **Rule 3** — full suite, both platforms, above: 1,437 passed / 49 skipped on Windows,
+  1,397 / 85 on Linux, 0 failed, delta reconciled test by test.
+* **Rule 5** — the C12 changes are Python. The sanitizer build is unaffected and was not
+  re-run for them; nothing in `cpp/` changed this chunk.
+* **Rule 7** — no new dependency. Nsight Systems and Nsight Compute are external
+  profilers invoked as executables, not linked or imported.
+* **Gate 2** — re-passed, cell for cell, on the changed forward (BENCH.md).
+
+## What is not done
+
+* **Nsight Compute on a real search rather than an isolated forward.** The forward is
+  profiled in isolation so every kernel is attributable to it; a whole-search ncu run
+  would have profiled the capture and the warmup too. The kernel mix inside a search is
+  covered by the nsys node-granularity trace instead.
+* **Any measurement of what root flattening is worth in Elo.** This is the gap that
+  actually blocks item (b), it is now stated precisely, and it is C13's.
+* **Pipelining, and therefore any measurement of its staleness cost.** Declined on the
+  decomposition above; if C13 finds throughput binding after all, the 1.11x is still there.
+* **The reuse-heavy regime as a strength-relevant number.** 334,315 sims/s is real and it
+  is also a regime where the network is answered from cache 67% of the time. Nothing here
+  says what that is worth over a game.

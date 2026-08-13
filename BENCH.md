@@ -1769,3 +1769,523 @@ Fewer torch calls means fewer places for a handoff to land inside one.
   `max_batch` 128 and ~1.2 GiB at 256 (Gate 2b's fixture). ~1.9 MiB per captured
   row, reported by `CaptureReport.describe()` at construction.
 * Capture costs ~0.6 s at engine start and is one-time.
+
+## C11c — Pondering: stop latency, arena high-water, and the ponder-hit rate
+
+Produced by `tools/bench_c11c_ponder.py` and `tools/smoke_c11.py --ponder`.
+Windows/MSVC Release, RTX 5070, shipping defaults (W=1, K=24, max_batch 128,
+VL 2.5, `PolicyTemperature` 1.0, `PonderDecay` 1.0).
+
+**None of these is a strength measurement, and Gate 5 must not use pondering
+at all** — the 2687.7 anchor was measured with ponder off, so the strength gate
+has to match it. `tools/smoke_c11.py --ponder` refuses `--mode nodes` for a
+related reason: fixed-node play sends `go nodes N` with `tc=inf`, so there is no
+opponent clock to ponder on and the run would measure nothing while looking as
+if it had.
+
+### Resolved sizing at the shipping defaults
+
+| quantity | value | where from |
+|---|---:|---|
+| `sims_per_move` | 60,000 | `fixed_sims or sim_cap` — see DECISIONS.md, C11c |
+| `ponder_max_sims` | 60,000 | `sims_per_move / ponder_decay`, decay 1.0 |
+| `arena_nodes` | 7,200,000 | `60 x (sims_per_move + ponder_max_sims)` |
+| arena footprint | 268 MB per arena, **536 MB for the ping-pong pair** | measured RSS, not reserved address space |
+| coupling | `1.0 x 60,000 <= 60,000` OK | printed on the `[config] ponder` line every `isready` |
+
+### Stop latency during ponder — a histogram, not a mean
+
+30 samples, measured from the `stop` WRITE to the `bestmove` READ over a real
+pipe, walking a game so `apply_move` compacts between samples.
+
+| bucket (ms) | count |
+|---|---:|
+| [5, 10) | 1 |
+| [10, 20) | 18 |
+| [20, 50) | 11 |
+| [50, inf) | 0 |
+
+| | ms |
+|---|---:|
+| min | 7.8 |
+| p50 | 17.2 |
+| p90 | 28.2 |
+| p95 | 29.8 |
+| p99 | 30.9 |
+| max | 30.9 |
+
+Root visits at the moment of the stop: min 6,393, p50 19,763, max 40,245.
+
+**C11's baseline for `stop` under `go infinite` was 7-109 ms.** The tail is now
+inside it, which is `Engine.interrupt_slice` arming the C++ mutable deadline in
+the past rather than the loop waiting out a 50 ms slice. This sits on the ponder
+MISS critical path, where the opponent has already moved and the engine is
+spending its own clock until it answers.
+
+A first version of this measurement re-pondered ONE position and produced 7.6 ms
+rising monotonically to 227.5 ms over 25 samples. That was the tree growing
+without ever advancing, and the O(visited nodes) principal-variation walk growing
+with it — a state no game reaches. See DECISIONS.md, C11c.
+
+### Arena high-water against the predicted `arena_nodes`
+
+| run | plies | clock | hit rate | peak nodes | of 7,200,000 |
+|---|---:|---|---|---:|---:|
+| self-play, forced hits | 40 | 400 ms/move | 100% | 5,993,742 | 83.2% |
+| self-play, forced hits | 70 | 400 ms/move | 100% | 4,580,052 | 63.6% |
+| **Cutechess vs Stockfish** | **488 moves / 20 games** | **10+0.1** | **36.8%** | **1,589,189** | **22.1%** |
+
+The self-play rows force a 100% hit rate — the driver knows both moves — which
+is the worst case for the arena because every ponder's nodes are carried into
+the timed search. The match row is the shipping configuration against a real
+opponent. **Zero `ARENA_EXHAUSTED` lines across 976 telemetry lines in the
+match.**
+
+Occupancy plateaus rather than ramping: 44% by ply 10 in the self-play runs,
+then slowly, because `apply_move` compacts every move.
+
+Nodes per simulation measured this chunk: **31.7-31.8** at 5,000-19,000
+simulations. That extends the brief's curve at its cheap end (C8: 38.9 at 2,000
+and 39.7 at 8,000; playtesting: <=32.4 at ~37,000) and confirms that fitting the
+observed ratio rather than the conservative 40 would have halved the arena.
+
+### Graceful degradation, made to fire
+
+`--arena-capacity 32768`, `go nodes 4000`, through a pipe:
+
+| | |
+|---|---|
+| bestmove | `b5c6` — legal |
+| delivered | 1,055 of 4,000 |
+| `arena_exhausted` | true |
+| exhausted at | 32,755 nodes |
+| stdout notice | `info string arena exhausted at 32755 nodes - this move delivered 1055 simulations of its budget and is NOT admissible as a benchmark row` |
+| Python traceback | none |
+| next `go` | answered normally |
+
+Library-level, against the Gate 1 dump and the stand-in evaluator, at three
+capacities and a 4,000-simulation budget:
+
+| arena | delivered / requested | exhausted at | best move | `vloss_total` | conservation failures |
+|---:|---|---:|---|---:|---:|
+| 4,096 | 119 / 3,999 | 4,089 | g5h7 | 0 | 0 |
+| 40,000 | 1,206 / 3,999 | 39,982 | g2f1 | 0 | 0 |
+| 1,200,000 | 3,999 / 3,999 | — | h4h5 | 0 | 0 |
+
+The last two columns are the point. A degraded search leaves the tree exactly as
+it found it, which is what makes "the search returned a slightly weaker move" a
+true description rather than a hopeful one.
+
+### Ponder-hit rate — 20 games, 10+0.1, vs Stockfish UCI_Elo 1800
+
+| | |
+|---|---:|
+| ponders resolved | 486 |
+| hits | 179 |
+| misses | 307 |
+| **hit rate** | **36.8%** |
+| skipped (book/tablebase answered the position) | 1 |
+
+Simulations carried into a hit: p50 3,209, p90 11,740, p95 13,797, p99 20,003,
+max 25,500, mean 4,478.
+
+This is the number that decides whether salvage-on-miss is worth revisiting. It
+is low, and that is not by itself an argument for salvage: a miss costs nothing
+that was otherwise being used, so the case needs Gate 5-class evidence that the
+lost work matters as well. See DECISIONS.md, C11c.
+
+### 20-game Cutechess smoke, `ponder=true`, 10+0.1, concurrency 1
+
+13/13 verdicts passed, including all four the brief names:
+
+| verdict | result |
+|---|---|
+| illegal moves | 0 (cutechess, and an independent python-chess replay of all 20 PGNs) |
+| null bestmoves | 0 over 820 mirrored bestmoves |
+| engine crashes / stalls | 0, and 0 Python tracebacks |
+| timeouts | 0 |
+| abnormal PGN terminations | 0 |
+| resolved book/Syzygy state recorded | book open, Syzygy open (5-man) |
+
+Decisions: search 465, book 23, tablebase 0 — 23 of 488 moves bypassed MCTS.
+
+**Concurrency 1 is not incidental.** Pondering multiplies GPU contention by the
+number of games in flight: four simultaneous games pondering means four searches
+against one RTX 5070, each getting a fraction of the throughput while believing
+it has the whole device, and per-game strength falls rather than rises. Either
+cap concurrency at one game when pondering is enabled, or disable pondering when
+concurrency exceeds one.
+
+### Measurement notes
+
+* `SearchOutcome.ponder_sims` and `search_sims` are never summed into one
+  figure. `sims_per_s` divides post-hit work by post-hit wall time; folding the
+  ponder into either would inflate the rate by whatever the opponent spent
+  thinking, and would make a ponder-on run incomparable with the ponder-off arm
+  Gate 5 is measured against.
+* `arena_exhausted` makes `delivered < requested` a legitimate outcome for the
+  first time since C10. A benchmark harness must consult it and REJECT the row
+  rather than publish a short one;
+  `test_a_benchmark_harness_rejects_a_degraded_row_rather_than_publishing_it`
+  asserts the rule rather than a paraphrase of it.
+* The stop-latency and arena figures come from a Release build. Nothing in this
+  section was measured on a sanitizer build.
+
+---
+
+## C12 — Where the time actually goes, and what could be done about it
+
+Reproduce with:
+
+```
+python tools/profile_c12.py search --regime fresh --sims 20000     # the workload
+nsys profile --trace=cuda,nvtx --cuda-graph-trace=graph ...        # C12-1
+powershell -File tools/run_ncu_c12.ps1                             # C12-2 (needs admin)
+python tools/nsys_report_c12.py runs/c12/*.sqlite --markdown
+python tools/ncu_report_c12.py runs/c12/*.ncu-rep --markdown
+python tools/bench_c12.py --markdown                               # C12-3, C12-5, C12-7
+```
+
+Same machine and model as C10/C10b throughout: `models/guofish5_20M/v5_10.9M_best.pt`
+(10.9M v5 student, 6 layers, d_model 384, bf16 autocast), RTX 5070 (48 SMs, **WDDM**),
+torch 2.8.0+cu129, MSVC 19.51 Release, `asan=False`, `verify_compaction=False`.
+
+**Read C12-4 before quoting any reuse-heavy figure from C10b.** One of this chunk's
+findings is that C10b-3e's reuse-heavy Gate 4 rows measure a 220-simulation search.
+
+### C12-1 — Nsight Systems: the GPU busy fraction, and the number it corrects
+
+One 20,000-simulation search on the fresh midgame root at the shipping W=1/K=24, with
+the setup, the capture and the warmup outside the NVTX region every figure is
+restricted to. Profiling overhead is not assumed small: the same search runs at
+14,022 sims/s under nsys against 14,003 unprofiled, i.e. **0.1%**.
+
+`GPU busy` is the **union** of every device interval — graph executions and memcpys —
+not their sum. Summing lets a 90%-busy device report 130% when streams overlap.
+
+| | pre-C12 code | **shipped C12 code** |
+|---|---:|---:|
+| region wall | 1,426.2 ms | 1,313.2 ms |
+| GPU busy | 1,049.3 ms | 1,015.5 ms |
+| **GPU busy fraction** | **73.6%** | **77.3%** |
+| GPU idle | 377.0 ms (26.4%) | 297.7 ms (22.7%) |
+| graph launches | 835 | 835 |
+| graph execution, p50 | 1,253.1 µs | 1,208.9 µs |
+| gap between launches, p50 | 441.8 µs | 342.8 µs |
+| gaps, total | 381.8 ms = 26.8% | 302.8 ms = 23.1% |
+
+**The GPU is 73.6% busy, not 92%.** C10b's grid reported `GPU share` as
+`call_ns / wall_ns` — the fraction of the cycle the dispatcher spends *blocked inside
+the callback* — and read a pipelining ceiling of 1.08–1.11x off it. That number is
+correct for what it measures and wrong for what it was used for: the callback contains
+its own host work, so being inside it is not the same as the device being busy. The
+measured ceiling is **1/0.736 = 1.36x**, three times the payoff C10b's proxy implied.
+This is exactly the disambiguation the brief said Step 1 would produce, and it changes
+the answer. C12-8 then decomposes it and declines it anyway, for a different reason.
+
+**Copies are not a term.** Over the whole search: 835 H2D totalling 4.6 MiB in 0.94 ms,
+and 1,670 D2H totalling 138.6 MiB in 4.33 ms. All of it is 0.4% of wall. The 4096-wide
+policy row crossing the bus instead of scope §2.5's 64-wide gather costs nothing
+measurable, confirming C10b-3a's conclusion from the other side.
+
+**Host-side CUDA API cost, and why it is the shape of the gap.** From the same trace,
+the host duration of each CUDA call (pre-C12 code):
+
+| CUDA runtime API | calls | total ms | p50 µs | p90 µs | max µs |
+|---|---:|---:|---:|---:|---:|
+| `cudaStreamSynchronize` | 1,670 | 1,036.9 | 308.5 | 1,252.9 | 1,407.5 |
+| `cudaMemcpyAsync` | 2,645 | 54.2 | 17.8 | 39.8 | 175.5 |
+| `cudaGraphLaunch` | 835 | 48.2 | **53.6** | 72.8 | 199.6 |
+| `cudaLaunchKernel` | 201 | 5.8 | 26.3 | 38.1 | 174.3 |
+| `cudaStreamIsCapturing` | 835 | 0.9 | 0.7 | 1.2 | 26.8 |
+
+`cudaStreamSynchronize` is the GPU wait and belongs to the device. The rest is 103.3 ms
+= **7.2% of wall spent submitting work**, and the line that matters is the third:
+**a graph launch costs 53.6 µs of host time on this machine.** That is a WDDM property —
+submission goes through the OS scheduler — and it is why the callback's `replay` phase
+in C12-3 is ~40–50 µs for a call that enqueues one node and returns. It is also why
+`cudaMemcpyAsync` costs 17.8 µs to move 96 bytes.
+
+**The reuse-heavy regime is not GPU-bound at all.** Six plies into the endgame the same
+20,000-simulation budget produces **one** boundary crossing of two rows: GPU busy 26.3%
+of a 2.5 ms region. Whatever is true of the network is irrelevant there, and every
+optimisation below is a fresh-root optimisation. See C12-4 for why that search is 2.5 ms
+long in the first place.
+
+### C12-2 — Nsight Compute: the kernel breakdown, and what is actually limiting
+
+`--set full`, `--graph-profiling node`, restricted by `--nvtx-include` to one
+steady-state forward. Collection needs administrator rights on this machine
+(`ERR_NVGPUCTRPERM`; `RmProfilingAdminOnly` is unset, i.e. the default of 1), so
+`tools/run_ncu_c12.ps1` exists and was run elevated; parsing needs nothing.
+
+**One forward is 151 kernel launches of 20 distinct kernels.**
+
+| class | launches | share @ shape 24 | share @ shape 128 | achieved occupancy @ 24 | @ 128 | compute SoL @ 24 | DRAM SoL @ 24 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GEMM (cutlass bf16 tensorop) | 29 | **48.0%** | **53.2%** | 12.9% | 13.6% | 36.0% | 12.7% |
+| elementwise / copy | 103 | **36.3%** | **31.4%** | 69.8% | 86.1% | 33.1% | 37.9% |
+| attention (`fmha_cutlassF`) | 6 | 8.6% | 8.6% | 27.3% | 31.8% | 35.0% | 20.8% |
+| normalisation (`vectorized_layer_norm_kernel<float,float>`) | 13 | 7.2% | 6.9% | 68.2% | 73.4% | 51.5% | 36.5% |
+
+Device time is 1,947 µs at shape 24 and 8,310 µs at 128 **under ncu**, which serialises
+and replays every kernel; the uninstrumented figures are 1,209 µs and ~6,200 µs (C12-1,
+C10b-3a). Use ncu for the shape of the distribution and nsys for its magnitude.
+
+The largest kernels at shape 24, and the one column that decides item (a):
+
+| kernel | calls | device µs | share | grid | block | achieved / **theoretical** occupancy | compute SoL |
+|---|---:|---:|---:|---|---|---:|---:|
+| `cutlass::Kernel2<...64x256...>` | 12 | 386.6 | 19.9% | (56,1,1) | (128,1,1) | 8.3% / **8.3%** | 37.1% |
+| `cutlass::Kernel2<...256x128...>` | 6 | 318.0 | 16.3% | (104,1,1) | (256,1,1) | 16.6% / **16.7%** | 33.5% |
+| `cutlass::Kernel2<...64x64...>` | 6 | 206.2 | 10.6% | (208,3,1) | (128,1,1) | 15.6% / **16.7%** | 39.6% |
+| `at::unrolled_elementwise_kernel<direct_copy...>` | 39 | 185.5 | 9.5% | **(1,1,1)** | (128,1,1) | 49.0% / 100.0% | 19.5% |
+| `at::elementwise_kernel` | 19 | 178.3 | 9.2% | (1224,1,1) | (128,1,1) | 82.3% / 100.0% | 40.8% |
+| `fmha_cutlassF_bf16_aligned_64x64_rf_sm80` | 6 | 166.7 | 8.6% | (2,6,24) | (32,4,1) | 27.3% / 33.3% | 35.0% |
+
+**Achieved occupancy equals theoretical in every GEMM row, so occupancy is not the
+lever.** 8.3% of 48 warps per SM is 4 warps, which is exactly one 128-thread CTA: the
+cutlass tiles are limited to one block per SM by their own register and shared-memory
+footprint, by design, trading occupancy for register-resident accumulators. At shape 128
+the grid is 544 blocks over 48 SMs — 11 full waves, no quantisation excuse — and compute
+Speed-of-Light is still 38.9%. The forward is **not** occupancy-starved and **not**
+bandwidth-starved (DRAM SoL 8.9–17.7% on the GEMMs); it is a small-K problem, K = 384
+over 1,632 tokens, where each tile does few MMA steps and spends its time on prologue
+and epilogue.
+
+**The brief's roofline diagnosis is confirmed and made specific: 52.0% of device time at
+shape 24 (46.8% at 128) is not a GEMM at all.** That is the activation materialisation.
+Of it, `aten::_to_copy` is 54 launches / 137.7 µs, and `aten::clone` + `aten::contiguous`
+are 30 launches / ~174 µs — `nn.MultiheadAttention` reshaping q/k/v around SDPA.
+
+**Item (a)(2) is banked, not available.** Attention already routes through
+`scaled_dot_product_attention`: the kernel is `fmha_cutlassF_bf16_aligned_64x64_rf_sm80`,
+i.e. the memory-efficient SDPA backend, reached via
+`aten::_scaled_dot_product_efficient_attention`. There is no matmul+softmax to replace.
+
+### C12-3 — Every millisecond of a fresh-root move, named
+
+One search: 19,999 delivered simulations, 835 crossings, 21.2 rows each, W=1/K=24, on
+the shipped code. Phases timed from inside a `TorchEvaluator` subclass so they are
+measured together rather than reconciled afterwards.
+
+| line | total ms | share of wall | per crossing µs |
+|---|---:|---:|---:|
+| graph replay wait (the `policy` D2H blocks until the forward is done) | 1,043.2 | **76.1%** | 1,249.4 |
+| C++ search outside the callback (descent, expand, backup, tokenize, probe) | 179.8 | **13.1%** | 215.4 |
+| H2D of the token rows + pad-tail restore (`stage`) | 52.9 | 3.9% | 63.4 |
+| value D2H (`value`) | 48.9 | 3.6% | 58.6 |
+| `cudaGraphLaunch` (`replay`, submission only) | 38.6 | 2.8% | 46.2 |
+| Python interpreter overhead inside the callback | 6.4 | 0.5% | 7.7 |
+| dispatcher GIL acquire wait | 1.5 | 0.1% | 1.8 |
+| **wall** | **1,371.4** | **100%** | 1,642.4 |
+
+**The residual is zero by construction and is not evidence.** The C++-search line is
+computed as `wall - call_ns - acquire_ns` and the Python line as
+`call_ns - (the four phases)`, so the column sums to the wall no matter what is true.
+What makes the table checkable is C12-1, which measures the same quantities from the
+CUDA trace instead of from these timers: **76.1% here against 77.3% GPU busy there**, and
+7.2% of wall in CUDA API submission there against 10.3% in `stage`+`replay`+`value` here
+(the difference being the Python and torch-dispatch time those three phases also
+contain). The two independent decompositions agree to about a point.
+
+The GIL is not a term — 1.5 ms of 1,371, p50 1.8 µs per crossing — which closes out the
+C10 contingency for the third time and the last.
+
+### C12-4 — The reuse-heavy Gate 4 rows in C10b measure 220 simulations
+
+`search_parallel(N)` runs to **N root visits**, not N new simulations:
+`target_ = num_simulations - existing` (`cpp/search.hpp`), and `ParallelStats::requested`
+is set to that *remainder*. So `delivered == requested` — the assertion every C10b table
+is gated on — is satisfied by a search that did almost nothing, and cannot detect it.
+
+Replaying C10b's construction exactly (six plies at an absolute 20,000, then a measured
+search at an absolute 20,000):
+
+| | inherited root visits | delivered | wall | reported sims/s |
+|---|---:|---:|---:|---:|
+| C10b-3e's spelling, reproduced | 19,780 | **220** | 2.0 ms | 108,911 |
+| production's spelling (`root_visits + 20,000`) | 80,510 | **20,000** | 59.8 ms | 334,315 |
+
+**It is also not how the engine plays.** `playing/uci_wrapper_v6.py` sets
+`budget = current + cfg.sim_cap` for both timed and infinite searches; only a literal
+`go nodes N` uses an absolute target. C10b's published 92,639 sims/s is therefore 220
+simulations divided by a wall clock that is mostly fixed per-call cost, and its
+five-repeat spread of 22,924–177,657 at W=8/K=4 is what a 220-sample looks like.
+
+`tools/bench_c12.py` asserts `delivered > 0` as well as `delivered == requested`, which
+is the check that would have caught this. The first version of C12's own table published
+a **zero** in this cell for the mirror-image reason — it built the tree with one spelling
+and measured it with the other — which is recorded in DECISIONS.md rather than quietly
+fixed.
+
+### C12-5 — Gate 4, both regimes, delivered simulations
+
+W=1/K=24, `max_batch` 128, virtual loss 2.5, `verify_compaction` **off**, 5 repeats
+(median), shipped code. No opening book and no tablebase are attached on the library
+path, so **no move is bypassed and there is nothing to exclude from the rate**.
+
+| regime | inherited | delivered | wall | **delivered sims/s** | min | max | rows/crossing | cache hit | vs floor (8k) | vs stretch (15k) | vs Python (838) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **fresh midgame root** | 1 | 19,999 | 1,303.5 ms | **15,342** | 15,207 | 15,484 | 21.2 | 11.3% | **1.92x** | **1.02x** | **18x** |
+| **reuse-heavy endgame** | 80,510 | 20,000 | 59.8 ms | **334,315** | 323,557 | 340,134 | 7.9 | 66.8% | **41.79x** | 22.29x | **399x** |
+| *reuse-heavy, C10b's spelling (220 sims — not a rate)* | 19,780 | 220 | 2.0 ms | *108,911* | *76,301* | *112,867* | 2.0 | 84.6% | — | — | — |
+
+**Gate 4 PASSES in both regimes, and the stretch target is now met on a fresh root** —
+15,342 against 15,000, where C10b measured 13,912. The floor is cleared by 1.92x.
+
+### C12-6 — What shipped, and the proof it changed no bit
+
+Three changes, all in Python, all on the host side of the boundary, **all bit-exact by
+construction and verified so**.
+
+1. **`hoist_norm_parameter_casts`** (`playing/v6/evaluator.py`). Autocast keeps
+   `layer_norm` on its fp32 list, so every forward widens both affine parameters of all
+   13 LayerNorms to fp32 — 26 kernel launches of 384 elements each, at grid **(1,1,1)**,
+   recomputing a constant. bf16 to fp32 is an exact widening, so storing the result once
+   produces exactly the bits the runtime cast would have. Called before capture, because
+   a graph records the kernels it was captured with.
+2. **Cached tensor views** (`GraphedForward._build_view_cache`, `TorchEvaluator._row_views`).
+   `tokens[:count]`, `_policy[shape][:count]`, `_input_t[:count]` and the two output
+   slices are five Python objects and five dispatcher round trips per crossing, for views
+   onto storage that CUDA graph capture already requires never to move. There are only
+   `max_batch` of each; they are built once.
+3. **The two D2H copies reordered.** The value copy is issued first and asynchronously;
+   the policy copy is blocking and, being on the same stream, completes both. Two
+   blocking copies cost two `cudaStreamSynchronize` round trips, and C12-1 measures a
+   round trip at ~50 µs against 96 bytes of payload.
+
+| | delivered sims/s (median of 15) | range | paired |
+|---|---:|---|---:|
+| pre-C12 | 14,479 | 14,263 – 14,741 | — |
+| **shipped** | **15,420** | 15,203 – 15,597 | **1.065x**, 15/15 wins |
+
+Interleaved, not two blocks, because the run-to-run spread is ~4% and drifts with GPU
+clock; two blocks of 15 would compare two machine states. Isolated, on the graphed
+forward's *device* time via CUDA events: change 1 alone is **1.024x at shape 24** and
+1.009x at 128 — the gap between the two is the point, because shape 24 is what the
+engine ships at.
+
+**Root flattening effect: none, and it is measured rather than argued.** The C12
+acceptance criterion asks every optimisation to report it, so:
+
+* the root visit vector is **bit-identical** pre- and post-change on every A/B pair;
+* `tests/test_c10b_graphs.py` finds **0 differing policy words** of 2,048,000 at every
+  captured shape, against the eager forward;
+* the entire top-move-share and TV column of C12-7 reproduces digit for digit between
+  the pre-C12 and shipped runs (78.7 / 75.1 / 71.2 / 70.3 / 65.9 / 60.8 / 53.9 / 46.9).
+
+A throughput gain that changed the search would show up in all three. None of them moves.
+
+### C12-7 — Item (b): outstanding leaves, and why the tolerance does not settle it
+
+W=1, 20,000 **new** simulations on the fresh midgame root, 5 repeats, shipped code.
+
+| K | delivered sims/s | vs K=24 | rows/crossing | pad waste | **top-move share** | TV vs K=8 | run-to-run TV |
+|--:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 9,637 | 0.62x | 7.1 | 1.12x | 78.7% | 0.0% | 0.0% |
+| 16 | 13,101 | 0.85x | 14.2 | 1.12x | 75.1% | 3.6% | 0.0% |
+| **24** | **15,453** | **1.00x** | 21.2 | 1.12x | **71.2%** | 7.5% | 0.0% |
+| 32 | 15,657 | 1.01x | 28.1 | 1.13x | 70.3% | 8.6% | 0.0% |
+| 48 | 16,822 | 1.09x | 42.0 | 1.14x | 65.9% | 12.8% | 0.0% |
+| 64 | 16,844 | 1.09x | 56.1 | 1.14x | 60.8% | 17.9% | 0.0% |
+| 96 | 17,414 | 1.13x | 83.8 | 1.14x | 53.9% | 24.8% | 0.0% |
+| 128 | 18,037 | 1.17x | 110.1 | 1.15x | 46.9% | 31.8% | 0.0% |
+
+**The brief says item (b) is "blocked on C10b's absolute root-stability tolerance", and
+C10b set that tolerance at 10% run-to-run TV. Every row above passes it, and that
+settles nothing.** At W=1 the search is deterministic, so run-to-run TV is 0.0% at every
+K by construction — the tolerance is a *reproducibility* bound, and the quantity that
+actually moves is *flattening*, which is a different column. Item (b) is not unblocked;
+it was blocked on the wrong unknown.
+
+The real exchange rate is in this table: **1.09x throughput costs 10.4 points of
+top-move share (K=24 to K=64), and 1.17x costs 24.3 points.** C10b-3g declined K=32 for
+2.4 points at a 1.74x Gate 4 margin. At a 1.92x margin and with the stretch target met,
+the same principle declines K=64 by a wider margin than it declined K=32.
+
+**Recommendation: K stays 24.** What would change it is Gate 5-class evidence — a
+time-controlled match at K=24 against K=64 — and the brief's own text says that decision
+belongs to a match, not to a throughput table. It is handed to C13.
+
+### C12-8 — Item (c): the pipelining ceiling, decomposed, and declined
+
+C12-1 raised the ceiling from C10b's 1.09x to 1.36x. Decomposing the 22.7% idle on the
+shipped code says what would actually be recoverable:
+
+| the idle is | share of wall | recoverable by |
+|---|---:|---|
+| C++ search — descent, expansion, backup, tokenize, cache probe | 13.1% | **raising outstanding leaves**, i.e. item (b) |
+| CUDA submission — `stage` + `replay` + `value` | 10.3% | pipelining the dispatcher stages |
+| Python interpreter + GIL wait | 0.6% | neither |
+
+**Items (b) and (c) are not independent, and this is the finding that decides item (c).**
+At W=1/K=24 the single worker has all 24 of its leaves outstanding, so it has nothing to
+descend while the GPU runs; the only way to overlap that 13.1% is to give it more leaves
+in flight, which is item (b) and costs root sharpness. Pipelining the dispatcher stages —
+what the brief actually asks for, and correctly separates from raising the budget —
+reaches the other 10.3%, so **its true ceiling is 1/(1 - 0.103) = 1.11x**, not 1.36x.
+
+**Declined.** 1.11x is an upper bound assuming perfect overlap, on a C++ change to the
+dispatcher in `search.hpp` with determinism and TSan consequences, against an engine that
+already clears the stretch target. Its stated prerequisite is already met and cost
+nothing: `TorchEvaluator._pin_buffers` page-locks **all three** buffers through
+`buffer_spans()`, not just the input, so the pageable-D2H hazard the brief flags does not
+exist here. The brief's own escape clause — "if the increased virtual loss staleness
+costs more sharpness than the throughput is worth, ship without pipelining" — points the
+same way, and no measurement of staleness was needed to get there.
+
+### C12-9 — Item (a): blocked by Gate 2, and the ruling that would unblock it
+
+**`torch.compile` is not in the shipped path**, so nothing is banked from it: C10b built
+it, measured it 1.23–1.47x faster, and **rejected it because it fails Gate 2 by four
+orders of magnitude** — 1,773,671 of ~2,621,440 policy words differing (C10b-1b). The
+shipped forward is a manual capture of the eager ATen ops, unfused.
+
+The C12 brief's premise for item (a) is that *"fusing the existing bf16 ops preserves the
+gate; changing precision is a deliberate re-baselining."* **That premise is false on this
+model, and C10b already measured it false.** Inductor changes no precision — it keeps
+bf16 throughout and fuses bias/GELU/LayerNorm into the matmul epilogue — and a bf16 logit
+moved by one ulp moves a prior by ~1e-3, three orders over the 1e-6 bound. Fusion *is*
+re-baselining here, so (a)(1) and (a)(3) are blocked for the same reason (a)'s precision
+clause blocks fp16. (a)(2) is banked (C12-2). (a)(4) has no dominant kernel to name — the
+largest is 19.9% — only a dominant *class*.
+
+Per the brief's instruction, this is **halted pending a ruling** and scoped in
+`docs/c12_kernel_fusion_scope.md`: Option A do nothing (recommended), Option B adopt
+Inductor and re-baseline Gate 2 (~1.19x delivered sims/s, ~2 points, costs the gate's
+meaning and Global Rule 2's golden provenance), Option C bit-exact data-movement Triton
+(~1.05x, ~8 points).
+
+### Gate 2, re-passed on the changed forward
+
+`pytest tests/test_c10b_graphs.py -q -s` — 14 passed. Every cell reproduces C10b-2
+exactly, which is the expected consequence of the change being bit-exact:
+
+| comparison | max abs delta | p99 | exact | over 1e-6 | inversions |
+|---|---:|---:|---:|---:|---:|
+| graphed vs reference interior (ATen CPU, python-chess order) | 2.384e-07 | 5.364e-08 | 3,986 | **0** | **0** |
+| graphed vs reference root (ATen CUDA, python-chess order) | 2.384e-07 | 4.470e-08 | 3,341 | **0** | **0** |
+| graphed vs ATen CPU in chess-library order | 2.682e-07 | 5.960e-08 | 3,865 | **0** | **0** |
+
+Graphed vs eager: **0 differing policy words** of 2,048,000 at shape 1 and of ~1.6–2.0M
+at each of shapes 8, 16, 24, 32, 48, 64, 96, 128.
+
+### Measurement notes
+
+* `tools/profile_c12.py` and `tools/bench_c12.py` both **refuse to run on an instrumented
+  build**, for the reason recorded in DECISIONS.md, C10.
+* The NVTX region excludes evaluator construction, graph capture, the reuse plies and a
+  throwaway warmup search, so no figure here includes first-touch on the arena's pages or
+  a cold transposition cache.
+* Per-batch NVTX markers are **off by default** (`--nvtx-batches` turns them on). They sit
+  inside the GIL-held callback; the per-batch structure in C12-1 is recovered from the
+  CUDA trace's own kernel timestamps instead, which costs the callback nothing.
+* `--cuda-graph-trace=node` costs 5.4% (13,262 sims/s against 14,022) and is used only for
+  the kernel breakdown. Every timing figure comes from a `graph`-granularity capture.
+* ncu figures are collected with kernel serialisation and replay, so device times there
+  are ~1.6x the uninstrumented ones. Shares, occupancy and Speed-of-Light are what that
+  report is quoted for.
+* Gate 4 rows report **delivered** simulations and assert `delivered == requested`,
+  `delivered > 0`, `vloss_total == 0`, zero conservation failures and
+  `arena_exhausted == false` before the row is admitted.

@@ -220,6 +220,44 @@ class GraphedForward:
         self.padded_rows = 0
         self.by_size = {size: 0 for size in self.sizes}
         self._capture()
+        self._build_view_cache()
+
+    # --- the view cache (C12) ---------------------------------------------
+
+    def _build_view_cache(self) -> None:
+        """One tensor view per (count) and per (shape, count), built once.
+
+        C12 PROFILING FINDING. `self.tokens[:count]` and `self._policy[p][:count]`
+        are cheap in the sense that they copy nothing — and they are not cheap in
+        the sense that matters, because each one constructs a Python object and
+        runs a slice through the ATen dispatcher, inside the GIL-held callback,
+        once per boundary crossing. BENCH.md C12-3 measures the whole callback at
+        ~205 us of host time against a 1,282 us graph, and `stage` alone at 55 us
+        of which the `cudaMemcpyAsync` is 17.8. There are only `max_batch`
+        possible counts and nine possible shapes, so every one of these views can
+        exist before the search starts.
+
+        The views alias the same storage as the tensors they are cut from —
+        `tokens` and the captured outputs never change identity, which is exactly
+        the property CUDA graph capture already requires of them (docstring
+        property 2). So a cached view cannot go stale: if it could, the graph
+        would already be replaying against the wrong addresses.
+
+        Memory is negligible: `max_batch` + `len(sizes) x max_batch` view objects,
+        no storage.
+
+        WHY THE CACHE DOES NOT SHORT-CIRCUIT `pad_to` OR `replay`. Both are
+        mutation targets in tools/drill_c10b_graphs.py (`round-down`,
+        `stale-replay`), and a `run` that inlined them would leave those
+        mutations unexercised — the drill would keep reporting that the suite
+        catches them while the suite no longer ran them. The cache is keyed on
+        what `pad_to` returns rather than on what it returned at construction.
+        """
+        self._token_views = {count: self.tokens[:count]
+                             for count in range(1, self.max_batch + 1)}
+        self._output_views = {
+            (size, count): (self._policy[size][:count], self._value[size][:count])
+            for size in self.sizes for count in range(1, size + 1)}
 
     # --- capture ----------------------------------------------------------
 
@@ -296,7 +334,7 @@ class GraphedForward:
         one readable place rather than a line inside a hot function.
         """
         padded = self.pad_to(count)
-        self.tokens[:count].copy_(source, non_blocking=True)
+        self._token_views[count].copy_(source, non_blocking=True)
         if self._dirty > count:
             # Only the rows a PREVIOUS, larger batch wrote need restoring; the
             # rest are still the pad position from construction. This is why the
@@ -311,6 +349,14 @@ class GraphedForward:
 
     def outputs(self, count: int, padded: int) -> tuple[torch.Tensor, torch.Tensor]:
         """The captured shape's outputs, narrowed to the rows that were asked for."""
+        cached = self._output_views.get((padded, count))
+        if cached is not None:
+            return cached
+        # `padded < count` is unreachable through `pad_to`, and reachable through
+        # a mutation of it (drill_c10b_graphs.py `round-down`). Slice rather than
+        # KeyError so the mutation still produces the SHAPE MISMATCH the caller
+        # would have seen before the cache existed, and fails the test it is
+        # aimed at rather than a different one.
         return self._policy[padded][:count], self._value[padded][:count]
 
     def poison_pad(self, count: int, padded: int) -> None:

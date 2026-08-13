@@ -1758,6 +1758,20 @@ py::dict parallel_stats_dict(const guofish::ParallelStats &stats) {
     d["outstanding_at_drain"] = int64_array(stats.outstanding_at_drain);
     d["hook_wait_ns"] = stats.hook_wait_ns;
     d["hook_wait_ns_samples"] = int64_array(stats.hook_wait_ns_samples);
+    // C11c. The two legitimate reasons `delivered < requested`, and the arena
+    // occupancy a sizing report checks the formula against. A benchmark harness
+    // that admits a row only on `delivered == requested` must consult these
+    // before rejecting the row as broken — and must still reject it, rather than
+    // publish a short one. See ParallelStats in cpp/search.hpp.
+    d["deadline_hit"] = stats.deadline_hit;
+    d["arena_exhausted"] = stats.arena_exhausted;
+    d["arena_exhausted_at"] = stats.arena_exhausted_at;
+    d["arena_high_water"] = stats.arena_high_water;
+    d["arena_capacity"] = stats.arena_capacity;
+    d["arena_utilisation"] =
+        stats.arena_capacity > 0 ? static_cast<double>(stats.arena_high_water) /
+                                       static_cast<double>(stats.arena_capacity)
+                                 : 0.0;
     d["mean_batch"] = stats.batches > 0
                           ? static_cast<double>(stats.queued_leaves) /
                                 static_cast<double>(stats.batches)
@@ -2317,6 +2331,84 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
             "requested budget. The reference's `stats['simulations'] += 1` was an "
             "unsynchronized read-modify-write over the same quantity across 32 threads, which "
             "is why its throughput figures could not be trusted to the last few percent.")
+
+        // --- C11c: the mutable deadline ------------------------------------
+        //
+        // THE ONLY BINDINGS IN THIS FILE THAT ARE MEANT TO BE CALLED FROM
+        // ANOTHER PYTHON THREAD WHILE A SEARCH IS RUNNING, and the property
+        // that makes that safe is that each is a single atomic load or store
+        // with nothing else in it. In particular NONE of them takes
+        // `py::gil_scoped_release`: they are too short for the release to pay
+        // for itself, and the calling thread — the UCI reader, blocked in
+        // `readline` the rest of its life — already holds the GIL while the
+        // searching thread has released it.
+        .def(
+            "set_deadline_in",
+            [](Search &self, double seconds) { self.set_deadline_in(seconds); },
+            py::arg("seconds"),
+            "Arm the mutable deadline `seconds` from now. Callable from another thread while "
+            "search_parallel() is in flight — that is what it is for.\n\n"
+            "This is how `ponderhit` converts an infinite-budget search into a timed one "
+            "WITHOUT stopping and restarting it. Restarting would discard the tree, which is "
+            "the entire point of having pondered.\n\n"
+            "A duration rather than an instant, deliberately: std::steady_clock and Python's "
+            "time.monotonic() are both monotonic and are NOT the same epoch on Windows, so a "
+            "caller is never asked to name a time in a clock it cannot read. Zero or negative "
+            "is an already-expired deadline, which is the correct reading of a ponderhit on a "
+            "flagged clock.\n\n"
+            "The workers re-read it at their existing abort point, so it takes effect within "
+            "one simulation. It is NOT cleared by search_parallel(): the host arms it once and "
+            "the slice loop enters the search many times. Clear it in a finally.")
+
+        .def("clear_deadline", &Search::clear_deadline,
+             "Disarm the mutable deadline. The search then runs to its node budget.\n\n"
+             "MUST be called when a timed search ends, because the deadline outlives the "
+             "search_parallel() call that observed it. A host that forgets leaves the next "
+             "search pre-expired.")
+
+        .def_property_readonly(
+            "deadline_remaining_s",
+            [](const Search &self) {
+                return static_cast<double>(self.deadline_remaining_ns()) * 1e-9;
+            },
+            "Seconds until the armed deadline; 0.0 when none is armed, negative once it has "
+            "passed. The two zeros are distinguishable through `deadline_armed`.")
+
+        .def_property_readonly(
+            "deadline_armed",
+            [](const Search &self) { return self.deadline_ns() != Search::kNoDeadline; },
+            "Whether a deadline is currently armed. On the engine's telemetry line so a "
+            "search that ended instantly can be told from one that was never given time.")
+
+        // --- C11c: graceful arena exhaustion --------------------------------
+        .def_property_readonly(
+            "arena_exhausted", [](const Search &self) { return self.arena_exhausted(); },
+            "Did an allocation fail during the last search()/search_parallel()?\n\n"
+            "TRUE MEANS THE SEARCH DEGRADED RATHER THAN FAILED. The workers stopped "
+            "descending at their abort point, the in-flight simulations unwound without "
+            "backing anything up, and the search returned the best move it already had. "
+            "`delivered < requested` is then a legitimate outcome — and a benchmark harness "
+            "must REJECT such a row rather than publish a short one, which is why this is "
+            "readable at all.\n\n"
+            "Cleared at the top of each search call. A host that slices a move ORs it across "
+            "the slices, because the statement worth logging is 'this move degraded'.")
+
+        .def_property_readonly(
+            "arena_exhausted_at",
+            [](const Search &self) { return self.arena_exhausted_at(); },
+            "Nodes allocated when the first allocation failed, or 0 if none did. The N in "
+            "`info string arena exhausted at N nodes`.")
+
+        .def_property_readonly(
+            "arena_capacity", [](const Search &self) { return self.arena_capacity(); },
+            "Nodes the ACTIVE arena can hold. The denominator for arena_high_water; the "
+            "ping-pong pair reserves two of these. See arena_bytes_reserved.")
+
+        .def_property_readonly(
+            "arena_high_water", [](const Search &self) { return self.arena_high_water(); },
+            "Peak occupancy of EITHER ping-pong arena, across every reset. Also in "
+            "reuse_stats(); lifted out here because the C11c sizing verification reads it "
+            "per move and does not want the rest of that dict.")
 
         .def(
             "audit", [](const Search &self) { return tree_audit_dict(self.audit()); },
@@ -3176,6 +3268,57 @@ PYBIND11_MODULE(guofish_core, m) {
         "mutation drill makes about golden data. Under a TSan build this must produce a "
         "report; if it does not, the clean C9 acceptance run proves nothing. The return "
         "value is the racy counter, which is also usually wrong, and that is expected.");
+
+    m.def(
+        "steady_now_ns",
+        [] { return guofish::Q32ReplaySearch::steady_now_ns(); },
+        "std::steady_clock::now() in nanoseconds — THE CLOCK THE MUTABLE DEADLINE USES.\n\n"
+        "Exposed so a stop-latency measurement can be taken against the same clock the "
+        "engine aborts on, rather than against time.monotonic(). The two are both monotonic "
+        "and are NOT the same epoch on Windows, so a difference between one reading of each "
+        "is meaningless while a difference between two readings of this is not.\n\n"
+        "Nothing in the engine needs it: set_deadline_in() takes a duration precisely so "
+        "that no caller has to name an instant in this epoch.");
+
+    m.def(
+        "deadline_race_probe",
+        [](int iterations) {
+            // C11c's positive control for the MUTABLE DEADLINE, and the reason
+            // it is separate from race_probe above.
+            //
+            // race_probe proves TSan is looking at all. This one proves it is
+            // looking at the shape of access the deadline actually has: one
+            // thread storing a 64-bit integer while another polls it in a loop,
+            // which is exactly ReplaySearch::set_deadline_ns against
+            // ReplaySearch::deadline_passed. Written with a PLAIN int64 rather
+            // than an atomic, so under TSan it must report — and if it does
+            // not, a clean run over the real deadline says nothing, because the
+            // sanitizer was not able to see that pattern.
+            //
+            // Quarantined behind an explicit call. Nothing in the engine calls
+            // it and nothing may.
+            std::int64_t deadline = 0;
+            std::int64_t observed = 0;
+            {
+                py::gil_scoped_release release;
+                std::thread poller([&deadline, &observed, iterations] {
+                    for (int i = 0; i < iterations; ++i) {
+                        observed += deadline;
+                    }
+                });
+                for (int i = 0; i < iterations; ++i) {
+                    deadline = i;
+                }
+                poller.join();
+            }
+            return observed;
+        },
+        py::arg("iterations") = 200000,
+        "SANITIZER SELF-TEST for the C11c mutable deadline. One thread writes a plain "
+        "int64 while another reads it in a loop — the unsynchronised version of "
+        "set_deadline_ns() against the workers' abort-point poll.\n\n"
+        "race_probe proves ThreadSanitizer is looking; this proves it is looking at THIS "
+        "access pattern. A TSan build must report on it. Never called by the engine.");
 
     py::class_<GilProbe>(
         m, "GilProbe",

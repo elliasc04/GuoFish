@@ -1,0 +1,54 @@
+{
+ "rows": [
+  {
+   "mutation": "deadline-never-fires",
+   "test": "test_a_deadline_armed_before_the_search_ends_it_on_time",
+   "baseline_passed": true,
+   "mutated_passed": false,
+   "caught": true
+  },
+  {
+   "mutation": "deadline-never-fires",
+   "test": "test_the_deadline_is_settable_from_another_thread_mid_search",
+   "baseline_passed": true,
+   "mutated_passed": false,
+   "caught": true
+  },
+  {
+   "mutation": "deadline-never-fires",
+   "test": "test_clearing_the_deadline_returns_the_search_to_its_node_budget",
+   "baseline_passed": true,
+   "mutated_passed": false,
+   "caught": true
+  },
+  {
+   "mutation": "exhaustion-silent",
+   "test": "test_a_degraded_move_says_so_loudly_in_its_own_telemetry",
+   "baseline_passed": true,
+   "mutated_passed": false,
+   "caught": true
+  },
+  {
+   "mutation": "merge-the-sim-counts",
+   "test": "test_ponder_and_search_simulations_are_reported_separately",
+   "baseline_passed": true,
+   "mutated_passed": false,
+   "caught": true
+  },
+  {
+   "mutation": "arena-formula-halved",
+   "test": "test_the_arena_default_is_sixty_nodes_per_simulation_of_both_budgets",
+   "baseline_passed": true,
+   "mutated_passed": false,
+   "caught": true
+  },
+  {
+   "mutation": "coupling-unchecked",
+   "test": "test_a_pinned_ponder_cap_that_breaks_the_coupling_is_reported_not_refused",
+   "baseline_passed": true,
+   "mutated_passed": false,
+   "caught": true
+  }
+ ],
+ "golden_unchanged": true
+}

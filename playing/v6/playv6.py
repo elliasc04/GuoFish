@@ -122,7 +122,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import guofish_core  # noqa: E402
 
-DEFAULT_MODEL = REPO_ROOT / "models" / "guofish5_20M" / "v5_10.9M_best.pt"
+DEFAULT_MODEL = REPO_ROOT / "models" / "guofish5_90M" / "v5_10.9M_best.pt"
 DEFAULT_SWITCH_INTERVAL = guofish_core.DEFAULT_SWITCH_INTERVAL
 
 # The two host-side asset locations, restated from uci_wrapper_v5.py rather than
@@ -172,6 +172,43 @@ LEGACY_VALUE_SCALE = 290.6806
 def err(msg: str) -> None:
     """stderr, flushed. Never stdout: stdout is the UCI stream."""
     print(msg, file=sys.stderr, flush=True)
+
+
+def force_utf8_streams() -> str:
+    """Pin stdout and stderr to UTF-8. Returns what they were, for the log.
+
+    C11c, AND IT IS A CORRECTNESS FIX RATHER THAN TIDINESS.
+
+    On Windows, a Python process whose streams are PIPES picks its encoding from
+    the locale — cp1252 here — while every reader in this repo opens the
+    resulting file as UTF-8. The engine's own configuration lines have carried
+    em-dashes since C11b (`[book] opened <path> - <how>`), and cp1252 encodes
+    one as the single byte 0x97, which UTF-8 then decodes as U+FFFD.
+
+    That is not cosmetic. `tools/bench_provenance.py` matches those lines with a
+    regex containing a literal em-dash, and it is what
+    `require_recorded_state()` uses to decide whether a games table may be
+    PUBLISHED AT ALL. The C11c 20-game ponder smoke passed every one of its four
+    acceptance criteria and then failed its provenance check for this reason:
+    the run was sound and its artifact said the book state could not be
+    determined.
+
+    Called first thing in every entry point, before the reader thread and before
+    anything writes a line. stdout is separately kept ASCII-only by protocol —
+    UCI is a byte-oriented line protocol and a GUI is not obliged to decode
+    anything else — so this changes nothing there and fixes the stream that
+    carries prose.
+    """
+    before = f"stdout={getattr(sys.stdout, 'encoding', '?')} " \
+             f"stderr={getattr(sys.stderr, 'encoding', '?')}"
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):        # pragma: no cover
+            # A stream that is not a TextIOWrapper — a test harness's capture
+            # object, most likely. Nothing to do and nothing worth failing over.
+            pass
+    return before
 
 
 def apply_switch_interval(interval: float = DEFAULT_SWITCH_INTERVAL) -> tuple[float, float]:
@@ -317,7 +354,30 @@ class EngineConfig:
     max_tree_depth: int = 80
     cache_entries: int = 400_000
     cache_shards: int = 0          # 0 => the core's kDefaultCacheShards
-    arena_capacity: int = 1_200_000
+
+    # C11c. NODES PER ARENA, and `None` means "compute it from the budget".
+    #
+    # It was a hard 1,200,000 until C11c, which is a number that was right for
+    # the budget it was measured at and silently wrong for any other. Pondering
+    # makes that unacceptable rather than merely untidy: an unbounded ponder
+    # searches for as long as the opponent thinks, so the arena has to be sized
+    # against `sims_per_move + ponder_max_sims` and not against `sims_per_move`
+    # alone. See `arena_nodes` for the formula and the measured curve it fits.
+    #
+    # Still an explicit field, because no formula is provably right for every
+    # position and an operator must be able to overrule it. Setting it pins the
+    # value; leaving it None tracks the budget, which is what a
+    # `--sims 15000` run wants without also having to remember to raise this.
+    arena_capacity: Optional[int] = None
+
+    # C11c. The ceiling on a PONDER search's simulations, and `None` means
+    # "compute it from the budget and the decay". See `ponder_max_sims_resolved`.
+    #
+    # THE PRIMARY MECHANISM, with graceful arena exhaustion as the backstop
+    # rather than the other way round: a ponder has no budget of its own, so on
+    # a slow opponent clock it would otherwise fill any arena that exists.
+    ponder_max_sims: Optional[int] = None
+
     ponder_decay: float = 1.0
     verify_compaction: bool = False
 
@@ -389,6 +449,137 @@ class EngineConfig:
         """The tablebase directory this configuration would open."""
         return self.syzygy_path or DEFAULT_SYZYGY
 
+    # --- C11c: the budget, the ponder cap and the arena, in that order ------
+    #
+    # These three are ONE derivation and are written next to each other for that
+    # reason. Setting them independently is exactly how the Python reference
+    # reached 60,000 inherited ponder simulations against 2,000 fresh ones —
+    # scope E6's over-commit defect — and `describe()` prints all three on one
+    # line so a mismatched pair is visible before a game rather than after one.
+
+    @property
+    def sims_per_move(self) -> int:
+        """The MOST simulations one move can spend. The other two derive from it.
+
+        `fixed_sims` when a fixed-budget tournament has pinned one, else
+        `sim_cap`.
+
+        `sim_cap` RATHER THAN `default_sims`, AND THE DIFFERENCE WAS MEASURED
+        RATHER THAN ARGUED. `default_sims` (5,000) is what a move spends only
+        when the GUI supplies neither a clock nor a node count, which in a
+        tournament never happens; every timed search runs to `current +
+        sim_cap` and stops on the clock. Sizing off `default_sims` therefore
+        sizes for the one case that does not occur.
+
+        The measurement, from the first pipe drive of the C11c ponder machine
+        at `go ponder wtime 30000` + `ponderhit`, shipping defaults:
+
+            ponder phase      4,999 sims -> 158,504 nodes   31.7 nodes/sim
+            ponderhit phase  18,881 sims -> 599,995 nodes   31.8 nodes/sim
+
+        600,000 is exactly `60 x (default_sims + ponder_max_sims)`, and the
+        second row is it, to five digits: ONE ORDINARY PONDERHIT MOVE ON A 30 s
+        CLOCK EXHAUSTED THE ARENA at the shipping defaults. That is the
+        graceful-degradation path working, and it is not a state to ship in —
+        the backstop is for the position that beats the estimate, not for the
+        median move.
+
+        The cost of the wider base is address space and nothing else; see
+        `arena_bytes`, which the startup line prints so the trade is visible
+        before a game rather than after one. Recorded in DECISIONS.md, C11c,
+        because the brief specifies the formula and not which quantity feeds it.
+        """
+        return self.fixed_sims if self.fixed_sims is not None else self.sim_cap
+
+    @property
+    def ponder_max_sims_resolved(self) -> int:
+        """The ponder simulation ceiling: `ponder_max_sims`, or the computed one.
+
+            ponder_max_sims = sims_per_move / ponder_decay
+
+        TIED TO THE DECAY, because the decay is the knob it interacts with.
+        C8's inheritance decay exists so that a fresh search can overturn a
+        verdict the ponder inherited, and that only works while the decayed
+        inherited weight is comparable to the fresh budget:
+
+            ponder_decay x ponder_max_sims  <=  sims_per_move
+
+        which rearranges to the line above and holds with equality at the
+        computed default. At the C8 default decay of 1.0 that is 1x
+        `sims_per_move`; at the 0.25 the knob exists to be set to, 4x.
+
+        The alternative — a hardcoded multiplier — cannot be tuned, cannot
+        follow the deployment budget, and above all does not say WHY its
+        multiplier is the one it is. `coupling_holds` asserts the inequality and
+        `describe()` prints both sides.
+        """
+        if self.ponder_max_sims is not None:
+            return self.ponder_max_sims
+        return max(1, int(math.ceil(self.sims_per_move / self.ponder_decay)))
+
+    @property
+    def coupling_holds(self) -> bool:
+        """Does `ponder_decay x ponder_max_sims <= sims_per_move` still hold?
+
+        True by construction at the computed default. False is legal — an
+        operator may pin `ponder_max_sims` above it deliberately — and is
+        reported loudly rather than refused, because the consequence is a
+        weaker search rather than a broken one, and refusing would make the
+        knob unusable for the experiment that would justify changing it.
+        """
+        # A tolerance of one simulation, because the computed default rounds up.
+        return (self.ponder_decay * self.ponder_max_sims_resolved
+                <= self.sims_per_move + 1)
+
+    @property
+    def arena_nodes(self) -> int:
+        """Nodes per arena: `arena_capacity`, or the computed default.
+
+            arena_nodes = 60 x (sims_per_move + ponder_max_sims)
+
+        60 NODES PER SIMULATION, from the measured curve and deliberately from
+        its CONSERVATIVE end. Three points, mildly sublinear because more
+        simulations revisit existing nodes rather than creating new ones:
+
+            C8            2,000 sims ->    77,800 nodes   38.9 nodes/sim
+            C8            8,000 sims ->   317,600 nodes   39.7 nodes/sim
+            playtesting  37,000 sims -> <=1,200,000 nodes  <=32.4 nodes/sim
+
+        Fitting the low-sim 40 and multiplying by 1.5 for branching variance
+        gives 60, which predicts 1.48M at 37k sims against the 1.2M that was
+        observed to be sufficient — 23% headroom where it was measured, and
+        growing at larger budgets because of the sublinearity.
+
+        DELIBERATELY NOT TUNED TIGHTLY. The asymmetry is total: over-provisioning
+        costs tens of megabytes of address space, under-provisioning costs a
+        game. Graceful degradation (`SearchOutcome.arena_exhausted`) is the
+        backstop for the position that beats the estimate anyway, and
+        `tools/bench_c11c_arena.py` reports the measured high-water against this
+        prediction rather than trusting it.
+        """
+        if self.arena_capacity is not None:
+            return self.arena_capacity
+        return 60 * (self.sims_per_move + self.ponder_max_sims_resolved)
+
+    @property
+    def arena_bytes(self) -> int:
+        """Bytes BOTH ping-pong arenas reserve at `arena_nodes`.
+
+        Both, because both are live: `apply_move` compacts the surviving subtree
+        into the standby arena and swaps, so the peak occupancy is the moment
+        the two overlap. Reporting one arena would understate the footprint by
+        exactly a factor of two, and the startup line exists to be read by
+        somebody deciding whether a number is absurd.
+
+        The per-node width comes from the core rather than from a constant here:
+        the SoA arena's field widths are its business and a duplicated 40 would
+        be wrong the first time an accumulator changed.
+        """
+        per_node = (guofish_core.NodeArenaQ32.bytes_per_node
+                    + 4    # parent_, one uint32 per node
+                    + 2)   # raw_move_, one uint16 per node
+        return 2 * per_node * self.arena_nodes
+
     @property
     def in_flight(self) -> int:
         """K = max_outstanding / threads, at least 1.
@@ -442,9 +633,18 @@ class EngineConfig:
             raise ConfigError(f"max_tree_depth must be >= 1, got {self.max_tree_depth}")
         if self.cache_entries < 0:
             raise ConfigError(f"cache_entries must be >= 0, got {self.cache_entries}")
-        if self.arena_capacity < 1024:
+        # C11c. `None` is "compute it" and is the default; a pinned value is
+        # still refused below 1024. The floor is not arbitrary: a position has
+        # at most 218 legal moves, and `expand_root` is the ONE expansion that
+        # may not degrade gracefully — a root with no children cannot produce a
+        # move at all — so the arena has to be able to hold the root plus its
+        # widest possible child block with room to spare.
+        if self.arena_capacity is not None and self.arena_capacity < 1024:
             raise ConfigError(
                 f"arena_capacity must be >= 1024, got {self.arena_capacity}")
+        if self.ponder_max_sims is not None and self.ponder_max_sims < 1:
+            raise ConfigError(
+                f"ponder_max_sims must be >= 1, got {self.ponder_max_sims}")
         if not (0.0 < self.ponder_decay <= 1.0):
             raise ConfigError(
                 f"ponder_decay must lie in (0, 1], got {self.ponder_decay}")
@@ -505,7 +705,9 @@ class EngineConfig:
             fpu_tree=self.fpu_tree,
             virtual_loss=self.virtual_loss,
             max_tree_depth=self.max_tree_depth,
-            arena_capacity=self.arena_capacity,
+            # C11c. The RESOLVED value, not the field: `None` means "compute it
+            # from the budget" and the core takes a number. See `arena_nodes`.
+            arena_capacity=self.arena_nodes,
             cache_slots=self.cache_entries,
             ponder_decay=self.ponder_decay,
             verify_compaction=self.verify_compaction,
@@ -541,6 +743,16 @@ class EngineConfig:
             out[f.name] = str(value) if isinstance(value, Path) else value
         out["in_flight"] = self.in_flight
         out["effective_outstanding"] = self.effective_outstanding
+        # C11c. THE RESOLVED VALUES BESIDE THE DECLARED ONES. `arena_capacity=None`
+        # and `ponder_max_sims=None` say what was ASKED FOR; these say what the
+        # engine will actually run with, which is the only one of the two a
+        # benchmark artifact can be reconciled against. Same discipline as
+        # `effective_outstanding` above.
+        out["sims_per_move"] = self.sims_per_move
+        out["ponder_max_sims_resolved"] = self.ponder_max_sims_resolved
+        out["arena_nodes"] = self.arena_nodes
+        out["arena_mb"] = round(self.arena_bytes / (1024 * 1024), 1)
+        out["coupling_holds"] = self.coupling_holds
         return out
 
     def as_kv(self) -> str:
@@ -583,16 +795,53 @@ class EngineConfig:
                'being sharpened/flattened at the root and at every interior node)'} "
             f"dirichlet_epsilon={self.dirichlet_epsilon:g} "
             f"dirichlet_alpha={self.dirichlet_alpha:g}",
+            # C11c. THE LINE THE BRIEF REQUIRES TO BE READABLE AT A GLANCE, and
+            # the reason it carries the whole derivation rather than just the
+            # answer: `arena: 2 x 1,500k nodes (111.6 MB)` is checkable by
+            # somebody who knows neither the formula nor the budget, and a
+            # number that is absurd or that is tiny should be catchable by
+            # reading the launch line rather than by watching a game go wrong.
             f"[config] memory     : cache_entries={self.cache_entries} "
             f"cache_shards={self.cache_shards or 'default'} "
-            f"arena_capacity={self.arena_capacity}",
+            f"arena: 2 x {self.arena_nodes:,} nodes "
+            f"({self.arena_bytes / (1024 * 1024):.1f} MB total) "
+            f"[{'explicit' if self.arena_capacity is not None else f'computed 60 x ({self.sims_per_move:,} + {self.ponder_max_sims_resolved:,})'}]"
+            # The arena COMMITS rather than reserves — measured at 268 MB RSS
+            # for one 7.2M-node arena — so a footprint this size is real memory
+            # and not address space. Warned rather than refused: it is a legal
+            # configuration and the operator may have meant it, but a
+            # PonderDecay of 0.25 quadruples the ponder cap and therefore this
+            # number, which is not obvious from the option that caused it.
+            + (f"  *** WARNING: {self.arena_bytes / (1024 ** 3):.2f} GB is a "
+               f"lot of committed memory. It is real RSS, not reserved address "
+               f"space. Lower SimCap, raise PonderDecay, or pin ArenaCapacity "
+               f"explicitly. ***" if self.arena_bytes > (1 << 30) else ""),
+            # C11c. BOTH VALUES ON ONE LINE, WITH THE INEQUALITY THEY HAVE TO
+            # SATISFY. Setting the ponder cap and the decay independently is how
+            # the reference reached 60,000 inherited simulations against 2,000
+            # fresh ones — scope E6's over-commit defect, which this port is
+            # deliberately fixing rather than reproducing — and the defence
+            # against re-introducing it is that a mismatched pair is visible
+            # before a game rather than inferred after one.
+            f"[config] ponder     : ponder={self.ponder} "
+            f"sims_per_move={self.sims_per_move:,} "
+            f"ponder_max_sims={self.ponder_max_sims_resolved:,} "
+            f"[{'explicit' if self.ponder_max_sims is not None else 'computed sims_per_move/decay'}] "
+            f"ponder_decay={self.ponder_decay:g} "
+            f"coupling: decay x ponder_max_sims = "
+            f"{self.ponder_decay * self.ponder_max_sims_resolved:,.0f} "
+            f"{'<=' if self.coupling_holds else '>'} sims_per_move "
+            f"{self.sims_per_move:,} "
+            f"{'OK' if self.coupling_holds else 'VIOLATED: a ponder can out-weigh the fresh search it hands its tree to'}",
             f"[config] budget     : default_sims={self.default_sims} "
             f"sim_cap={self.sim_cap} fixed_sims={self.fixed_sims} "
             f"slice_seconds={self.slice_seconds:g} "
             f"move_overhead_ms={self.move_overhead_ms}",
-            f"[config] host       : ponder={self.ponder} "
-            f"ponder_decay={self.ponder_decay:g} "
-            f"verify_compaction={self.verify_compaction}",
+            # `ponder` and `ponder_decay` moved to the `[config] ponder` line
+            # above at C11c, where they sit beside the two quantities they are
+            # coupled to. They are not repeated here: two lines carrying the
+            # same field is how the two stop agreeing.
+            f"[config] host       : verify_compaction={self.verify_compaction}",
             # THE LINE A BENCHMARK ARTIFACT HAS TO CARRY. Both features bypass
             # MCTS, so a strength or throughput number measured with either on
             # is measuring something other than this port's search — and the
@@ -682,6 +931,71 @@ class SearchOutcome:
     # ELO afterwards.
     source: str = "search"
 
+    # --- C11c: pondering ----------------------------------------------------
+    #
+    # `delivered` KEEPS ITS MEANING — what THIS search_move call backed up — and
+    # `ponder_sims` is what a preceding ponder phase contributed to the same
+    # tree. They are never merged into one figure, which is the delivered-sims
+    # discipline that has held since C11 applied to the one new way of splitting
+    # the work.
+    #
+    # WHY THEY MUST STAY APART. Budget accounting starts at the `ponderhit`
+    # instant: ponder simulations ran on the OPPONENT's clock and are a bonus,
+    # not a draw against this move's allocation. A merged count would make the
+    # engine look 2-3x faster than it is on a hit and would make its sims/s
+    # incomparable with a ponder-off run — which is exactly the arm Gate 5 has
+    # to be measured against, since the 2687.7 anchor ran with ponder off.
+    ponder_sims: int = 0
+    ponder_wall_s: float = 0.0
+
+    # --- C11c: graceful arena exhaustion ------------------------------------
+    #
+    # `arena_exhausted` is what makes `delivered < requested` a legitimate
+    # outcome rather than a broken row. A benchmark harness must consult it and
+    # REJECT the row; a game log must print it loudly, because a silent
+    # degradation that only shows up as unexplained weakness is worse than a
+    # crash — nobody investigates a crash's absence.
+    arena_exhausted: bool = False
+    arena_exhausted_at: int = 0
+    arena_high_water: int = 0
+    arena_capacity: int = 0
+    # Whether the C++ mutable deadline, rather than the Python slice loop,
+    # ended the last slice. On a ponderhit-converted search this is the normal
+    # ending and its absence is the interesting case.
+    deadline_hit: bool = False
+
+    @property
+    def search_sims(self) -> int:
+        """Simulations delivered SINCE the ponderhit. An alias for `delivered`.
+
+        Named because the brief names it, and because `delivered` beside
+        `ponder_sims` reads ambiguously in a report while `search_sims` beside
+        `ponder_sims` does not.
+        """
+        return self.delivered
+
+    @property
+    def total_sims(self) -> int:
+        """Every simulation in the tree this move was decided from.
+
+        Reported ALONGSIDE the two, never instead of them: it is the right
+        number for "how much search backs this move" and the wrong one for
+        every throughput figure.
+        """
+        return self.ponder_sims + self.delivered
+
+    @property
+    def arena_utilisation(self) -> float:
+        """Peak arena occupancy as a fraction of capacity. 0.0 when unknown.
+
+        The number the C11c sizing verification reports: the formula predicts
+        `arena_nodes` and this says what was actually needed, so a safety factor
+        nobody has seen engage stops being an assumption.
+        """
+        if self.arena_capacity <= 0:
+            return 0.0
+        return self.arena_high_water / self.arena_capacity
+
     @property
     def bypassed(self) -> bool:
         """True when MCTS did not run. `delivered` is 0 and `sims_per_s` is 0/0.
@@ -744,18 +1058,35 @@ class SearchOutcome:
                     f"best={self.best_move} wall={self.wall_s * 1000:.1f}ms "
                     f"delivered=0 nominal={nominal} "
                     f"budget_source={self.budget_source} reason={self.reason}")
+        # C11c. The two sim counts are always both present and are never added
+        # together. `ponder_sims=0` on a move that was not pondered is a zero
+        # that means what it says.
+        ponder = (f"ponder_sims={self.ponder_sims} search_sims={self.search_sims} "
+                  f"total_sims={self.total_sims} "
+                  f"ponder_wall={self.ponder_wall_s * 1000:.1f}ms ")
+        # LOUD, and only when it fired. Scope: a degraded move must be
+        # investigable from the run's own log without anybody having gone
+        # looking for it first.
+        degraded = ("" if not self.arena_exhausted else
+                    f"ARENA_EXHAUSTED at={self.arena_exhausted_at} "
+                    f"(delivered {self.delivered} of the budget; this move is "
+                    f"NOT admissible as a benchmark row) ")
         return (f"[search] source={self.source} delivered={self.delivered} "
                 f"nominal={nominal} "
                 f"inherited={self.inherited} slices={self.slices} "
                 f"wall={self.wall_s * 1000:.1f}ms "
+                f"{ponder}{degraded}"
                 f"delivered_sims_per_s={self.sims_per_s:,.0f} "
                 f"nominal_sims_per_s={nominal_rate} "
                 f"inflation={inflation} "
                 f"root_visits={self.root_visits} nodes={self.nodes} "
+                f"arena_hw={self.arena_high_water}/{self.arena_capacity} "
+                f"({self.arena_utilisation:.1%}) "
                 f"eval_rows={self.eval_rows} eval_batches={self.eval_batches} "
                 f"cache_hits={self.cache_hits} cache_misses={self.cache_misses} "
                 f"best={self.best_move} score_cp={self.score_cp} "
                 f"budget_source={self.budget_source} "
+                f"deadline_hit={self.deadline_hit} "
                 f"stopped={self.stopped} reason={self.reason}")
 
 
@@ -1404,10 +1735,40 @@ class Engine:
 
     # --- the search -------------------------------------------------------
 
+    def interrupt_slice(self) -> None:
+        """Abort the RUNNING slice, from another thread. C11c.
+
+        THE ONLY ENGINE METHOD MEANT TO BE CALLED WHILE A SEARCH IS IN FLIGHT,
+        and it does exactly one thing: arms the C++ mutable deadline in the
+        past, which the workers observe at their abort point within a single
+        simulation.
+
+        It does not decide anything. The slice loop still re-reads
+        `should_stop()` and the clock afterwards and is the only thing that
+        chooses whether to continue — so an interrupt that races a slice
+        boundary costs at most one nearly-empty slice, never a wrong decision.
+
+        WHY IT EXISTS. Before C11c the wrapper's `stop` latency was bounded
+        below by `slice_seconds` (50 ms), because nothing could reach a search
+        already inside `search_parallel`. That was tolerable for `stop` on a
+        clock the engine had budgeted for; it is not tolerable on the ponder
+        miss path, where a `stop` sits on the critical path of the opponent
+        having already moved. It is also how `ponderhit` gets the running
+        search to hand control back so the timed phase can start ON the tree
+        the ponder built.
+
+        Safe from any thread: `set_deadline_in` is one atomic store, takes no
+        lock, and does not release the GIL. Harmless when no search is running
+        — the next `search_move` clears the deadline before its first slice.
+        """
+        if self.search is not None:
+            self.search.set_deadline_in(0.0)
+
     def search_move(self, *, budget: int, deadline: Optional[float] = None,
                     nominal: Optional[int] = None, budget_source: str = "nodes",
                     should_stop: Optional[Callable[[], bool]] = None,
-                    on_slice: Optional[Callable[["SearchOutcome"], None]] = None
+                    on_slice: Optional[Callable[["SearchOutcome"], None]] = None,
+                    allow_bypass: bool = True, count_decision: bool = True
                     ) -> SearchOutcome:
         """Run to `budget` root visits, in slices, honouring clock and stop flag.
 
@@ -1427,6 +1788,25 @@ class Engine:
         partial outcome after each slice, for `info` emission — it runs on this
         thread with no search in flight, which is the only moment Python may run
         without competing with the dispatcher for the GIL.
+
+        C11c ADDS TWO FLAGS AND ONE CLOCK.
+
+        `allow_bypass=False` skips the book/tablebase probe. The PONDER phase
+        passes it, because the caller has already probed the predicted position
+        and declined to ponder if either answered — probing twice would be the
+        same lookup charged to a search that is not going to use it.
+
+        `count_decision=False` keeps this call out of `decision_counts`. A
+        ponder decides no move, so tallying it would double-count every
+        pondered move against the per-game figures a benchmark artifact carries.
+
+        THE CLOCK: `deadline` is now armed on the C++ side as well, so it aborts
+        the slice that is RUNNING rather than only preventing the next one. The
+        Python deadline still owns the decision and the reporting; see
+        `interrupt_slice` and `ReplaySearch::set_deadline_in`. It is cleared in
+        a `finally`, because the C++ deadline deliberately outlives the
+        `search_parallel` call that observed it and a stale one would leave the
+        next search pre-expired.
         """
         self.ensure_ready()
         if self._base_fen is None:
@@ -1440,7 +1820,7 @@ class Engine:
         # about a search that did not happen. `delivered` is 0 by construction,
         # `source` says which lookup answered, and `bypassed` is what every
         # aggregate filters on.
-        if self._board is not None:
+        if allow_bypass and self._board is not None:
             started = time.perf_counter()
             uci, source = self.bypass_move(self._board)
             if uci is not None:
@@ -1460,69 +1840,118 @@ class Engine:
         eval_batches = 0
         reason = "budget"
         stopped = False
+        # C11c. ORed across the slices: "this MOVE degraded" is the statement a
+        # game log and a benchmark row both need, and the core clears its own
+        # flag at the top of every `search_parallel`.
+        exhausted = False
+        exhausted_at = 0
+        deadline_hit = False
         started = time.perf_counter()
         # Seeded from the shipping configuration's measured rate so the first
         # slice is already about the right size; every slice after it uses this
         # search's own measurement.
         rate = 14_000.0
 
-        while True:
-            current = int(self.search.root_visits)
-            if current >= budget:
-                reason = "budget"
-                break
-            if should_stop is not None and should_stop():
-                reason, stopped = "stop", True
-                break
-            now = time.perf_counter()
-            if deadline is not None and now >= deadline:
-                reason = "time"
-                break
+        # C11c. Arm the C++ mutable deadline from the Python one, so the clock
+        # can end the slice that is RUNNING. Cleared unconditionally first: the
+        # deadline outlives the call that observed it by design, so a previous
+        # move's expired deadline would otherwise abort this one's first slice.
+        self.search.clear_deadline()
+        if deadline is not None:
+            self.search.set_deadline_in(deadline - time.monotonic())
 
-            chunk = max(cfg.min_slice_sims, int(rate * cfg.slice_seconds))
-            if deadline is not None:
-                # Do not start a slice that cannot finish inside the deadline;
-                # shrink it instead. `min_slice_sims` is the floor, so a nearly
-                # expired clock still runs one small slice rather than spinning.
-                affordable = int(rate * max(0.0, deadline - now))
-                chunk = max(cfg.min_slice_sims, min(chunk, affordable))
-            target = min(budget, current + chunk)
+        try:
+            while True:
+                current = int(self.search.root_visits)
+                if current >= budget:
+                    reason = "budget"
+                    break
+                if should_stop is not None and should_stop():
+                    reason, stopped = "stop", True
+                    break
+                now = time.perf_counter()
+                if deadline is not None and now >= deadline:
+                    reason = "time"
+                    break
 
-            self.search.search_parallel(target, parallel)
-            par = self.search.parallel_stats()
-            evals = self.search.eval_stats()
-            delivered += int(par["delivered"])
-            eval_rows += int(evals["rows"])
-            eval_batches += int(evals["batches"])
-            slices += 1
-            elapsed = time.perf_counter() - started
-            if delivered > 0 and elapsed > 0:
-                rate = delivered / elapsed
+                chunk = max(cfg.min_slice_sims, int(rate * cfg.slice_seconds))
+                if deadline is not None:
+                    # Do not start a slice that cannot finish inside the
+                    # deadline; shrink it instead. `min_slice_sims` is the
+                    # floor, so a nearly expired clock still runs one small
+                    # slice rather than spinning.
+                    affordable = int(rate * max(0.0, deadline - now))
+                    chunk = max(cfg.min_slice_sims, min(chunk, affordable))
+                target = min(budget, current + chunk)
 
-            if on_slice is not None:
-                on_slice(self._outcome(nominal, budget_source, inherited,
-                                       delivered, elapsed, slices, eval_rows,
-                                       eval_batches, stopped=False,
-                                       reason="running", with_pv=False))
+                self.search.search_parallel(target, parallel)
+                par = self.search.parallel_stats()
+                evals = self.search.eval_stats()
+                delivered += int(par["delivered"])
+                eval_rows += int(evals["rows"])
+                eval_batches += int(evals["batches"])
+                slices += 1
+                if par["arena_exhausted"]:
+                    exhausted = True
+                    exhausted_at = exhausted_at or int(par["arena_exhausted_at"])
+                deadline_hit = bool(par["deadline_hit"])
+                elapsed = time.perf_counter() - started
+                if delivered > 0 and elapsed > 0:
+                    rate = delivered / elapsed
 
-            # The depth-1 mate short-circuit ends the search wherever it fired,
-            # exactly as the reference's completion_event does. Without this the
-            # next slice would clear `mating_move` and keep going, and the root
-            # would never reach the target because the hack keeps re-firing.
-            if self.search.mating_move is not None:
-                reason = "mate"
-                break
-            if int(par["delivered"]) == 0 and int(par["requested"]) > 0:
-                # Nothing moved: a root with no legal continuation left, or a
-                # target the core declined. Reporting it beats spinning.
-                reason = "stalled"
-                break
+                if on_slice is not None:
+                    on_slice(self._outcome(nominal, budget_source, inherited,
+                                           delivered, elapsed, slices, eval_rows,
+                                           eval_batches, stopped=False,
+                                           reason="running", with_pv=False,
+                                           exhausted=exhausted,
+                                           exhausted_at=exhausted_at,
+                                           deadline_hit=deadline_hit))
 
-        self.decision_counts["search"] = self.decision_counts.get("search", 0) + 1
+                # The depth-1 mate short-circuit ends the search wherever it
+                # fired, exactly as the reference's completion_event does.
+                # Without this the next slice would clear `mating_move` and keep
+                # going, and the root would never reach the target because the
+                # hack keeps re-firing.
+                if self.search.mating_move is not None:
+                    reason = "mate"
+                    break
+                # C11c. AHEAD OF THE `stalled` CHECK, and that ordering is the
+                # whole of it. An exhausted arena delivers a short slice and
+                # then a zero one, so a loop that tested `stalled` first would
+                # report "stalled" for a condition that has a name, a cause and
+                # a remedy — and `arena_exhausted` would reach the outcome
+                # attached to the wrong reason string.
+                if exhausted:
+                    reason = "arena_exhausted"
+                    break
+                if deadline_hit:
+                    # The clock ended the slice. The loop's own deadline test
+                    # above will agree on the next pass; breaking here just
+                    # avoids one more nearly-empty slice.
+                    reason = "time"
+                    break
+                if int(par["delivered"]) == 0 and int(par["requested"]) > 0:
+                    # Nothing moved: a root with no legal continuation left, or
+                    # a target the core declined. Reporting it beats spinning.
+                    reason = "stalled"
+                    break
+        finally:
+            # ALWAYS. See the docstring: the C++ deadline is deliberately not
+            # reset by `search_parallel`, so whoever armed it has to disarm it
+            # or the next search starts pre-expired. `interrupt_slice` may have
+            # armed it from another thread, which is exactly the case a
+            # `finally` covers and an `if deadline is not None` would not.
+            self.search.clear_deadline()
+
+        if count_decision:
+            self.decision_counts["search"] = self.decision_counts.get("search", 0) + 1
         return self._outcome(nominal, budget_source, inherited, delivered,
                              time.perf_counter() - started, slices,
                              eval_rows, eval_batches,
-                             stopped=stopped, reason=reason, with_pv=True)
+                             stopped=stopped, reason=reason, with_pv=True,
+                             exhausted=exhausted, exhausted_at=exhausted_at,
+                             deadline_hit=deadline_hit)
 
     # --- reporting internals ---------------------------------------------
 
@@ -1567,7 +1996,9 @@ class Engine:
     def _outcome(self, nominal: Optional[int], budget_source: str,
                  inherited: int, delivered: int, wall: float, slices: int,
                  eval_rows: int, eval_batches: int, *,
-                 stopped: bool, reason: str, with_pv: bool) -> SearchOutcome:
+                 stopped: bool, reason: str, with_pv: bool,
+                 exhausted: bool = False, exhausted_at: int = 0,
+                 deadline_hit: bool = False) -> SearchOutcome:
         best = self.search.best_move
         mating = self.search.mating_move
         cache = self.search.cache_stats()
@@ -1609,6 +2040,14 @@ class Engine:
             stopped=stopped,
             reason=reason,
             budget_source=budget_source,
+            arena_exhausted=exhausted,
+            arena_exhausted_at=exhausted_at,
+            # Read off the LIVE tree rather than off the last slice's stats:
+            # `high_water` survives resets and covers both ping-pong arenas, so
+            # this is the peak the memory budget is actually about.
+            arena_high_water=int(self.search.arena_high_water),
+            arena_capacity=int(self.search.arena_capacity),
+            deadline_hit=deadline_hit,
         )
 
     def _principal_variation(self, best: Optional[str], max_plies: int = 12
@@ -1778,7 +2217,37 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                    help="transposition-cache slots; 0 disables the cache")
     g.add_argument("--cache-shards", type=int, default=EngineConfig.cache_shards,
                    help="0 uses the core's default shard count")
-    g.add_argument("--arena-capacity", type=int, default=EngineConfig.arena_capacity)
+    g.add_argument("--arena-capacity", type=int, default=None,
+                   help="nodes per arena, BOTH halves of the ping-pong pair "
+                        "being reserved. Omit for the computed default "
+                        "60 x (sims_per_move + ponder_max_sims), which tracks "
+                        "the budget instead of having to be remembered "
+                        "alongside it; the resolved value and its MB footprint "
+                        "are on the [config] memory line")
+    # C11c. HERE RATHER THAN IN uci_wrapper_v6.main(), which is where it lived
+    # until this chunk. `ponder` is an `EngineConfig` field and this function's
+    # contract is "the full EngineConfig surface as command-line flags", so the
+    # wrapper defining its own was always the anomaly — and it left
+    # `playv6_interactive` with no `--ponder` at all, which was invisible while
+    # the flag did nothing there.
+    #
+    # It stopped being invisible the moment `--ponder-max-sims` was added:
+    # argparse's prefix matching turned a bare `--ponder` into "ambiguous
+    # option: could match --ponder-max-sims, --ponder-decay". Defining it
+    # exactly, once, resolves the prefix and gives all three entry points the
+    # same flag.
+    g.add_argument("--ponder", action="store_true", default=EngineConfig.ponder,
+                   help="advertise and honour pondering. Over UCI that is the "
+                        "`go ponder`/`ponderhit` handshake; in the interactive "
+                        "frontend it searches the CURRENT position while you "
+                        "think. OFF by default: pondering changes the time "
+                        "model rather than move selection, and Gate 5 must "
+                        "match the ponder-off anchor")
+    g.add_argument("--ponder-max-sims", type=int, default=None,
+                   help="ceiling on a ponder search's simulations. Omit for the "
+                        "computed default sims_per_move / ponder_decay, which "
+                        "is the value that keeps a pondered tree from "
+                        "out-weighing the fresh search it is handed to")
     g.add_argument("--ponder-decay", type=float, default=EngineConfig.ponder_decay)
     g.add_argument("--verify-compaction", action="store_true", default=False)
 
@@ -1836,6 +2305,11 @@ def _analyse(engine: Engine, fen: str, moves: list[str], budget: int) -> SearchO
 
 def main(argv: Optional[list[str]] = None) -> int:
     # FIRST STATEMENT, before any thread exists. See apply_switch_interval.
+    # C11c. Before any line is written: the streams are pipes under a
+    # harness and Windows picks cp1252 for them, while every reader in
+    # this repo opens the captured log as UTF-8. See
+    # playv6.force_utf8_streams for the run this cost a verdict.
+    force_utf8_streams()
     before, after = apply_switch_interval()
 
     parser = argparse.ArgumentParser(
