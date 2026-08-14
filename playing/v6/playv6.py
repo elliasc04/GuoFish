@@ -324,6 +324,19 @@ class EngineConfig:
     pin: bool = True
     switch_interval: float = DEFAULT_SWITCH_INTERVAL
 
+    # C12b. THE ADOPTION HAPPENS HERE, which is why this default is True while
+    # `TorchEvaluator`'s is False. The library default keeps C10/C10b's
+    # acceptance tests comparing the forward they certified; the ENGINE — the
+    # thing that plays games and the thing Gate 4 and Gate 5 measure — ships
+    # Inductor, because ~1.19x on fresh-root searches is worth having and the
+    # numerics it costs are re-certified by Gate 2' rather than lost.
+    #
+    # `compile=False` is a real fallback and stays one: it reproduces tag
+    # GUOFISH_NUMERICS_BASELINE bit-exactly (asserted in
+    # tests/test_c12b_gate2prime.py), so a regression can be bisected against it
+    # rather than argued about, in the same spirit as `graphs=` and `pin=`.
+    compile: bool = True
+
     # An explicit centipawn calibration for `q_to_centipawns` to invert. None
     # means "resolve it normally" — the checkpoint's own value if it has one,
     # else LEGACY_VALUE_SCALE. See `Engine._resolve_value_scale`.
@@ -781,7 +794,9 @@ class EngineConfig:
             f"value_scale="
             f"{f'checkpoint, else {LEGACY_VALUE_SCALE:.4f}' if self.value_scale is None else f'{self.value_scale:.4f} (OVERRIDE)'}",
             f"[config] evaluator  : max_batch={self.max_batch} graphs={self.graphs} "
-            f"pin={self.pin} switch_interval={self.switch_interval:g}",
+            f"compile={self.compile} pin={self.pin} "
+            f"switch_interval={self.switch_interval:g}"
+            f"{'' if self.compile else ' (EAGER NUMERICS BASELINE)'}",
             f"[config] parallel   : threads(W)={self.threads} in_flight(K)={self.in_flight} "
             f"max_outstanding={self.max_outstanding} "
             f"(effective W*K={self.effective_outstanding}) affinity={self.affinity}",
@@ -1221,7 +1236,8 @@ class Engine:
 
         self.evaluator = live_evaluator.TorchEvaluator(
             self.model, self.device, cfg.max_batch,
-            switch_interval=cfg.switch_interval, pin=cfg.pin, graphs=cfg.graphs)
+            switch_interval=cfg.switch_interval, pin=cfg.pin, graphs=cfg.graphs,
+            compile=cfg.compile)
         self.search = guofish_core.ReplaySearchQ32(cfg.to_search_config())
         self.search.set_evaluator(self.evaluator.core)
         self._ready = True
@@ -2173,6 +2189,11 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                         f"(default: {EngineConfig.max_batch}, the measured knee)")
     g.add_argument("--no-graphs", dest="graphs", action="store_false", default=True,
                    help="run the eager forward instead of the captured CUDA graph")
+    g.add_argument("--no-compile", dest="compile", action="store_false", default=True,
+                   help="capture the UNFUSED eager ATen forward instead of the "
+                        "Inductor-codegen'd one — i.e. run tag "
+                        "GUOFISH_NUMERICS_BASELINE's numerics (C12b). Slower on "
+                        "fresh roots; bit-exact against the frozen baseline")
     g.add_argument("--no-pin", dest="pin", action="store_false", default=True,
                    help="do not page-lock the boundary buffers")
     g.add_argument("--switch-interval", type=float, default=DEFAULT_SWITCH_INTERVAL,

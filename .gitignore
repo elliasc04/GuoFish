@@ -18,8 +18,10 @@ coverage/
 /docs
 /cmake-build-debug
 /golden
+/baseline
 /runs/capacity_suite
 /runs/c12
+/runs/c12b
 
 # --- GuoFish multiPV data pipeline ---
 # Raw Lichess eval dump (~21GB) and any decompressed/derived form. Never committed.

@@ -2289,3 +2289,358 @@ at each of shapes 8, 16, 24, 32, 48, 64, 96, 128.
 * Gate 4 rows report **delivered** simulations and assert `delivered == requested`,
   `delivered > 0`, `vloss_total == 0`, zero conservation failures and
   `arena_exhausted == false` before the row is admitted.
+
+## C12b — Inductor adopted, Gate 2' re-based, and the gate that did not pass
+
+Every figure here is on **`models/guofish5_90M/v5_10.9M_best.pt`** — the checkpoint the
+engine ships (`playv6.DEFAULT_MODEL`), not the 20M-corpus net the golden gates are anchored
+to. Same v5 architecture (10,887,681 parameters, 68 tokens, `d_model` 384 x 6), so the
+captured ladder is unchanged and only the weights differ. README_BUILD.md's Golden data
+section carries the full anchoring table.
+
+**Gate 2' passes as ruled, having been reported failed as briefed.** The throughput,
+determinism and no-recompilation criteria are met outright. The move-agreement criterion
+missed the briefed 99% at 98.65%; the owner ruled 98% sufficient after adjudicating the
+decisive disagreements against Stockfish. C12b-6 has the numbers, the measurement is
+unchanged, and DECISIONS.md has the sequencing.
+
+### C12b-1 — Default-mode `torch.compile` can be captured by the C10b machinery
+
+The brief asks for this to be reported as a finding if it could not be. It can.
+
+`torch.compile(model, dynamic=False)` in **default mode** — Inductor codegen, no
+compile-owned cudagraphs — captured by the existing `pad_to` / static-buffer / `replay`
+machinery, at every one of the nine shipped shapes. `mode="reduce-overhead"` is not used
+and must not be: it brings Inductor's own cudagraph trees, which would replace the padding
+and staleness machinery that `tools/drill_c10b_graphs.py` bites on.
+
+| property | result |
+|---|---|
+| shapes captured | 9 of 9 (`1, 8, 16, 24, 32, 48, 64, 96, 128`) |
+| captured replay vs un-captured compiled call | **0 differing policy words** at every shape |
+| dynamo frames compiled during capture | **0** |
+| warmup rounds to convergence | **2 per shape** — one compiles, one confirms |
+
+Two settings are required rather than preferred, and both are set by `configure_inductor()`:
+
+* **`use_static_cuda_launcher = False`** — with torch 2.8.0+cu129 / triton 3.4.0 on this
+  RTX 5070 the static launcher raises `OverflowError: Python int too large to convert to C
+  long` on the first Inductor kernel. C10b hit the same thing.
+* **`triton.autotune_pointwise = False`** — see C12b-2.
+
+### C12b-2 — Determinism, and why the autotune cache is removed rather than pinned
+
+The brief requires bit-identical priors across runs and asks for the autotune cache to be
+pinned or shipped. Measured, the cache is the hazard, so it is deleted instead of pinned.
+
+| configuration | `.best_config` files written | two cold compiles agree? |
+|---|---:|:--|
+| `triton.autotune_pointwise = True` (torch default) | 28 | **no — 17 of 28 configs differ** |
+| `triton.autotune_pointwise = False` (**shipped**) | **0** | **yes, 3 of 3 cold compiles bit-identical** |
+
+With autotuning on, Inductor benchmarks several Triton configs per pointwise/reduction
+kernel at first call and caches the winner it *timed* fastest. The differing picks are real
+schedule changes — XBLOCK 128 against 256, XBLOCK 1024 / 4 warps against 512 / 8 warps —
+and a reduction kernel's block size changes the accumulation order, hence the bits. A warm
+default cache and a fresh one disagreed at shape 24 in exactly this way.
+
+**It costs nothing to turn off**, which is what makes the choice easy:
+
+| | device time, shape 24 | capture |
+|---|---:|---:|
+| autotuning on | 970.3 us | ~15 s slower |
+| autotuning off | **964.6 us** | — |
+
+Determinism as the acceptance criterion states it — *across runs*, i.e. across processes:
+
+| check | result |
+|---|---|
+| two captures in one process | bit-identical policy words |
+| **a fresh process** (`tools/c12b_forward_digest.py`) | **bit-identical at all four digested shapes** |
+| 520-position corpus, every captured shape | identical sha256 per shape |
+
+Shipping a pinned cache directory was rejected on three counts: it is an artifact that can
+drift from the code, it is keyed on device/driver/torch, and on Windows the Triton cache
+manager hits `MAX_PATH` and fails outright when the cache directory is more than a few
+dozen characters deep — hit in practice while measuring this.
+
+### C12b-3 — The graphed forward's device time, and the fusion term
+
+CUDA events, 200 timed replays after 20 warm ones, `max_batch` 128. Device time is where
+the change is; C12b-4's sims/s is this after the dispatcher, the C++ descent and the
+padding have diluted it.
+
+| shape | eager us | inductor us | speedup | policy words differing | max abs dlogit |
+|--:|---:|---:|---:|---:|---:|
+| 1 | 267.7 | 205.9 | 1.300x | 2,656 of 4,096 (64.8%) | 0.04688 |
+| 8 | 633.9 | 471.9 | 1.343x | 20,848 of 32,768 (63.6%) | 0.03906 |
+| 16 | 943.9 | 1,010.1 | **0.934x** | 39,872 of 65,536 (60.8%) | 0.04688 |
+| **24** | 1,232.1 | 963.8 | **1.278x** | 59,808 of 98,304 (60.8%) | 0.04688 |
+| 32 | 1,658.6 | 1,400.9 | 1.184x | 79,648 of 131,072 (60.8%) | 0.04688 |
+| 48 | 2,317.2 | 1,833.3 | 1.264x | 119,616 of 196,608 (60.8%) | 0.04688 |
+| 64 | 3,121.4 | 2,479.9 | 1.259x | 159,488 of 262,144 (60.8%) | 0.04688 |
+| 96 | 4,547.9 | 3,498.6 | 1.300x | 239,232 of 393,216 (60.8%) | 0.04688 |
+| 128 | 5,903.8 | 4,596.8 | 1.284x | 318,976 of 524,288 (60.8%) | 0.04688 |
+
+**Shape 16 regresses and is reported rather than tuned.** It is reproducible across every
+run and every `max_batch`, and it is not an eager fallback — 39,872 words differ, so
+Inductor is running; it is simply a worse schedule at that width. K=24 rounds to shape 24,
+so the shipping configuration rarely lands there. The ladder is C10b's and re-tuning it is
+not this chunk's remit.
+
+**The fusion term is the whole point of the chunk**: ~61-65% of the bf16 policy words move
+at every shape, at up to 0.047 of a logit. That is what re-bases the numerics and what
+Gate 2' exists to re-certify.
+
+#### The bug this table found: dynamo's recompile limit silently ran shape 128 eager
+
+`torch._dynamo`'s `recompile_limit` defaults to **8**. The shipping ladder has **nine**
+shapes and `dynamic=False` gives each its own specialised frame, so the ninth blew the
+limit — and dynamo does not raise, it logs a warning and falls back to running that shape
+**eager, permanently**. The engine ships `max_batch=128`, so the shape that fell back was
+the largest one. Before the fix:
+
+    shape 128   eager 5,912.6 us   inductor 5,912.8 us   1.000x   0 of 524,288 words differ
+
+The capture succeeded, the priors were correct and the recompilation counter was *stable*
+(nothing was being compiled any more, which is the problem). Only the throughput row
+showed it. `_raise_recompile_limit` now raises the limit to `len(sizes) + 8`, and
+`assert_every_shape_is_fused()` checks the property semantically — every shape's output
+must differ from the unfused module's — because counting compiled frames cannot express it.
+
+### C12b-4 — Gate 4 on the Inductor forward, both regimes, REPORTED SEPARATELY
+
+W=1, K=24, `max_batch` 128, virtual loss 2.5, `verify_compaction` off, 5 repeats (median),
+arms interleaved repeat by repeat so the ~4% GPU-clock drift divides out of the paired
+ratio instead of adding to it. `delivered > 0` and no-recompilation are asserted before a
+row is admitted.
+
+| regime | arm | inherited | delivered | wall | **delivered sims/s** | min | max | rows/crossing | pad waste | cache hit | paired speedup |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fresh midgame root | `compile=False` | 1 | 19,999 | 1,326.3 ms | **15,079** | 14,912 | 15,200 | 21.6 | 1.11x | 9.9% | — |
+| fresh midgame root | `compile=True` | 1 | 19,999 | 1,108.8 ms | **18,036** | 15,501 | 18,406 | 21.6 | 1.11x | 9.9% | **1.189x**, 5/5 wins |
+| reuse-heavy endgame | `compile=False` | 57,726 | 20,000 | 1,306.4 ms | **15,310** | 12,518 | 15,451 | 18.2 | 1.23x | 24.1% | — |
+| reuse-heavy endgame | `compile=True` | 55,080 | 20,000 | 1,142.9 ms | **17,499** | 15,727 | 17,808 | 18.1 | 1.23x | 24.6% | **1.151x**, 5/5 wins |
+
+**There is deliberately no combined number**, per the brief's Part 4. Gate 4's floor is
+8,000 delivered sims/s and its stretch target 15,000; the Python reference measured 838.
+Both regimes clear the stretch target on both arms.
+
+**1.189x on a fresh root matches the brief's ~1.19x prediction.** What does not match is the
+reuse-heavy regime.
+
+#### The reuse-heavy regime is not the one C12 measured, and the checkpoint is why
+
+C12-5 reported the reuse-heavy endgame at **334,315** sims/s with a **66.8%** cache hit
+rate — the cheap regime where the GPU is 26.3% busy and Inductor should buy ~nothing. On
+the 90M checkpoint that regime does not reproduce: same positions, same budget, **24.1%**
+cache hit and 15,310 sims/s eager. So a `vs C12-5` ratio is not a comparison and is not
+quoted.
+
+The cause is the tree, measured over the six reuse plies at 20,000 NEW simulations each:
+
+| ply | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| 20M nodes | 261,111 | 390,075 | 415,635 | 203,807 | 156,615 | 156,126 |
+| 90M nodes | 308,188 | 530,925 | 646,246 | 654,081 | 864,057 | 1,104,746 |
+
+The 20M net's reuse tree peaks at ply 3 and then *shrinks* as the endgame simplifies. The
+90M net's grows every ply and reaches **1,436,625** nodes by the measured search. So on the
+shipped net the two regimes are much closer together than the brief anticipated, and
+Inductor buys 1.151x under reuse rather than nothing.
+
+This also exposed a harness bug: `bench_c10b.ARENA_CAPACITY = 1,200,000` predates C11c and
+coincides with `60 x 20,000`, i.e. C11c's rule for **one** search — but the reuse arm runs
+seven searches on one accumulating tree. At 1.2M the measured search exhausts the arena and
+delivers 6,666 of 20,000, which `timed_search` correctly refuses to publish.
+`tools/bench_c12b.py` now derives the arena from the rule, `60 x sims x (reuse_plies + 1)`.
+**The engine's own sizing is not implicated**: per search the 90M net builds 308,188 nodes
+for 20,000 simulations — **15.4 nodes/sim against the 60 the rule assumes**, ~4x headroom.
+
+### C12b-5 — What adoption costs at engine start
+
+| arm | method | capture | construct | device memory | warmup rounds per shape |
+|---|---|---:|---:|---:|---|
+| `compile=False` | `cudagraph` | 0.6 s | 0.9 s | +730 MiB | — |
+| `compile=True` | `inductor+cudagraph` | 7.7 s | 9.6 s | **+326 MiB** | 2 at every shape |
+
+`ensure_ready` pays this once per process, and the figures are for a **warm** Inductor
+cache; a cold cache (new machine, new GPU, new torch) costs roughly 30 s more. The device
+memory is the surprise and it goes the right way: Inductor's captured graphs reserve **less
+than half** what the eager captures do, because the fused epilogues materialise fewer
+intermediate activations into each graph's private pool.
+
+### C12b-6 — Gate 2': the numbers, and the two criteria it does not meet
+
+520 positions (Gate 2b's 500 plus the 20 Gate 1 positions, disjoint), 1,600 simulations,
+W=1/K=1, against the eager baseline frozen at tag `GUOFISH_NUMERICS_BASELINE`.
+
+**The prior shift — reported, not gated.** This is the re-baselining, measured:
+
+| quantity | value |
+|---|---|
+| priors compared | 15,764 over 520 positions |
+| bit-identical | **0 (0.0%)** |
+| max abs dprior | **9.116e-03** — 9,116x Gate 2's 1e-06 bound |
+| p99 / median abs dprior | 2.598e-03 / 2.216e-05 |
+| per-position Linf: max / p99 / median | 9.116e-03 / 6.254e-03 / 1.577e-03 |
+| per-position L1: max / p99 / median | 1.830e-02 / 1.448e-02 / 5.768e-03 |
+
+**Inversions — measured, not gated**, exactly as the brief directs:
+
+| quantity | value |
+|---|---|
+| inverted pairs | **170 of 269,257 comparable (0.063%)** |
+| baseline gap at an inverted pair: max / p99 / median / min | 2.570e-03 / 1.746e-03 / 3.699e-05 / 4.499e-06 |
+| widest | 2.570e-03 at `5bk1/6pp/3pbp2/8/3B4/6P1/2p1PP1P/R5K1 b - - 0 34` |
+
+Every inversion sits far inside the `2 x max|dprior| = 1.823e-02` a shift of this size can
+cross, so the measurement is self-consistent. The minimum inter-prior gap on this corpus is
+1.927e-06 (C10b), so a ~1e-3 shift inverting near-ties is arithmetic, not a defect.
+
+**The move-agreement criteria — as briefed, as measured, and as RULED:**
+
+| criterion | as briefed | measured | as ruled |
+|---|---|---|:--|
+| move agreement | >= 99% | **98.65%** (513/520) | **>= 98% — PASSES** |
+| disagreements outside a 2% margin | 0 | **5 of 7** | **reported, not gated** |
+
+The ruling (owner, 2026-08-13) followed a hand adjudication of the five decisive
+disagreements below against Stockfish at high depth: **every Inductor move was equal to or
+better than the baseline's.** The criteria were held, the chunk was reported blocked, and
+the budget escape was tested and refuted before the ruling was made — see DECISIONS.md.
+
+    c10_corpus   494/500 = 98.80%
+    gate1         19/20  = 95.00%
+
+Only 20 of 520 positions (3.85%) were decided by the baseline within 2%; 2 of those 20
+disagreed, and **5 disagreements fall outside that set entirely**. The five decisive ones:
+
+| position | baseline | inductor |
+|---|---|---|
+| `r5k1/5pp1/1p2p1b1/6Np/PP1p3P/Q7/2q2PP1/R5K1 w - - 0 36` | a4a5 (27.0%) | a1c1 (16.2%) |
+| `r3k2r/1b1n1ppp/pq2p3/3nP1B1/BP6/8/P3QPPP/3R1RK1 w kq - 3 21` | e2g4 (48.8%) | e2h5 (6.9%) |
+| `r1b1kb1r/pp1p1ppp/1q2pn2/8/1n1P1B2/1Q2PN2/PP3PPP/RN2KB1R b KQkq - 2 8` | a7a5 (46.6%) | b4d5 (51.5%) |
+| `rn1qkb1r/pp3ppp/2b1p1n1/4P3/3p4/1P1B1N2/P2P1PPP/RNBQR1K1 w kq - 0 10` | c1b2 (45.5%) | g2g3 (40.7%) |
+| `r4bk1/pp1b1pp1/2n2q1p/3p4/5n2/1NPB1N1P/PP3PPB/R2Q2K1 w - - 5 18` | d3c2 (2.4%) | h2f4 (7.1%) |
+
+#### The near-tie criterion has never been met, at any numerical distance
+
+`tests/test_c10_gate2b.py::test_every_disagreement_is_a_near_tie` has been **red since C10**
+— it is the single failure in C11's whole-suite figures, and C11b's record shows the owner
+dropped it from scope rather than fixing it. Re-running the (normally deselected)
+differential on this tree reproduces C10 exactly:
+
+| | C10 recorded | this run |
+|---|---|---|
+| agreement | 497/500 = 99.4% | **497/500 = 99.4%** |
+| decisive disagreements | 2 | **2, the same positions, the same margins** |
+
+So the Python-to-C++ differential has not moved, and **the near-tie bound fails between two
+engines that agree to 1e-6**. It is a property of a corpus containing chaotic positions — a
+perturbation anywhere flips an early selection and both trees then converge confidently
+elsewhere — not a bound Inductor broke. Gate 2 could hold 1e-6 on the *priors*; nothing has
+ever held a near-tie bound on the *moves*.
+
+Only the **>= 99% agreement** criterion is one Inductor is the first to miss, and it misses
+it by seven positions.
+
+#### The budget hypothesis, tested on the whole corpus and REFUTED
+
+Sampling four decisive positions across budgets suggested 1,600 was simply not converged —
+the eager arm **alone**, with no Inductor anywhere, changes its own answer on three of four:
+
+| position | 1,600 | 3,200 | 6,400 | 12,800 |
+|---|---|---|---|---|
+| `rn1q1rk1/...R2QK2R w KQ - 0 13` | e4d5 | e3b6 | e3b6 | e3b6 |
+| `3r2k1/...R1R3K1 b - - 12 23` | e5g4 | h7h6 | h7h6 | h7h6 |
+| `rnbqk2r/...R2QKB1R b KQkq - 5 5` | e8g8 | e8g8 | e8g8 | c7c5 |
+| `2R5/...2r5 w - - 1 49` | c5b4 | c5b4 | c5b4 | c5b4 |
+
+**The sample did not generalise.** Both arms over the whole 520-position corpus at 6,400
+simulations (`tools/sweep_c12b_budget.py`, 2,127 s) makes the gate *worse*:
+
+| simulations | agreement | >= 99%? | disagreements | of which decisive | all near-ties? |
+|---:|---:|:--|---:|---:|:--|
+| 1,600 | 98.65% (513/520) | **NO** | 7 | 5 | **NO** |
+| **6,400** | **97.88%** (509/520) | **NO** | **11** | **8** | **NO** |
+
+**The divergence grows with search depth rather than converging away.** In hindsight that
+is the expected direction: more simulations mean more selections for a ~1e-3 prior
+perturbation to flip, and a deeper tree amplifies an early divergence instead of washing it
+out. Individual positions can converge; the corpus does not. There is therefore no version
+of "keep the criterion, move the budget" that rescues Gate 2', and **the criterion was not
+moved** to fit the result (Global Rule 10).
+
+The fourth sampled row is `2R5/7p/P3k3/1PK2p1p/5P1P/8/8/2r5 w - - 1 49` — **one of C10's
+two known decisive positions**, where the Python reference plays c5b6 and the C++ engine
+c5b4. C12b's two arms landed on the two sides of a divergence that predates this chunk.
+
+### C12b-7 — Rule 3, the suite, Amendment D
+
+`pytest tests/ -v -p no:randomly` on Windows, Release build, **nothing deselected** —
+including the four Gate 2b differential tests that C12 deselects by convention:
+
+    3 failed, 1456 passed, 49 skipped in 752.43s (12m32s)
+
+| failure | status |
+|---|---|
+| `test_c10_gate2b.py::test_every_disagreement_is_a_near_tie` | **pre-existing since C10**, owner-acknowledged, reproduces C10's two positions exactly |
+| `test_c12b_gate2prime.py::..._on_99_percent_of_moves` | **resolved by the ruling** — 98.65% against a floor now set at 98%. Renamed `test_move_agreement_against_the_baseline_meets_the_ruled_floor`, since the name was the last thing still asserting 99 |
+| `test_c12b_gate2prime.py::test_every_disagreement_is_a_near_tie` | **resolved by the ruling** — converted to a report and renamed `test_the_decisive_disagreements_are_listed_for_adjudication` |
+
+**That count is the pre-ruling run, left as measured.** Post-ruling the suite stands at
+**1 failed / 1,458 passed / 49 skipped** — and that figure is derived rather than
+re-measured, so here is the derivation. Nothing outside `tests/test_c12b_gate2prime.py`
+was touched by the ruling; inside it only `MIN_AGREEMENT` moved and one gate became a
+report. All 18 of its tests have since been executed against the changed file — 14 in the
+drill's baseline run and the 4 differential ones separately (4m37s) — and all 18 pass, with
+the differential reproducing 513/520 and the same five decisive positions. The search is
+deterministic at W=1/K=1, so re-running the other 1,440 tests would restate them.
+
+The one remaining red is `test_c10_gate2b.py::test_every_disagreement_is_a_near_tie`, which
+predates this chunk by two chunks.
+
+The 49 skips match C12's count exactly and are the same set. **The runtime figure corrects
+C12's record**: the whole suite including the four deselected tests is 12m32s, and the
+differential's C++ arm alone is 306 s. C12's "3 h 29 m" is an ASan build and its "53
+minutes" is the Python reference arm, which lives in the golden generator rather than in
+the test.
+
+**The Linux arm certifies nothing in this chunk.** It has no CUDA, Inductor emits Triton,
+and every test in `test_c12b_gate2prime.py` is individually `skipif`-marked with a reason
+naming CUDA (Amendment D — no module-scope skips). A green Linux run here means 18 tests
+skipped, not that Inductor was checked. C12's Amendment D note applies unchanged.
+
+### C12b-8 — Mutation drill (Amendment B)
+
+`python tools/drill_c12b.py` — **5/5 mutations caught, `golden/` and `baseline/` unchanged.**
+
+| mutation | what it breaks | caught by |
+|---|---|---|
+| `no-inductor` | `compile=True` builds an `InductorGraphedForward` that captures the UNFUSED module, with the constructor's own guard disabled — the self-comparison trap | `test_the_prior_shift_is_reported` |
+| `autotune-on` | restores `triton.autotune_pointwise`, the setting whose picks differ between cold compiles | `test_autotuning_is_off_because_that_is_what_pins_the_kernels` |
+| `recompile-limit` | puts dynamo's limit below the captured ladder, so shapes fall back to eager silently | `test_warmup_converged_before_anything_was_captured` |
+| `stale-replay` | skips the graph launch and re-reads the previous batch's outputs | `test_the_manual_capture_did_not_change_the_inductor_forward` |
+| `corrupt-baseline` | one bf16 word of `policy_1` changed in a scratch COPY of the frozen baseline | `test_compile_false_reproduces_the_frozen_baseline_bit_exactly` |
+
+**`no-inductor` is the one the drill exists for.** Every other test in the file passes if
+`compile=True` silently yields the eager forward — capture fidelity compares eager against
+eager, both determinism checks agree trivially, and Gate 2' reports 100% move agreement
+against a baseline it merely reproduced. The assertion that closes it is a single line in
+`test_the_prior_shift_is_reported`: a genuinely fused forward moves ~61% of the bf16 policy
+words, so a max `|dprior|` of exactly zero means Inductor never ran.
+
+**The drill caught a defect in itself first, and that is worth recording.** The initial
+`corrupt-baseline` flipped bytes at a fixed offset near the end of the `.npz`.
+`np.savez_compressed` writes members in insertion order, so the tail of that archive holds
+`fens` and `source` — two arrays the gate never reads. The mutation corrupted the file,
+changed nothing under test, and was correctly reported as **MISSED**. It now re-saves every
+array unchanged except one word of `policy_1`. A mutation has to land on the quantity under
+test to say anything about it.
+
+Four tests are deselected from the drill: the ones sharing the 4.5-minute `differential`
+fixture. Two of them are red for the reason C12b-6 reports, and a drill whose target does
+not pass proves nothing; the other two are excluded on cost, since no mutation here is
+aimed at search output. Both reasons are recorded in the tool so that the list is revisited
+rather than inherited.

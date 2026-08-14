@@ -94,7 +94,33 @@ AUTOCAST_DTYPE = torch.bfloat16
 MIN_VOCAB_SIZE = 41
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# THESE TWO ARE DIFFERENT CHECKPOINTS ON PURPOSE, AND THE SPLIT IS LOAD-BEARING.
+#
+# `DEFAULT_MODEL` is what `build()` loads when a caller names nothing, and it is
+# PINNED TO THE 20M-CORPUS CHECKPOINT because that is the one every historical
+# golden was generated against. `golden/c10_gate2.npz` records its priors to 1e-6
+# and `golden/c10_gate2b.json` records its moves; `tests/test_c10_gate2b.py` and
+# `tests/test_c10b_graphs.py` both call `build()` with no model and compare
+# against those files. Repointing this constant would make both suites compare a
+# different network against goldens that cannot be regenerated from it (Global
+# Rule 2 — they come from the Python reference), so C10 and C10b's certifications
+# would fail for a reason that has nothing to do with what they certify.
+#
+# `SHIPPING_MODEL` is the 90M-corpus checkpoint the ENGINE actually loads —
+# `playing/v6/playv6.py`'s own `DEFAULT_MODEL`, which `uci_wrapper_v6.py` hands
+# to every tournament arm and which `tools/run_90M_vs_stockfish.ps1` benches. It
+# is the same v5 architecture (10,887,681 parameters, 68 tokens, d_model 384 x 6
+# layers), so the captured ladder, the shapes and the throughput profile are
+# unchanged; only the weights differ.
+#
+# C12b's baseline, Gate 2' and benchmarks all name `SHIPPING_MODEL`, because a
+# throughput optimisation and a numerics re-baselining should be measured on the
+# net that will be tuned and played, not on the one an older gate happens to be
+# anchored to. `tests/test_c12b_gate2prime.py` asserts the two constants still say
+# what this comment says they say, so the split cannot drift into an accident.
 DEFAULT_MODEL = REPO_ROOT / "models" / "guofish5_20M" / "v5_10.9M_best.pt"
+SHIPPING_MODEL = REPO_ROOT / "models" / "guofish5_90M" / "v5_10.9M_best.pt"
 
 # scope §2.1, settled by C0b's measurement rather than by projection. See
 # guofish_core.LiveEvaluator's docstring for the numbers and for why the Windows
@@ -267,7 +293,8 @@ class TorchEvaluator:
     def __init__(self, model: torch.nn.Module, device: torch.device, max_batch: int,
                  *, switch_interval: float = DEFAULT_SWITCH_INTERVAL, pin: bool = True,
                  graphs: bool = True, graph_method: str = "cudagraph",
-                 graph_sizes=None, hoist_norm_casts: bool = True):
+                 graph_sizes=None, hoist_norm_casts: bool = True,
+                 compile: bool = False):   # noqa: A002 - the brief names this flag
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
         require_engine_contract(model)
@@ -324,6 +351,44 @@ class TorchEvaluator:
         # exists: capture must own the device while it runs, and it allocates
         # (each shape's private pool), which is exactly what the callback may
         # not do afterwards.
+        # C12b. `compile=` SELECTS THE FORWARD'S NUMERICS, WHICH IS WHY IT IS A
+        # SEPARATE FLAG FROM `graph_method=` RATHER THAN A VALUE OF IT.
+        #
+        # `compile=False` is the eager ATen forward frozen at tag
+        # GUOFISH_NUMERICS_BASELINE and certified against the Python reference by
+        # Gate 2 and Gate 2b. `compile=True` is the same manual capture over an
+        # Inductor-codegen'd module: no precision change, but fused epilogues and
+        # therefore a different accumulation order, ~1e-3 on the priors, and a
+        # different certification (Gate 2', tests/test_c12b_gate2prime.py).
+        #
+        # THE DEFAULT IS `False`, DELIBERATELY, AND IT IS NOT INDECISION. The
+        # shipping engine turns it on — `EngineConfig.compile` defaults True and
+        # `playing/v6/playv6.py` passes it — so adoption happens where the engine
+        # is configured. This constructor is also what C10b's and C10's
+        # acceptance tests build, and those compare against Gate 2's golden at
+        # 1e-6; defaulting the library to Inductor would make them fail for the
+        # intended reason, which is exactly the outcome the C12b brief says
+        # teaches nothing. A library default of eager keeps every historical
+        # certification meaning what it meant.
+        self.compiled = bool(compile)
+        if self.compiled:
+            if not graphs:
+                raise ValueError(
+                    "compile=True requires graphs=True: the shipped Inductor path "
+                    "is a MANUAL capture of an Inductor-codegen'd module (C12b), "
+                    "and an uncaptured compiled forward is a different thing that "
+                    "no gate in this project has certified.")
+            if device.type != "cuda":
+                raise ValueError(
+                    f"compile=True requires a CUDA device, got {device.type}")
+            if graph_method != "cudagraph":
+                raise ValueError(
+                    f"compile=True and graph_method={graph_method!r} are two ways "
+                    f"of asking for a compiled forward and they disagree; C12b "
+                    f"ships the manual capture, so pass graph_method='cudagraph' "
+                    f"(the default) or drop compile=.")
+            graph_method = "inductor"
+
         self.graph = None
         if graphs and device.type == "cuda":
             from playing.v6 import graphs as graph_module
@@ -425,6 +490,18 @@ class TorchEvaluator:
             return 1.0
         return self.graph.padded_rows / self.graph.rows
 
+    def assert_no_recompilation(self, when: str = "since warmup") -> None:
+        """C12b acceptance 4. A no-op on every path that cannot recompile.
+
+        Silent on the eager and manually-captured paths rather than raising,
+        because "did torch.compile recompile?" is not a question those paths can
+        answer and refusing to answer it would make every caller branch on which
+        forward it happens to hold. A caller that needs to know whether the check
+        was real reads `self.compiled`.
+        """
+        if self.compiled and self.graph is not None:
+            self.graph.assert_no_recompilation(when)
+
     # --- page-locking ----------------------------------------------------
 
     def _pin_buffers(self) -> bool:
@@ -519,12 +596,17 @@ def build(max_batch: int, *, model_path: Path | None = None,
           device: torch.device | None = None,
           switch_interval: float = DEFAULT_SWITCH_INTERVAL,
           pin: bool = True, graphs: bool = True, graph_method: str = "cudagraph",
-          graph_sizes=None) -> TorchEvaluator:
-    """Load the default checkpoint and wrap it. The one-liner every caller wants."""
+          graph_sizes=None, compile: bool = False) -> TorchEvaluator:  # noqa: A002
+    """Load the default checkpoint and wrap it. The one-liner every caller wants.
+
+    `compile=` defaults to False here for the reason `TorchEvaluator.__init__`
+    records: this is what the C10/C10b acceptance tests construct, and they
+    compare against Gate 2's golden at 1e-6.
+    """
     model, resolved = load_default_model(model_path, device)
     return TorchEvaluator(model, resolved, max_batch, switch_interval=switch_interval,
                           pin=pin, graphs=graphs, graph_method=graph_method,
-                          graph_sizes=graph_sizes)
+                          graph_sizes=graph_sizes, compile=compile)
 
 
 __all__ = [
@@ -535,6 +617,7 @@ __all__ = [
     "POISON_BITS",
     "POLICY_SIZE",
     "SEQ_LENGTH",
+    "SHIPPING_MODEL",
     "TorchEvaluator",
     "build",
     "load_default_model",

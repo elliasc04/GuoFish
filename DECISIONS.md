@@ -7458,3 +7458,356 @@ Linux" as evidence about the callback.
 * **The reuse-heavy regime as a strength-relevant number.** 334,315 sims/s is real and it
   is also a regime where the network is answered from cache 67% of the time. Nothing here
   says what that is worth over a game.
+
+# C12b — Inductor adoption, Gate 2', and the gate that did not pass (2026-08-13)
+
+## The headline: Gate 2' passes as RULED, after being reported failed as BRIEFED
+
+The measurement never changed; the acceptance did, and the order matters. As briefed, both
+criteria failed and the chunk was reported blocked with the criteria untouched (Global Rule
+10). The owner then ruled on the evidence, and the gate passes against the ruled figures.
+
+| criterion | as briefed | measured | as ruled (2026-08-13) |
+|---|---|---|:--|
+| move agreement vs the frozen eager baseline | >= 99% | **98.65%** (513/520) | **>= 98% — PASSES** |
+| disagreements outside a 2% visit margin | 0 | **5 of 7**, margins 2.4%-48.8% | **reported, not gated** |
+
+**The ruling rests on better evidence than the criterion it replaced.** The owner
+adjudicated the five decisive disagreements listed in BENCH.md C12b-6 by hand against
+Stockfish at high depth: **every Inductor move was equal to or better than the baseline's.**
+
+That is worth stating as a methodological point and not just as a decision. "Every
+disagreement is a near-tie" was only ever a *proxy* — it infers from visit margins that
+neither engine held a real opinion, and therefore that a disagreement cost nothing.
+Adjudicating the moves themselves against a strong engine answers the underlying question
+directly, and it answered it in the changed engine's favour. A proxy that fails while the
+thing it proxies for passes is a bad proxy, and this one was independently known to be bad:
+it has been red on Gate 2b since C10 between two engines that agree to **1e-6**.
+
+**What was NOT done, and the sequencing is the point.** The criteria were not moved to make
+a red suite green. They were held, the chunk was reported blocked, the corpus was swept at a
+second budget to test the obvious escape (it made things worse, not better), and only then
+did the owner rule. `tests/test_c12b_gate2prime.py`'s `MIN_AGREEMENT` carries the ruling and
+its basis, so the 98% is auditable rather than inherited as a bare constant.
+
+**The adjudication is not in this repository.** It was performed outside the harness, so
+nothing here can re-derive it, and the test file says so. A future chunk that wants the
+evidence in the loop should add the Stockfish adjudication as a tool under `tools/` and cite
+its output — that is the one loose thread this ruling leaves.
+
+The disagreeing positions are printed in full by
+`tests/test_c12b_gate2prime.py::test_the_inductor_engine_agrees_with_the_baseline_on_99_percent_of_moves`.
+Both arms are perfectly reproducible, the eager arm reproduces the frozen baseline
+exactly in isolation, and `compile=False` reproduces the baseline bit-exactly at every
+captured shape — so this is a genuine behavioural divergence caused by the fusion, not a
+harness artifact. The evidence for that is in the next two sections.
+
+## The near-tie criterion was imported from a gate where it measured something else
+
+Gate 2b compared two engines that agreed to 1e-6. The only mechanism available for a
+disagreement there was a genuine coin flip, so a small top-two visit margin was the
+signature of one, and "every disagreement is a near-tie" was a meaningful check that the
+engines had not formed different opinions.
+
+Under Inductor's ~1e-3 prior shift the mechanism is different. An early selection flips,
+the two trees diverge structurally from that point, and **each arm then converges
+confidently on its own answer**. A visit margin measured at the end of that says how
+concentrated one arm's tree became — not how close the decision was. Five disagreements
+at margins up to 48.8% are what that looks like, and reading them as "the engines disagree
+about the position" is reading the metric outside its domain.
+
+### The budget hypothesis was tested on the whole corpus and REFUTED
+
+A four-position sample suggested the 1,600-simulation budget was the culprit: on three of
+four sampled decisive positions the **eager arm alone** changes its own move as the budget
+grows, with no Inductor anywhere, which made 1,600 look like a budget at which neither arm
+had settled.
+
+That sample did not generalise. Running both arms over the whole 520-position corpus at
+6,400 simulations (`tools/sweep_c12b_budget.py`, 2,127 s) makes the gate **worse, not
+better**:
+
+| simulations | agreement | >= 99%? | disagreements | of which decisive | all near-ties? |
+|---:|---:|:--|---:|---:|:--|
+| 1,600 | 98.65% (513/520) | **NO** | 7 | 5 | **NO** |
+| 6,400 | **97.88%** (509/520) | **NO** | **11** | **8** | **NO** |
+
+**So the disagreement is not a budget artifact and it does not converge away — it grows
+with search depth.** In hindsight that is the expected direction and the sample was
+misleading: more simulations mean more selections for a ~1e-3 prior perturbation to flip,
+and a deeper tree amplifies an early divergence rather than washing it out. Individual
+positions can converge; the corpus does not.
+
+This is the measurement that settles what the chunk hands back. Gate 2''s criterion is not
+recoverable by re-running it somewhere more favourable, so there is no version of "keep the
+criterion, move the budget" that rescues it.
+
+**What was NOT done: the criterion was not moved.** >= 99% with every disagreement under a
+2% margin is what the brief sets and what the test asserts, at the budget the frozen
+baseline was generated with. `tools/sweep_c12b_budget.py` reports what happens at other
+budgets; the gate gates. Narrowing the criterion to fit the result is the one thing Rule 10
+forbids outright — and on this evidence narrowing it would not have helped anyway.
+
+## The near-tie criterion already fails at 1e-6, and C10 found that before Inductor existed
+
+**The criterion Gate 2' inherits is one Gate 2b has never met.**
+`tests/test_c10_gate2b.py::test_every_disagreement_is_a_near_tie` has been RED since C10 —
+it is the single failure in C11's whole-suite figures ("the 49 skips and the 1 failure all
+predate this chunk"), and C11b's record says the owner dropped it from scope rather than
+fixed it. The two decisive positions C10 recorded are:
+
+    2R5/7p/P3k3/1PK2p1p/5P1P/8/8/2r5 w - - 1 49    reference c5b6 40.8% vs engine c5b4 38.8%
+    5rn1/Pk2p3/1p1p4/1NpP2r1/2P5/7K/8/4R3 b - - 1 43  reference g5g6 62.1% vs engine f8a8 47.4%
+
+Re-running the deselected differential on this tree reproduces **497/500 = 99.4% and both of
+those rows digit for digit**, so the Python-to-C++ differential has not moved and the C12
+deselection's justification still holds.
+
+**That reframes this chunk's criterion-2 failure and corrects an earlier reading of it.**
+`2R5/7p/...` was initially recorded here as a divergence that survives every simulation
+budget and therefore as the hard part of the Inductor re-baselining. It is not an Inductor
+finding at all: it is a known chaotic position that already produces a *decisive*
+disagreement between two engines that agree to **1e-6**, and C12b's two arms simply landed
+on the two sides of it — eager on the C++ answer `c5b4`, Inductor on the reference answer
+`c5b6`.
+
+So "every disagreement is a near-tie" is not a bound Inductor broke. It is a bound this
+corpus does not support at any numerical distance, because the corpus contains positions
+whose search is chaotic in the ordinary sense: a perturbation anywhere flips an early
+selection and both trees then converge confidently somewhere else. Gate 2 could hold a 1e-6
+bound on the *priors*; nothing has ever held a near-tie bound on the *moves*.
+
+That is the substantive question this chunk hands back: **is "the engine plays the same
+moves" the right acceptance for a fusion, or is the right acceptance a Gate 5 match?** The
+brief itself says the honest claim is the former and that "Gate 5 is what prices the
+difference". The measurement here is that the former is not achievable at 99% with a
+near-tie qualifier — not by Inductor and not by the certified eager engine either — so the
+decision is whether to accept an agreement rate with the divergences characterised, or to
+price the change in Elo instead.
+
+## Determinism: autotuning is disabled rather than the cache pinned
+
+The brief asks for the autotune cache to be "pinned or shipped". **It is removed instead**,
+which is strictly better, and the measurement that forced the question:
+
+* With `triton.autotune_pointwise` at its default `True`, Inductor benchmarks several
+  Triton configs per pointwise/reduction kernel at first call and caches the winner in a
+  `.best_config` file. The winner comes from measured times. **17 of 28 `.best_config`
+  files differ between two cold compiles of this model** — XBLOCK 128 against 256, XBLOCK
+  1024 / 4 warps against 512 / 8 warps — and a reduction kernel's block size changes the
+  accumulation order, which changes the bits. A warm default cache and a cold one
+  disagreed at shape 24 in exactly this way.
+* With it `False`, the heuristics emit one config per kernel, **zero `.best_config` files
+  are written**, and three independent cold compiles produce bit-identical priors at every
+  shape.
+
+So there is no cache to pin, nothing keyed on the GPU, driver or torch version, and nothing
+to go stale — and it costs nothing measurable: 964.6 us against 970.3 us on the graphed
+forward's device time at shape 24, inside the run-to-run spread, with capture ~15 s faster
+because the benchmarking was what was slow. `configure_inductor()` sets it, the setting is
+recorded on `CaptureReport`, and `test_autotuning_is_off_because_that_is_what_pins_the_kernels`
+asserts it, so a future torch that changes the default breaks a test with an explanation
+attached rather than breaking determinism silently.
+
+The alternative — shipping a cache directory — was rejected on three counts: it is an
+artifact that can drift out of sync with the code, it is keyed on toolchain and device, and
+on Windows the Triton cache manager hits `MAX_PATH` and fails outright when the cache
+directory is more than a few dozen characters deep. That last one is not hypothetical; it
+was hit while measuring this.
+
+## `use_static_cuda_launcher = False` is a correctness requirement, not a preference
+
+With torch 2.8.0+cu129 / triton 3.4.0 on this RTX 5070, the static CUDA launcher raises
+`OverflowError: Python int too large to convert to C long` from
+`_StaticCudaLauncher._launch_kernel` on the very first Inductor kernel. C10b hit the same
+thing and recorded it against a `CompiledForward` that was never shipped; it is restated
+here because this path is shipped.
+
+## Dynamo's recompile limit is 8, the shipping ladder is 9 shapes, and the ninth ran eager
+
+**This is the bug this chunk found, and it would have shipped.** `torch._dynamo`'s
+`recompile_limit` defaults to 8. `DEFAULT_CAPTURE_SIZES` has nine entries and
+`dynamic=False` makes each shape its own specialised frame, so the ninth blows the limit.
+Dynamo does not raise: it logs a warning and **falls back to running that shape eager,
+permanently**. The engine ships `max_batch=128`, so the shape that fell back was 128.
+
+It is invisible from every direction that normally matters — the capture succeeds, the
+priors are correct, and the recompilation counter is *stable*, because nothing is being
+compiled any more, which is the problem. It was visible only as a throughput row:
+
+    shape 128   eager 5,912.6 us   inductor 5,912.8 us   1.000x   0 of 524,288 words differ
+
+`_raise_recompile_limit` now sets the limit to `len(sizes) + 8` before warmup. Raising the
+limit can only permit specialisations the ladder already implies, because `pad_to` admits
+no shape outside `sizes`.
+
+### The guard is semantic, because counting frames cannot express it
+
+The obvious assertion is "warmup compiled one dynamo frame per captured shape", and it is
+wrong in both directions:
+
+* a shape that has hit the limit **stops compiling** and therefore converges immediately,
+  which is indistinguishable from a shape that finished; and
+* a second `torch.compile` of the same module in one process **reuses dynamo's cache** and
+  legitimately compiles zero new frames — so the assertion fires on a perfectly healthy
+  second evaluator. It did, on the second section of the benchmark.
+
+`assert_every_shape_is_fused()` asks the question that actually matters instead, of each
+shape, by measurement: **does this shape's output differ from the unfused module's?**
+Inductor's epilogue fusion moves 60-65% of the bf16 policy words at every shape here, so a
+shape that fell back returns bit-identical words. If a future torch ever fuses these
+epilogues bit-exactly this raises, and it should — that would mean the fusion no longer
+re-bases the numerics and Gate 2' should be retired in favour of Gate 2, not weakened.
+
+## The library default stays eager; the engine default becomes Inductor
+
+`TorchEvaluator(compile=...)` defaults to **False** and `EngineConfig.compile` defaults to
+**True**. The split is deliberate and is not indecision.
+
+`tests/test_c10_gate2b.py` and `tests/test_c10b_graphs.py` both call
+`live_evaluator.build()` with no arguments and compare against Gate 2's golden at 1e-6.
+Defaulting the library to Inductor would fail both — for the intended reason, which is
+exactly the outcome the brief says teaches nothing. A library default of eager keeps every
+historical certification meaning what it meant. Adoption therefore happens where the engine
+is configured, which is also where it is observable: `[config] evaluator` prints
+`compile=True`, and `compile=False` prints `(EAGER NUMERICS BASELINE)` beside it.
+
+## The baseline lives in `baseline/`, not `golden/`
+
+Global Rule 2: golden data comes from the Python reference only, and none of C12b's frozen
+outputs do — they are the eager C++ engine's own priors, values and root visit vectors. A
+separate directory is the mechanism that keeps that true rather than remembered: a reader
+who finds `baseline/` cannot mistake it for a reference dump, and a tool that globs
+`golden/` cannot pick it up. The manifest carries an Amendment A provenance header and a
+sha256 of every array file, because a baseline you have to rebuild to compare against is a
+baseline that will drift.
+
+`GUOFISH_NUMERICS_BASELINE` is tagged at **8b8474855323c50c47de6bc64be7d286112976aa**.
+
+## Gate 2' runs the 90M checkpoint while every golden gate stays on the 20M one
+
+The engine ships `models/guofish5_90M/v5_10.9M_best.pt` (`playv6.DEFAULT_MODEL`), and a
+throughput optimisation and a numerics re-baselining belong on the net that will be tuned
+and played. The golden gates cannot follow it: their data comes from the Python reference,
+so re-anchoring them means regenerating `golden/`, which Global Rule 1 forbids and
+Amendment A repeats — and it would discard C10's 497/500, which is evidence about the port
+rather than about any particular weights.
+
+So `evaluator.DEFAULT_MODEL` stays at the 20M checkpoint, `evaluator.SHIPPING_MODEL` is the
+90M one, every C12b artifact names the latter explicitly, and
+`test_the_two_model_constants_still_mean_what_they_say` asserts both halves so the split
+cannot decay into an accident. The choice and the full table of which gate is anchored to
+which checkpoint are written at the top of README_BUILD.md's Golden data section.
+
+## The reuse-heavy regime is not the regime C12 measured, and the 20M net is why
+
+C12-5 reported the reuse-heavy endgame at 334,315 delivered sims/s with a 66.8% cache hit
+rate — the cheap regime the brief expects Inductor to buy nothing in. **On the 90M
+checkpoint that regime does not reproduce**: the same positions and the same budget give a
+24.1% cache hit rate and 15,310 sims/s eager, because the tree does not converge.
+
+Measured over the six reuse plies at 20,000 NEW simulations each:
+
+    20M   261,111 -> 390,075 -> 415,635 -> 203,807 -> 156,615 -> 156,126
+    90M   308,188 -> 530,925 -> 646,246 -> 654,081 -> 864,057 -> 1,104,746
+
+The 20M net's reuse tree peaks at ply 3 and shrinks as the endgame simplifies. The 90M
+net's grows every ply. So the two regimes are much closer together on the shipped net than
+the brief anticipated, and Inductor buys 1.151x in the reuse regime rather than ~nothing.
+The `vs C12-5` column in BENCH.md C12b-4 is therefore not a comparison and is marked as
+such.
+
+### The arena constant this exposed was a harness bug, not an engine one
+
+`bench_c10b.ARENA_CAPACITY = 1,200,000` predates C11c. It coincides with `60 x 20,000` —
+C11c's rule for ONE search of the default budget — but the reuse arm runs seven searches of
+20,000 NEW simulations on a single accumulating tree, so one move's allowance was never the
+right budget for it. It fit before only because the 20M net's tree converged; on the 90M net
+the measured search needs 1,436,625 nodes, exhausts at 1.2M and delivers 6,666 of 20,000.
+C11c makes a short delivery legitimate on exhaustion and `timed_search` correctly refuses to
+publish the row.
+
+`tools/bench_c12b.py` now derives it from the rule — `60 x sims x (reuse_plies + 1)` —
+rather than hardcoding a constant, so it scales with `--sims` as C11c specifies.
+
+**This is not evidence that the engine's own sizing is model-sensitive, and the same data
+says so.** Per search — which is what `EngineConfig.arena_nodes` covers — the 90M net's
+first 20,000-simulation search builds 308,188 nodes, i.e. **15.4 nodes per simulation
+against the 60 the rule assumes**, roughly 4x headroom. What accumulates in the benchmark is
+an artifact of a harness that deliberately never lets go of the tree.
+
+## Shape 16 is slower under Inductor, and it is reported rather than tuned
+
+    shape 16   eager 943.9 us   inductor 1,010.1 us   0.934x
+
+Reproducible across every run and every `max_batch`, and the only shape in the ladder that
+regresses. It is not a fallback — 39,872 of 65,536 words differ, so Inductor is running —
+just a worse schedule at that width. It is left alone: 16 is not a shape the shipping
+configuration lands on often (K=24 rounds to 24), the ladder is C10b's and re-tuning it is
+not this chunk's remit, and a per-shape override would be a tuning knob added on one
+measurement.
+
+## Rule compliance
+
+* **Rule 1/2** — no test and no golden file was modified, regenerated or deleted.
+  `tests/test_c12b_gate2prime.py` is new; `baseline/` is new and is explicitly not golden
+  data. `tools/bench_c12.py` and `bench_c10b.py` are untouched, so C12-5's table stays
+  reproducible.
+* **Rule 4/5/8** — nothing in `cpp/` changed this chunk. The build, the warning surface and
+  the sanitizer arms are unaffected and were not re-run for C12b.
+* **Rule 7** — no new dependency. `torch.compile`, Inductor and Triton ship inside the
+  already-approved torch.
+* **Rule 10** — Gate 2' is reported as failing, with the criteria unmoved.
+
+## Mutation drill (Amendment B)
+
+`tools/drill_c12b.py` — **5/5 caught**, `golden/` and `baseline/` digest-verified unchanged
+before and after. Table in BENCH.md C12b-8.
+
+Two things worth keeping from building it:
+
+**The drill caught a defect in itself before it caught anything else.** The first
+`corrupt-baseline` flipped bytes at a fixed offset near the end of the `.npz`, on the
+reasoning that the tail is payload rather than zip metadata. It is payload — of `fens` and
+`source`, the last two arrays passed to `np.savez_compressed` and two the gate never reads.
+The mutation corrupted the file, changed nothing under test, and was reported MISSED, which
+is the drill working exactly as intended. It now re-saves one changed word of `policy_1`.
+The general lesson is the one Amendment B is really about: a mutation that does not land on
+the quantity under test tells you nothing about the test, and "the suite caught it" and
+"the suite would have caught a real defect" are different claims.
+
+**`no-inductor` is the mutation this drill exists for**, and it is the one the C12b brief
+names as the worst available outcome. Gate 2' is a differential, and a differential's
+characteristic failure is comparing something against itself. If `compile=True` quietly
+produced the eager forward, capture fidelity would compare eager against eager, both
+determinism checks would agree trivially, and the move-agreement criterion would report
+100% against a baseline it had merely reproduced — a green gate certifying nothing. The
+guard is one assertion in `test_the_prior_shift_is_reported`: a genuinely fused forward
+moves ~61% of the bf16 policy words, so a max `|dprior|` of exactly zero means Inductor
+never ran. That assertion did not exist in the first draft of the test file; the drill is
+what established it was needed.
+
+## What is not done
+
+* **The Stockfish adjudication behind the ruling is not in the repository.** It was done by
+  hand, outside the harness, so nothing here re-derives it and `MIN_AGREEMENT` says so. The
+  clean version is a tool under `tools/` that adjudicates the decisive disagreements and
+  emits its output as evidence; the ruling stands on the owner's word until that exists.
+* **Gate 5.** Still the thing that would price a ~1e-3 prior shift in Elo rather than in
+  move agreement. The adjudication is a strong local check on the positions that diverged;
+  it is not a match result.
+* **Any budget beyond 6,400 simulations.** The corpus sweep was run at 1,600 and 6,400 and
+  the trend is the wrong way (98.65% -> 97.88%), so a third point would refine a curve
+  rather than change a decision. The engine plays at ~15k, where the trend predicts worse
+  agreement still — measuring that would sharpen the Gate 5 question, not answer it.
+* **A time-controlled match.** The brief's own estimate is +14 to +23 Elo from the
+  throughput, and it explicitly says the true figure at 15k simulations is likely at the low
+  end. Nothing in C12b measures Elo.
+* **Shape 16's regression.** Measured at 0.934x, reproducible, reported, not chased. The
+  ladder is C10b's.
+* **The C11c arena formula against the 90M net in play.** The per-search headroom is ~4x
+  (15.4 nodes/sim measured against 60 assumed), which is why the benchmark's accumulating
+  tree is not evidence about the engine's own sizing. A pondering engine at 60,000 + 60,000
+  simulations was not measured.
+* **Anything on Linux.** No CUDA there, so every C12b test skips and the arm certifies
+  nothing in this chunk.

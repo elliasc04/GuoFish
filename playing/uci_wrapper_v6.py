@@ -195,6 +195,13 @@ OPTIONS: tuple[Option, ...] = (
     Option("ValueScale", "value_scale", "string", _parse_optional_float),
     Option("MaxBatch", "max_batch", "spin", int, "min 1 max 1024"),
     Option("Graphs", "graphs", "check", _parse_bool),
+    # C12b. Like `Graphs`, this is read ONCE — at `ensure_ready`, when the
+    # forward is compiled and captured — so a GUI must set it before the first
+    # `isready` for it to have any effect. Default on: the engine ships the
+    # Inductor forward. Turning it off selects tag GUOFISH_NUMERICS_BASELINE's
+    # unfused eager numerics, which is what Gate 2 and Gate 2b certified and what
+    # a regression is bisected against.
+    Option("Compile", "compile", "check", _parse_bool),
     Option("Pin", "pin", "check", _parse_bool),
     Option("SwitchInterval", "switch_interval", "string", float),
 

@@ -325,16 +325,80 @@ different iteration counts — always read it next to the `iters` column.
 produced by the Python reference only, by scripts under `tools/`, and it is never
 regenerated to make a test pass (Global Rules 1 and 2).
 
-| file | generator | size |
-|---|---|---:|
-| `movegen.jsonl` | `tools/gen_movegen_golden.py` | 27 MB |
-| `tokens.npz` | `tools/gen_token_golden.py` | 3.2 MB |
-| `keys.jsonl`, `keys_adversarial.jsonl` | `tools/gen_key_golden.py` | 13 MB |
-| `gate1_dump.npz`, `gate1_trees.npz`, `gate1_manifest.json` | `tools/gen_gate1_golden.py` | 19 MB |
-| `gate1_terminal_dump.npz`, `gate1_terminal_trees.npz`, `gate1_terminal_manifest.json` | `tools/gen_gate1_golden.py --corpus terminal` | 9 MB |
-| `c10_corpus.json` | `tools/gen_c10_corpus.py` | 90 KB |
-| `c10_gate2.npz`, `c10_gate2_manifest.json` | `tools/gen_c10_gate2_golden.py` | 3 MB |
-| `c10_gate2b.json`, `c10_gate2b_manifest.json` | `tools/gen_c10_gate2b_golden.py --sims 1600` | 1 MB |
+### Which checkpoint each gate is anchored to (C12b decision)
+
+**Two checkpoints are in play, and the split is deliberate.** They are the same v5
+architecture — 10,887,681 parameters, 68 tokens, `d_model` 384 × 6 layers — and
+differ only in the corpus they were trained on and therefore in their weights:
+
+* **`models/guofish5_20M/v5_10.9M_best.pt`** (sha `98e557d0…`) — the checkpoint
+  every golden file below was generated against, and the one
+  `playing/v6/evaluator.py`'s `DEFAULT_MODEL` still loads.
+* **`models/guofish5_90M/v5_10.9M_best.pt`** (sha `0b070269…`) — the checkpoint
+  the *engine* ships: `playing/v6/playv6.py`'s `DEFAULT_MODEL`, what
+  `uci_wrapper_v6.py` hands every tournament arm, and what
+  `tools/run_90M_vs_stockfish.ps1` benches. Exposed to library callers as
+  `playing/v6/evaluator.py`'s `SHIPPING_MODEL`.
+
+**C12b and Gate 2' use the 90M checkpoint. Every gate listed in the table below
+stays on the 20M one, and none of them is regenerated.** The reasoning:
+
+1. **A throughput optimisation and a numerics re-baselining belong on the net that
+   will actually be tuned and played.** C12b adopts Inductor and re-bases the
+   numerics gate onto the frozen eager engine; measuring that on a checkpoint the
+   engine no longer loads would optimise for a net nobody runs.
+2. **The gates below cannot simply follow it.** Their goldens come from the Python
+   reference (Global Rule 2), so re-anchoring them means regenerating `golden/` —
+   which Global Rule 1 forbids and Amendment A repeats. Regenerating would also
+   discard the historical record: C10's Gate 2b result of 497/500 is the evidence
+   that the C++ port matches Python, and it is evidence about the port, not about
+   any particular set of weights.
+3. **So the split is kept and made explicit rather than resolved.**
+   `evaluator.DEFAULT_MODEL` stays at 20M so that `build()` with no model still
+   matches the goldens and `tests/test_c10_gate2b.py` and
+   `tests/test_c10b_graphs.py` keep certifying what they certified.
+   `evaluator.SHIPPING_MODEL` is 90M and every C12b artifact names it explicitly.
+   `tests/test_c12b_gate2prime.py::test_the_two_model_constants_still_mean_what_they_say`
+   asserts both halves, so the split cannot decay into an accident: if the two
+   constants ever collapse onto one path, that test fails and says why.
+
+Gate 2''s own artifacts therefore live in **`baseline/`, not `golden/`** — they are
+C++ and torch output rather than Python-reference output, so Global Rule 2 keeps
+them out of `golden/` entirely. See `tools/gen_c12b_baseline.py`.
+
+| file | generator | reference model | size |
+|---|---|---|---:|
+| `movegen.jsonl` | `tools/gen_movegen_golden.py` | — (no network) | 27 MB |
+| `tokens.npz` | `tools/gen_token_golden.py` | — (no network) | 3.2 MB |
+| `keys.jsonl`, `keys_adversarial.jsonl` | `tools/gen_key_golden.py` | — (no network) | 13 MB |
+| `gate1_dump.npz`, `gate1_trees.npz`, `gate1_manifest.json` | `tools/gen_gate1_golden.py` | `guofish5_20M/v5_10.9M_best.pt` | 19 MB |
+| `gate1_terminal_dump.npz`, `gate1_terminal_trees.npz`, `gate1_terminal_manifest.json` | `tools/gen_gate1_golden.py --corpus terminal` | `guofish5_20M/v5_10.9M_best.pt` | 9 MB |
+| `gate1_cache_trees.npz`, `gate1_cache_terminal_trees.npz`, `gate1_cache_manifest.json` | `tools/gen_c7_cache_golden.py` | `guofish5_20M/v5_10.9M_best.pt` | 2.9 MB |
+| `c8_reuse_dump.npz`, `c8_reuse_trees.npz`, `c8_reuse_manifest.json` | `tools/gen_c8_reuse_golden.py` | `guofish5_20M/v5_10.9M_best.pt` | 14 MB |
+| `c10_corpus.json` | `tools/gen_c10_corpus.py` | — (FEN list only) | 90 KB |
+| `c10_gate2.npz`, `c10_gate2_manifest.json` | `tools/gen_c10_gate2_golden.py` | `guofish5_20M/v5_10.9M_best.pt` | 3 MB |
+| `c10_gate2b.json`, `c10_gate2b_manifest.json` | `tools/gen_c10_gate2b_golden.py --sims 1600` | `guofish5_20M/v5_10.9M_best.pt` | 1 MB |
+| `c11b_gate2_temp.npz`, `c11b_gate2_temp_manifest.json` | `tools/gen_c11b_gate2_temp_golden.py` | `guofish5_20M/v5_10.9M_best.pt` | 508 KB |
+
+Every row whose reference model is `—` is network-free and is unaffected by any
+checkpoint change: the tokenizer, the movegen oracle and the Zobrist keys do not
+run a forward pass, and `c10_corpus.json` is a list of FENs. **`gate1_dump.npz` is
+the interesting middle case** — it *records* model priors and values, but Gate 1
+replays them with no network in the loop, so what it certifies is tree-logic
+equivalence rather than anything about the weights. It is listed with its
+checkpoint because the recorded numbers came from one, not because the gate is a
+statement about it.
+
+**Not golden data, listed here so it is not mistaken for it:**
+
+| file | generator | reference model | size |
+|---|---|---|---:|
+| `baseline/c12b_eager_forward.npz`, `baseline/c12b_eager_search.json`, `baseline/c12b_eager_manifest.json` | `tools/gen_c12b_baseline.py` | `guofish5_90M/v5_10.9M_best.pt` | 13 MB |
+
+These are the eager C++ engine's own outputs, frozen at tag
+`GUOFISH_NUMERICS_BASELINE` so Gate 2' has a fixed artifact to compare the
+Inductor engine against. They are produced from C++ and torch, never from the
+Python reference, which is exactly why they are not in `golden/`.
 
 The Gate 1 files are the only ones whose generation needs a GPU and the v5
 checkpoint. The quiet corpus takes ~35 minutes, the terminal corpus ~25:
