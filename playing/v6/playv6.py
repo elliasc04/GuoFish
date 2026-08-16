@@ -405,9 +405,21 @@ class EngineConfig:
     dirichlet_alpha: float = 0.3
 
     # --- budgets ----------------------------------------------------------
-    # The per-move simulation budget when the GUI sends no `nodes`. `sim_cap`
-    # bounds whatever it does send; `fixed_sims`, when set, overrides both and is
-    # what a fixed-budget tournament pins.
+    # `fixed_sims` IS THE PER-MOVE BUDGET and is what `--sims` sets. `sim_cap`
+    # bounds whatever `go nodes` asks for and sizes the arena; `default_sims` is
+    # the floor under a `go` that carried neither a clock nor nodes.
+    #
+    # NO LONGER A COMMAND-LINE FLAG (the `--sims`/`--fixed-sims` collapse; see
+    # `add_config_arguments`). It stays a FIELD, with its `DefaultSims` UCI
+    # option, because `_plan`'s last branch needs a number and `fixed_sims` may
+    # not have one: `fixed_sims=None` is what "defer to the GUI" is spelled as,
+    # and `_plan` tests it first and returns deadline=None, so a non-None
+    # default here would make the engine ignore every clock in every game.
+    #
+    # In practice it is unreachable in a real game — lichess-bot and Cutechess
+    # both always send a clock or nodes — and it exists for a bare `go` at a
+    # terminal and as the CLI/interactive fallback (`fixed_sims or
+    # default_sims`).
     default_sims: int = 5_000
     sim_cap: int = 60_000
     fixed_sims: Optional[int] = None
@@ -569,10 +581,58 @@ class EngineConfig:
         backstop for the position that beats the estimate anyway, and
         `tools/bench_c11c_arena.py` reports the measured high-water against this
         prediction rather than trusting it.
+
+        THE FLOOR IS `sim_cap`, NOT `sims_per_move`, AND THAT IS DELIBERATE.
+        `sims_per_move` collapses to `fixed_sims` when one is pinned, so once
+        `--sims` became `fixed_sims` (see `add_config_arguments`) a plain
+        `--sims 4000` would have sized the arena at 60 x 8,000 = 480k nodes
+        where it previously got `sim_cap`'s 7.2M. That is ample for ONE search
+        — ~15.4 nodes/sim measured, so ~62k nodes at 4,000 sims — and is the
+        wrong budget for an ACCUMULATING tree. DECISIONS.md's C12b entry is the
+        record of exactly that mistake: a reuse arm running seven searches of
+        20,000 new simulations on one tree needed 1,436,625 nodes, exhausted a
+        1.2M arena sized off one move's allowance, and delivered 6,666 of
+        20,000. `playv6 --selfplay` accumulates the same way.
+
+        Taking the max keeps the sizing where it has always been for every
+        invocation that does not pin `arena_capacity`, so the flag collapse
+        changes no run's memory profile. The cost is over-provisioning a
+        fixed-budget run — 536 MB at the shipping `sim_cap` regardless of the
+        budget — which is a deliberate trade: at the concurrency this engine
+        runs at, that is affordable, and the failure it buys off is a degraded
+        game rather than a slow one.
+
+        WHY THIS AND NOT `sims_per_move` ITSELF. `sims_per_move` also feeds
+        `ponder_max_sims_resolved`, and pinning THAT to `sim_cap` would let a
+        ponder in a `--sims 2000` run spend 60,000 simulations against the
+        2,000 the next move gets — scope E6's over-commit defect, restored
+        verbatim. The arena is the only consumer that wants the wider number,
+        so the widening lives here and nowhere else: BOTH terms are recomputed
+        as if no fixed budget were pinned, while the ceilings the SEARCH runs
+        under stay tied to the budget actually asked for.
         """
         if self.arena_capacity is not None:
             return self.arena_capacity
-        return 60 * (self.sims_per_move + self.ponder_max_sims_resolved)
+        budget, ponder = self.arena_sizing_terms
+        return 60 * (budget + ponder)
+
+    @property
+    def arena_sizing_terms(self) -> tuple[int, int]:
+        """(budget, ponder ceiling) the arena is sized from. See `arena_nodes`.
+
+        Separate from `sims_per_move` / `ponder_max_sims_resolved` — which are
+        what the SEARCH is bounded by — and returned as a pair so `describe()`
+        prints the formula it actually used rather than a second copy of it
+        that can drift.
+
+        An explicitly pinned `ponder_max_sims` is honoured: an operator who
+        named that number meant it, and it is the ponder ceiling the search
+        will really run under.
+        """
+        budget = max(self.sims_per_move, self.sim_cap)
+        if self.ponder_max_sims is not None:
+            return budget, self.ponder_max_sims
+        return budget, max(1, int(math.ceil(budget / self.ponder_decay)))
 
     @property
     def arena_bytes(self) -> int:
@@ -820,7 +880,7 @@ class EngineConfig:
             f"cache_shards={self.cache_shards or 'default'} "
             f"arena: 2 x {self.arena_nodes:,} nodes "
             f"({self.arena_bytes / (1024 * 1024):.1f} MB total) "
-            f"[{'explicit' if self.arena_capacity is not None else f'computed 60 x ({self.sims_per_move:,} + {self.ponder_max_sims_resolved:,})'}]"
+            f"[{'explicit' if self.arena_capacity is not None else f'computed 60 x ({self.arena_sizing_terms[0]:,} + {self.arena_sizing_terms[1]:,})'}]"
             # The arena COMMITS rather than reserves — measured at 268 MB RSS
             # for one 7.2M-node arena — so a footprint this size is real memory
             # and not address space. Warned rather than refused: it is a legal
@@ -847,7 +907,24 @@ class EngineConfig:
             f"{self.ponder_decay * self.ponder_max_sims_resolved:,.0f} "
             f"{'<=' if self.coupling_holds else '>'} sims_per_move "
             f"{self.sims_per_move:,} "
-            f"{'OK' if self.coupling_holds else 'VIOLATED: a ponder can out-weigh the fresh search it hands its tree to'}",
+            f"{'OK' if self.coupling_holds else 'VIOLATED: a ponder can out-weigh the fresh search it hands its tree to'}"
+            # C12c. WHAT THIS LINE CANNOT KNOW, said on the line itself.
+            #
+            # Every number above derives from `sims_per_move`, i.e. from
+            # `fixed_sims or sim_cap` — a value fixed before any `go` arrived.
+            # A GUI that sends `go nodes N` every move (lichess-bot with
+            # `go_commands.nodes`, cutechess with `nodes=`) is stating a smaller
+            # per-move budget than `sim_cap`, and the UCI layer re-derives the
+            # ponder ceiling from it per move as `N / ponder_decay`.
+            #
+            # So this line is the CEILING and the `[go] ponder:` line is what
+            # was actually spent. Saying so here is the difference between a
+            # startup record that is wrong and one that is bounded — and it is
+            # the same discipline as reporting delivered rather than requested
+            # simulations one layer down.
+            + f"  (a `go nodes N` lowers this at runtime to N/decay = "
+              f"N/{self.ponder_decay:g}; the [go] ponder: line reports what "
+              f"was used)",
             f"[config] budget     : default_sims={self.default_sims} "
             f"sim_cap={self.sim_cap} fixed_sims={self.fixed_sims} "
             f"slice_seconds={self.slice_seconds:g} "
@@ -1130,6 +1207,134 @@ def aggregate_sims_per_s(outcomes: Iterable[SearchOutcome]) -> tuple[float, dict
     counts["bypassed"] = len(outcomes) - len(searched)
     counts["excluded_wall_s"] = sum(o.wall_s for o in outcomes if o.bypassed)
     return (delivered / wall if wall > 0 else 0.0), counts
+
+
+# Replies below this share of the root's child visits are pruned from the ponder
+# tables. DISPLAY ONLY — every arithmetic caller (`inherited_by_next_search`,
+# `gained`, the transfer rate) reads the unpruned list, because the move a human
+# or a GUI actually plays is frequently a long-shot and its inherited visits are
+# exactly what the next search starts from.
+#
+# 0.20 is the operator's number. It is also self-limiting in a useful way: at
+# most five replies can hold a 20% share, so the table cannot run long and the
+# `top_n` cap effectively never binds at this threshold.
+PONDER_MIN_SHARE = 0.20
+
+
+def move_label(board, uci: Optional[str]) -> str:
+    """SAN for `uci` in `board`, falling back to the UCI string.
+
+    SAN BECAUSE THESE LINES ARE READ BY A PERSON. `g1f3` and `Nf3` name the same
+    move and only one of them can be recognised at a glance in a list of six.
+    The reference did the same thing and for the same reason (core/mctsv4.py's
+    `_san` helper, used in every ponder line it printed).
+
+    Total, never raising: the caller is emitting a diagnostic, and a diagnostic
+    that can throw is worse than one that degrades to coordinates. A board that
+    is None, a move that is illegal in it, or a python-chess that is not
+    importable all fall back rather than fail.
+    """
+    if uci is None:
+        return "none"
+    if board is None:
+        return uci
+    try:
+        import chess
+        return board.san(chess.Move.from_uci(uci))
+    except Exception:                                            # noqa: BLE001
+        return uci
+
+
+def format_root_branches(branches: list[tuple[str, int, float]], *,
+                         predicted: Optional[str] = None,
+                         played: Optional[str] = None,
+                         before: Optional[dict] = None,
+                         board=None,
+                         top_n: int = 5,
+                         min_share: float = PONDER_MIN_SHARE,
+                         prefix: str = "[ponder]") -> list[str]:
+    """The branch table, one line per reply. See `Engine.root_branches`.
+
+    A TABLE RATHER THAN THE REFERENCE'S INLINE LIST, and that is the whole of
+    the change. core/mctsv4.py printed
+    `branches=[Nf3(32w,1640v)]` and `branch_visits=[Nf3:2140v, e5:830v]` beside
+    a separate `actual_visits=2140`: three encodings of the same quantity, two
+    of them packing two numbers into one parenthesis behind single-letter
+    suffixes, and the one number that matters — what the NEXT search inherits —
+    repeated at the end where it reads as a fourth unrelated field. Columns with
+    headings, one row per reply, and the two roles marked in place instead.
+
+    `predicted` is the reply the engine expected; `played` is the one that
+    actually arrived. They are marked separately because a hit is exactly the
+    case where they coincide, and a table that could only show one of them
+    would be unable to say so.
+
+    `before` is `{uci: visits}` from the same call taken earlier, and adding it
+    turns on a `gained` column. THAT COLUMN IS THE ONE THAT ANSWERS THE
+    QUESTION. A branch holding 2,140 visits has told you nothing about the
+    ponder until you know whether 1,890 of them or 40 of them arrived during
+    it; the reference printed only the total and left the reader to remember
+    what it had been.
+    """
+    if not branches:
+        return [f"{prefix}   (no visited replies - the ponder built nothing)"]
+    # MATCHING STAYS ON UCI, DISPLAY BECOMES SAN. `predicted` and `played` are
+    # coordinates because that is what the tree and the callers hold; rendering
+    # is the last step, so an unlabellable move degrades to coordinates in one
+    # column instead of silently failing to match.
+    # PRUNE AND TRUNCATE FOR DISPLAY ONLY, and never drop the played move. A
+    # reply below the threshold is common — a human plays one often — and its
+    # inherited visits are exactly what the next search starts from, so if it
+    # was pruned it is pulled back on rather than being silently reported as
+    # unvisited. That is the bug a real game caught, where a branch holding 207
+    # visits at a 0% share was called absent while the engine printed
+    # `reused: 207` on the very next line.
+    kept = [row for row in branches if row[2] >= min_share]
+    if not kept:
+        # A flat distribution where nothing clears the bar. An empty table is
+        # strictly less useful than the leader, so the leader always shows.
+        kept = branches[:1]
+    shown = kept[:top_n]
+    elided = len(branches) - len(shown)
+    if played is not None and all(uci != played for uci, _, _ in shown):
+        pulled = [row for row in branches if row[0] == played]
+        if pulled:
+            shown = shown + pulled
+            elided -= 1
+
+    labels = {uci: move_label(board, uci) for uci, _, _ in shown}
+    # At least as wide as the heading, or the header row runs a character long
+    # and every column below it is off by one.
+    width = max(5, max(len(label) for label in labels.values()))
+    header = f"{prefix}   {'reply':<{width}}  {'visits':>9}  {'share':>6}"
+    if before is not None:
+        header += f"  {'gained':>8}"
+    lines = [header]
+    for uci, visits, share in shown:
+        marks = []
+        if predicted is not None and uci == predicted:
+            marks.append("predicted")
+        if played is not None and uci == played:
+            marks.append("PLAYED -> inherited by the next search")
+        note = f"   <- {', '.join(marks)}" if marks else ""
+        row = (f"{prefix}   {labels[uci]:<{width}}  {visits:>9,}  {share:>6.0%}")
+        if before is not None:
+            row += f"  {visits - before.get(uci, 0):>+8,}"
+        lines.append(row + note)
+    if elided > 0:
+        why = (f" below the {min_share:.0%} share threshold" if min_share > 0
+               else "")
+        lines.append(f"{prefix}   ... and {elided:,} more visited "
+                     f"{'reply' if elided == 1 else 'replies'}{why}")
+    # Tested against the FULL list, not the displayed one. This is the
+    # reference's near-zero case and it has to mean what it says: the played
+    # move genuinely received no visits, so the next search starts cold.
+    if played is not None and all(uci != played for uci, _, _ in branches):
+        lines.append(f"{prefix}   {move_label(board, played)} received NO "
+                     f"visits: the ponder built nothing on the line that was "
+                     f"played, and the next search starts from an unvisited "
+                     f"branch")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -2066,6 +2271,53 @@ class Engine:
             deadline_hit=deadline_hit,
         )
 
+    def root_branches(self, top_n: Optional[int] = None
+                      ) -> list[tuple[str, int, float]]:
+        """[(uci, visits, share)] for the root's children, most-visited first.
+
+        ALL OF THEM BY DEFAULT, and truncation is the display layer's job.
+        Returning the top 5 here was a bug caught by a real game: the caller
+        looks the PLAYED move up in this list to report what the next search
+        inherits, and a reply outside the top 5 was reported as having inherited
+        nothing. The engine then printed `reused: 208` on the very next move and
+        contradicted it. `format_root_branches(top_n=...)` shortens the table;
+        every arithmetic caller sees the whole list.
+
+        THE PONDER DIAGNOSTIC, and the one number that says whether pondering
+        did anything useful. The reference printed the same thing from
+        `root.children[m].visit_count` (core/mctsv4.py, `apply_move`'s
+        `branch_visits=[...]`) with the comment that says why it exists: if the
+        branch the opponent actually played is near-zero on a hit, the ponder
+        work did not transfer and the next search starts from nothing.
+
+        `share` is of the CHILDREN's total, not of `root_visits`, so the figures
+        sum to 1.0 and are read as "how the search divided its attention". The
+        root carries its own seed visit and including it would make a
+        two-reply position look like it had spent 3% of its effort somewhere
+        invisible.
+
+        Reads `dump_tree_arrays(1)` — the VISITED subtree, one node per
+        simulation rather than the ~30 per expansion the arena holds — and takes
+        the depth-1 rows, which are exactly the root's children. Unvisited
+        children are absent by construction, which is correct: a reply with no
+        visits is not a branch the ponder built.
+        """
+        if self.search is None:
+            return []
+        arrays = self.search.dump_tree_arrays(1)
+        depth = arrays["depth"]
+        if depth.size == 0:
+            return []
+        visits, packed = arrays["visits"], arrays["move"]
+        rows = [(int(visits[i]), int(packed[i]))
+                for i in range(int(depth.size)) if int(depth[i]) == 1]
+        if not rows:
+            return []
+        rows.sort(key=lambda row: row[0], reverse=True)
+        total = sum(count for count, _ in rows) or 1
+        return [(guofish_core.move_to_uci(move), count, count / total)
+                for count, move in (rows if top_n is None else rows[:top_n])]
+
     def _principal_variation(self, best: Optional[str], max_plies: int = 12
                              ) -> tuple[float, list[str], int, int]:
         """(best child Q, PV, PV length, deepest visited ply).
@@ -2273,13 +2525,42 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--verify-compaction", action="store_true", default=False)
 
     g = parser.add_argument_group("budget")
-    g.add_argument("--sims", dest="default_sims", type=int,
-                   default=EngineConfig.default_sims,
-                   help="per-move budget when the GUI sends no 'nodes'")
+    # ONE FLAG FOR THE PER-MOVE BUDGET, and it is `fixed_sims`.
+    #
+    # It was two until now — `--sims` bound to `default_sims` and `--fixed-sims`
+    # to `fixed_sims` — and that was a trap rather than a choice. In
+    # uci_wrapper.py and uci_wrapper_v5.py `--sims` IS the fixed budget
+    # (`fixed_sims=args.sims`, "force every search to use exactly this many
+    # sims, ignoring 'go nodes' / time-control args from the GUI"), and every
+    # ELO run this project has published used it that way: the 2878 @ 10k
+    # sweeps, run_15k_ab.ps1, tune_cpuct.bat. v6 silently rebound the same
+    # spelling to the LOWEST-precedence branch of `_plan` — the fallback for a
+    # `go` carrying neither a clock nor nodes — so the flag that used to
+    # override the GUI became the one the GUI overrides. Same name, inverted
+    # precedence, no error.
+    #
+    # In the CLI and interactive frontends the two were redundant anyway:
+    # `budget = fixed_sims or default_sims` is "whichever of these you set",
+    # and there is no GUI there for `--fixed-sims` to override.
+    #
+    # `default_sims` SURVIVES AS A FIELD, because the UCI fallback branch needs
+    # a number and `fixed_sims=None` is load-bearing: `_plan` tests
+    # `fixed_sims is not None` FIRST and returns deadline=None, so giving it a
+    # non-None default would make the engine ignore every clock in every game.
+    # It keeps its `DefaultSims` UCI option; it is simply no longer a flag
+    # anybody types.
+    g.add_argument("--sims", "--fixed-sims", dest="fixed_sims", type=int,
+                   default=None,
+                   help="THE per-move simulation budget: force every move to "
+                        "this many sims and ignore the clock. This is v5's "
+                        "--sims contract, restored. Omit to let the GUI decide "
+                        "(go nodes / the clock), which is what a rated game "
+                        "wants; set it for fixed-budget benchmarking. In the "
+                        "CLI and interactive frontends there is no GUI, so this "
+                        "is simply the budget (default: DefaultSims, 5000)")
     g.add_argument("--sim-cap", type=int, default=EngineConfig.sim_cap,
-                   help="ceiling on whatever 'go nodes N' asks for")
-    g.add_argument("--fixed-sims", type=int, default=None,
-                   help="force every move to this budget, ignoring the GUI")
+                   help="ceiling on whatever 'go nodes N' asks for, AND the "
+                        "quantity the arena is sized from (see arena_nodes)")
     g.add_argument("--slice-seconds", type=float, default=EngineConfig.slice_seconds,
                    help="wall-clock granularity at which 'stop' and the clock "
                         "are answered")
@@ -2428,6 +2709,8 @@ __all__ = [
     "add_config_arguments",
     "apply_switch_interval",
     "config_from_args",
+    "format_root_branches",
+    "move_label",
     "preimport_torch",
     "q_to_centipawns",
 ]

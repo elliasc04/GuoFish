@@ -122,7 +122,10 @@ def build_command(args, out_dir: Path) -> list[str]:
         "--sim-cap", str(args.sim_cap),
     ]
     if args.fixed_sims:
-        engine_args += ["--fixed-sims", str(args.fixed_sims)]
+        # `--sims` since the flag collapse; `--fixed-sims` survives as an
+        # argparse alias on the same option, so either spelling still lands on
+        # EngineConfig.fixed_sims.
+        engine_args += ["--sims", str(args.fixed_sims)]
     # C11b. NOTHING IS PASSED WHEN THE DEFAULTS ARE WANTED, so the smoke run
     # exercises the shipping configuration rather than a configuration only this
     # harness produces. The flags exist for the contrast run.

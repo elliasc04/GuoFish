@@ -71,6 +71,7 @@ C9's design, and deliberately not changed here.
 from __future__ import annotations
 
 import argparse
+import math
 import queue
 import sys
 import threading
@@ -90,7 +91,7 @@ import guofish_core  # noqa: E402
 from playing.v6.playv6 import (  # noqa: E402
     ConfigError, Engine, EngineConfig, SearchOutcome, add_config_arguments,
     apply_switch_interval, config_from_args, err, force_utf8_streams,
-    preimport_torch,
+    format_root_branches, move_label, preimport_torch,
 )
 
 ENGINE_NAME = "GuoFish v6"
@@ -692,6 +693,19 @@ class UCIEngine:
             else:
                 budget, _, nominal, source, plan = self._plan(params)
                 err(f"[go] {plan}")
+                # THE PREDICTION, NAMED. Standard UCI gives the engine the
+                # position INCLUDING the predicted reply, so the prediction is
+                # not something this engine chose — it is the last move of the
+                # position the GUI handed us, which is the `ponder` move our own
+                # previous `bestmove` suggested (see `_emit_bestmove`). Logging
+                # it is what lets a reader of the stderr alone reconstruct what
+                # was being pondered, which the reference printed as
+                # `predicted=[...]` from its own top-K.
+                err(f"[ponder] start: predicted={self._predicted_san()} "
+                    f"root_visits={int(self.engine.search.root_visits)} "
+                    f"(inherited from the last search) "
+                    f"ceiling={self.config.ponder_max_sims_resolved} fresh sims, "
+                    f"no clock")
                 self._last_info = 0.0
                 self._searching.set()
                 try:
@@ -745,11 +759,33 @@ class UCIEngine:
         # C11c), so it has to be recoverable from an ordinary match log rather
         # than from an instrumented run nobody will do again. Machine-readable
         # and greppable: `tools/bench_c11c_ponder.py` counts these.
+        # NEW KEYS GO ON THE END. `tools/bench_c11c_ponder.py`'s `_VERDICT`
+        # regex matches the prefix through `bypassed=` and is not anchored, so
+        # appending is safe and reordering is not.
+        carried = int(self.engine.search.root_visits) if self.engine.ready else 0
         err(f"[ponder] verdict={'hit' if hit else 'miss'} "
             f"ponder_sims={ponder_outcome.delivered if ponder_outcome else 0} "
             f"ponder_wall_ms={(ponder_outcome.wall_s * 1000) if ponder_outcome else 0.0:.1f} "
             f"bypassed={bypass_source if bypass_uci else 'no'} "
-            f"quit={self._quit.is_set()}")
+            f"quit={self._quit.is_set()} "
+            f"predicted={self._predicted_san()} "
+            # WHAT THE PONDER IS HANDING OVER, which is the whole point of
+            # having pondered and the number the reference buried as
+            # `actual_visits=`. On a hit this becomes `inherited` on the very
+            # next `[search]` line and the two can be reconciled; on a miss it
+            # is what the GUI's next `position` will discard.
+            f"root_visits_carried={carried}")
+        if ponder_outcome is not None and not self._quit.is_set():
+            # The branch table, read while the pondered tree is still rooted
+            # where the ponder left it. On a hit the GUI has confirmed the
+            # prediction, so the whole root IS the branch that transfers and
+            # these are the continuations under it — one ply deeper than the
+            # interactive frontend's table, because UCI pondering is rooted a
+            # ply further in.
+            for line in format_root_branches(
+                    self.engine.root_branches(), board=self.board,
+                    prefix=f"[ponder] {'hit' if hit else 'miss'}"):
+                err(line)
 
         if not hit:
             # A MISS, or a `stop`, or `quit`. The GUI discards this bestmove; it
@@ -815,6 +851,27 @@ class UCIEngine:
         self._emit_info(outcome, final=True)
         self._emit_bestmove(outcome)
 
+    def _predicted_san(self) -> str:
+        """The GUI's ponder move in SAN, for the ponder log lines.
+
+        Standard UCI hands the engine the position ALREADY INCLUDING the
+        predicted reply, so the prediction is the last move of `self.board` —
+        which means SAN for it is defined against the position BEFORE that move,
+        not against the one being pondered. Hence the copy and the pop; using
+        `self.board` directly would either raise or, worse, name a different
+        legal move that happens to share the coordinates' destination.
+        """
+        if not self._moves:
+            return "unknown"
+        parent = self.board.copy()
+        try:
+            parent.pop()
+        except (IndexError, AssertionError):
+            # A `position fen ... moves ...` whose stack this board does not
+            # carry. Coordinates are still true.
+            return self._moves[-1]
+        return move_label(parent, self._moves[-1])
+
     def _plan(self, params: GoParams
               ) -> tuple[int, Optional[float], Optional[int], str, str]:
         """(root-visit target, deadline, requested sims, budget source, why).
@@ -833,9 +890,30 @@ class UCIEngine:
         cfg = self.config
         current = int(self.engine.search.root_visits) if self.engine.ready else 0
 
-        if cfg.fixed_sims is not None:
+        if cfg.fixed_sims is not None and not params.ponder:
             # Fixed-budget tournaments compare engines on simulation count, so
             # the clock is deliberately not consulted. v5's --sims contract.
+            #
+            # `not params.ponder` IS LOAD-BEARING AND WAS A BUG WITHOUT IT.
+            # A ponder has no clock, so "ignore the clock" says nothing about
+            # it, and this branch returns an ABSOLUTE budget — which a ponder
+            # must never take, because it runs on a tree that has already been
+            # searched. With FixedSims=4000 and a root already holding 4,000
+            # visits from the previous move, `current >= budget` on the first
+            # pass of the slice loop and the ponder delivers ZERO simulations,
+            # then sits in the idle wait until the GUI speaks. Pondering
+            # silently does nothing, and the only symptom is ponder_sims=0 on a
+            # verdict line nobody reads.
+            #
+            # It was unreachable until the --sims/--fixed-sims collapse, since
+            # nothing set FixedSims by default; the collapse put it behind the
+            # flag every fixed-budget run types. The ponder branch below is the
+            # correct one for this case and needs no special-casing: its
+            # ceiling is `ponder_max_sims_resolved`, which is DERIVED from
+            # `sims_per_move` and therefore from `fixed_sims` when one is
+            # pinned. A fixed-budget ponder is bounded by the fixed budget
+            # already — as `current + fixed_sims/decay` fresh sims, which is
+            # what a ponder is supposed to get.
             return (cfg.fixed_sims, None, cfg.fixed_sims, "fixed",
                     f"fixed budget {cfg.fixed_sims} sims (clock ignored; "
                     f"FixedSims is set)")
@@ -849,7 +927,23 @@ class UCIEngine:
                 clock_note = f"{allotted * 1000:.0f} ms allotted"
 
         nodes = params.get("nodes")
-        if nodes is not None:
+        if nodes is not None and not params.ponder:
+            # `not params.ponder` FOR THE SAME REASON THE FIXED BRANCH CARRIES
+            # IT, and this is the door that is actually open in deployment.
+            #
+            # python-chess puts `nodes` on the ponder line: `_go` appends it
+            # whenever the Limit carries one and `ponder=True` only prepends the
+            # keyword, while lichess-bot ponders with `copy.copy(limit)`. So a
+            # config with `go_commands.nodes: N` and `ponder: true` sends
+            # `go ponder ... nodes N`, and without this guard the ponder would
+            # take an ABSOLUTE budget of N instead of its own ceiling — capped
+            # at N TOTAL root visits rather than given `ponder_max_sims`
+            # FRESH ones, and delivering nothing at all once the pondered root
+            # already holds N.
+            #
+            # A `nodes` count is the GUI's budget for A MOVE. A ponder is not a
+            # move; it is speculative work on the opponent's clock, and the
+            # quantity that bounds it is `ponder_max_sims_resolved`.
             budget = max(1, min(nodes, cfg.sim_cap))
             note = f"go nodes {nodes} -> budget {budget}"
             if nodes > cfg.sim_cap:
@@ -870,12 +964,57 @@ class UCIEngine:
             # reason — see EngineConfig.ponder_max_sims_resolved — and the
             # coupling it satisfies is printed on the startup line beside it.
             cap = cfg.ponder_max_sims_resolved
+            source_note = "PonderMaxSims"
+
+            # THE GUI'S OWN BUDGET FOR THIS MOVE, WHEN IT STATED ONE, BEATS THE
+            # STARTUP ESTIMATE. `ponder_max_sims_resolved` derives from
+            # `sims_per_move`, which is `fixed_sims or sim_cap` — a guess made
+            # before any `go` arrived, and justified on the reasoning that "every
+            # timed search runs to current + sim_cap and stops on the clock".
+            # That reasoning holds for a clock-governed tournament and fails for
+            # a harness that sends `nodes` every move: lichess-bot with
+            # `go_commands.nodes: 25000` makes the real per-move budget 25,000
+            # while `sim_cap` sits at its 60,000 default and never binds.
+            #
+            # Left alone, the ponder would spend 60,000 simulations to feed a
+            # 25,000-simulation move. At `ponder_decay=1.0` the inherited visits
+            # carry FULL weight, so the fresh search cannot outvote a verdict
+            # formed by a tree 2.4x its size — scope E6's over-commit exactly,
+            # and invisible because `coupling_holds` compares against `sim_cap`
+            # and cheerfully reports OK.
+            #
+            # python-chess puts `nodes` on the ponder line (`_go` appends it
+            # whenever the Limit carries one), so the number is right here and
+            # needs no remembering across moves. Taking the MINIMUM keeps
+            # `PonderMaxSims` an upper bound an operator can still lower.
+            # DIVIDED BY THE DECAY, exactly as `ponder_max_sims_resolved` is.
+            # The quantity a ponder must not outweigh is not the move budget but
+            # the move budget the FRESH search can outvote, and that is what
+            # `ponder_decay` sets: C8 decays inherited visits on a hit, so at
+            # decay 0.5 a 100,000-visit pondered tree arrives weighing 50,000
+            # and a 50,000-simulation fresh search can still overturn it. Capping
+            # at the raw budget would make `PonderDecay` unable to buy the deeper
+            # ponder it exists to permit.
+            #
+            # At the default decay of 1.0 this is the raw budget, which is the
+            # case that matters most: nothing is decayed, so a ponder larger than
+            # the move it feeds hands the fresh search a tree it cannot outvote.
+            nodes = params.get("nodes")
+            if nodes is not None:
+                move_budget = max(1, min(nodes, cfg.sim_cap))
+                allowed = max(1, int(math.ceil(move_budget / cfg.ponder_decay)))
+                if allowed < cap:
+                    cap = allowed
+                    source_note = (f"go nodes {nodes} / decay {cfg.ponder_decay:g}"
+                                   f", the GUI's budget for this move")
+
             budget = current + cap
             coupling = ("" if cfg.coupling_holds else
                         " WARNING: decay x ponder_max_sims exceeds sims_per_move; "
                         "a hit hands the next search a tree it cannot outvote")
             return (budget, None, None, "ponder",
-                    f"ponder: up to {cap} new sims (root at {current}), no clock, "
+                    f"ponder: up to {cap} new sims (root at {current}) "
+                    f"[{source_note}], no clock, "
                     f"ending on ponderhit/stop.{coupling}")
 
         if params.infinite:
@@ -921,6 +1060,25 @@ class UCIEngine:
             return (current + cfg.fixed_sims, None, cfg.fixed_sims, "fixed",
                     f"fixed budget {cfg.fixed_sims} FRESH sims on the pondered "
                     f"tree (root at {current}; clock ignored, FixedSims is set)")
+
+        nodes = params.get("nodes")
+        if nodes is not None:
+            # THE GUI ASKED FOR A NODE BUDGET AND STILL MEANS IT. Without this,
+            # a `go ponder ... nodes N` that HITS fell through to the clock
+            # below, so a pondered move was timed while every other move in the
+            # same game was node-bounded — the one budget model the operator did
+            # not choose, applied to exactly the moves the prediction got right.
+            #
+            # `current + N` rather than an absolute N, for the reason this whole
+            # method exists: the ponder's simulations ran on the OPPONENT's
+            # clock and are a bonus, not a draw against this move's allocation.
+            # An absolute N would let a productive ponder arrive with the budget
+            # already spent and return instantly with zero fresh work.
+            budget = max(1, min(nodes, cfg.sim_cap))
+            return (current + budget, None, budget, "ponderhit",
+                    f"ponderhit: {budget} FRESH sims on the pondered tree "
+                    f"(root at {current}; go nodes {nodes}, clock not consulted "
+                    f"because the GUI asked in nodes)")
 
         allotted = self._allot(params)
         if allotted is None:

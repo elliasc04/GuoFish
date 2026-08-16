@@ -22,6 +22,7 @@ coverage/
 /runs/capacity_suite
 /runs/c12
 /runs/c12b
+/probe
 
 # --- GuoFish multiPV data pipeline ---
 # Raw Lichess eval dump (~21GB) and any decompressed/derived form. Never committed.

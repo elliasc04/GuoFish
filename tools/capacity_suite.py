@@ -2208,7 +2208,7 @@ def run_check() -> int:
     log("wrapper flags derived from the current signature "
         "(playing/v6/playv6.add_config_arguments):")
     log("  --model --threads --max-outstanding --max-batch --affinity "
-        "--sim-cap --fixed-sims")
+        "--sim-cap --sims")
     log("  --c-puct-init --fpu-tree --policy-temperature --value-scale")
     log("  --no-book --book-path --book-seed --no-syzygy --syzygy-path")
     log("  book and Syzygy DEFAULT ON; the shipping W/K/max_batch/affinity IS "

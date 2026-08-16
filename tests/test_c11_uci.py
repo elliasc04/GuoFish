@@ -513,6 +513,346 @@ def test_fixed_sims_reads_zero_as_off(raw, expected):
 
 
 # ---------------------------------------------------------------------------
+# The budget flag, after the --sims/--fixed-sims collapse
+# ---------------------------------------------------------------------------
+
+
+def _cli(argv: list[str]) -> EngineConfig:
+    import argparse
+    parser = argparse.ArgumentParser()
+    playv6.add_config_arguments(parser)
+    return playv6.config_from_args(parser.parse_args(argv))
+
+
+@pytest.mark.parametrize("flag", ["--sims", "--fixed-sims"])
+def test_the_budget_flag_sets_fixed_sims_not_default_sims(flag):
+    """`--sims` IS the per-move budget, which is v5's contract restored.
+
+    It bound to `default_sims` from C11 to C12b — the LOWEST-precedence branch
+    of `_plan`, reached only when a `go` carries neither a clock nor nodes — so
+    the flag that overrode the GUI in `uci_wrapper.py` and `uci_wrapper_v5.py`
+    (`fixed_sims=args.sims`) became the one the GUI overrides. Every published
+    ELO run used the v5 meaning; nothing ever used the v6 one.
+    """
+    config = _cli([flag, "12345"])
+    assert config.fixed_sims == 12345
+    assert config.default_sims == EngineConfig.default_sims, (
+        "the budget flag must not touch default_sims, which is now only the "
+        "no-clock-no-nodes fallback")
+
+
+def test_omitting_the_budget_flag_leaves_the_gui_in_charge():
+    """`fixed_sims is None` is how "defer to the GUI" is spelled.
+
+    `_plan` tests it FIRST and returns `deadline=None`, so a non-None default
+    here would make the engine ignore every clock in every game. That is the
+    reason `default_sims` survives as a separate field rather than being folded
+    into this one.
+    """
+    assert _cli([]).fixed_sims is None
+
+
+def test_both_spellings_are_one_option():
+    """`--fixed-sims` is an argparse alias, not a second knob.
+
+    Kept so `tools/smoke_c11.py` and the recorded permission strings in
+    `.claude/settings*.json` keep working verbatim; it must land on the same
+    field, or the collapse would have created the ambiguity it removed.
+    """
+    assert _cli(["--sims", "7000"]).fixed_sims == _cli(["--fixed-sims", "7000"]).fixed_sims
+
+
+class _StubEngine:
+    """Just enough `Engine` for `_plan`: a ready flag and a root visit count."""
+
+    ready = True
+
+    def __init__(self, root_visits: int):
+        self.search = type("_S", (), {"root_visits": root_visits})()
+
+
+def _plan_for(config: EngineConfig, argv: list[str], root_visits: int = 0):
+    import chess
+    module = wrapper()
+    uci = module.UCIEngine.__new__(module.UCIEngine)
+    uci.config = config
+    uci.engine = _StubEngine(root_visits)
+    uci.board = chess.Board()
+    return uci._plan(module.GoParams(argv))
+
+
+@requires_wrapper
+@pytest.mark.parametrize("root_visits", [0, 3_999, 4_000, 12_000])
+def test_a_ponder_is_not_swallowed_by_a_fixed_budget(root_visits):
+    """`go ponder` must take the PONDER branch even when FixedSims is set.
+
+    The fixed branch returns an ABSOLUTE budget with the clock ignored, which is
+    right for a timed move and catastrophic for a ponder: a ponder runs on a
+    tree that has already been searched, so with FixedSims=4000 and a root
+    already holding 4,000 visits, `current >= budget` on the slice loop's first
+    pass and the ponder delivers ZERO simulations before parking in the idle
+    wait. Pondering silently does nothing and the only symptom is
+    `ponder_sims=0` on a verdict line.
+
+    Unreachable until `--sims` was collapsed onto `fixed_sims`, which put it
+    behind the flag every fixed-budget run types.
+    """
+    config = EngineConfig(fixed_sims=4_000)
+    budget, deadline, nominal, source, _ = _plan_for(
+        config, ["ponder", "wtime", "30000", "btime", "30000"], root_visits)
+    assert source == "ponder", "the fixed branch swallowed the ponder"
+    assert deadline is None, "a ponder has no clock"
+    assert budget - root_visits == config.ponder_max_sims_resolved, (
+        f"a ponder on a root holding {root_visits} visits must still get "
+        f"{config.ponder_max_sims_resolved} FRESH simulations, got "
+        f"{budget - root_visits}")
+
+
+@requires_wrapper
+@pytest.mark.parametrize("root_visits", [0, 25_000, 40_000])
+def test_a_ponder_is_not_swallowed_by_a_node_budget(root_visits):
+    """`go ponder ... nodes N` must still take the PONDER branch.
+
+    THE DOOR THAT IS ACTUALLY OPEN IN DEPLOYMENT. python-chess puts `nodes` on
+    the ponder line — `_go` appends it whenever the Limit carries one, and
+    `ponder=True` only prepends the keyword — and lichess-bot ponders with
+    `copy.copy(limit)`. So any config pairing `go_commands.nodes` with
+    `ponder: true` sends exactly this, and without the guard the ponder takes an
+    absolute N-visit target instead of its own ceiling: capped at N TOTAL rather
+    than given `ponder_max_sims` FRESH, and delivering nothing once the pondered
+    root already holds N.
+    """
+    config = EngineConfig()
+    budget, deadline, _, source, _ = _plan_for(
+        config, ["ponder", "wtime", "300000", "btime", "300000",
+                 "nodes", "25000"], root_visits)
+    assert source == "ponder", "the nodes branch swallowed the ponder"
+    assert deadline is None
+    # THE INVARIANT IS THAT THE BUDGET IS RELATIVE, not what it equals. The bug
+    # was an ABSOLUTE target: fresh sims collapsed to zero as the pondered root
+    # filled. The magnitude — capped at the GUI's move budget — is asserted by
+    # `test_the_ponder_ceiling_matches_the_guis_stated_move_budget`.
+    fresh = budget - root_visits
+    assert fresh == 25_000, (
+        f"a ponder on a root holding {root_visits} visits got {fresh} fresh "
+        f"sims; the count must not depend on how full the root already is")
+
+
+@requires_wrapper
+def test_the_ponder_ceiling_matches_the_guis_stated_move_budget():
+    """A ponder must not outspend the move it feeds.
+
+    `ponder_max_sims_resolved` derives from `sims_per_move` — `fixed_sims or
+    sim_cap` — which is a startup guess justified on the reasoning that "every
+    timed search runs to current + sim_cap and stops on the clock". That holds
+    for a clock-governed tournament and fails for a harness sending `nodes`
+    every move: lichess-bot at `go_commands.nodes: 25000` leaves the real budget
+    at 25,000 while `sim_cap` sits at 60,000 and never binds.
+
+    Unfixed, the ponder spends 60,000 sims to feed a 25,000-sim move, and at
+    `ponder_decay=1.0` the inherited visits carry full weight — so the fresh
+    search cannot outvote a tree 2.4x its size. That is scope E6's over-commit,
+    and `coupling_holds` misses it because it compares against `sim_cap`.
+    """
+    config = EngineConfig()
+    assert config.ponder_max_sims_resolved == 60_000, "shipping default moved"
+    budget, _, _, source, note = _plan_for(
+        config, ["ponder", "wtime", "300000", "btime", "300000",
+                 "nodes", "25000"], root_visits=5_000)
+    assert source == "ponder"
+    assert budget - 5_000 == 25_000, "the ponder outspent the move it feeds"
+    assert "go nodes 25000" in note, note
+
+
+@requires_wrapper
+def test_the_node_budget_only_ever_lowers_the_ponder_ceiling():
+    """`PonderMaxSims` stays an upper bound an operator can lower.
+
+    The GUI's budget is better information than the startup estimate, but it is
+    not permission to exceed a ceiling somebody set deliberately.
+    """
+    budget, _, _, _, note = _plan_for(
+        EngineConfig(ponder_max_sims=8_000),
+        ["ponder", "wtime", "300000", "btime", "300000", "nodes", "25000"],
+        root_visits=5_000)
+    assert budget - 5_000 == 8_000
+    assert "PonderMaxSims" in note
+
+
+@requires_wrapper
+def test_a_ponder_with_no_node_budget_keeps_its_configured_ceiling():
+    """The clock-governed case the derivation was written for is unchanged."""
+    config = EngineConfig()
+    budget, _, _, _, _ = _plan_for(
+        config, ["ponder", "wtime", "300000", "btime", "300000"],
+        root_visits=5_000)
+    assert budget - 5_000 == config.ponder_max_sims_resolved
+
+
+@requires_wrapper
+@pytest.mark.parametrize("root_visits", [5_000, 30_000])
+def test_a_ponderhit_honours_the_node_budget_as_fresh_sims(root_visits):
+    """A hit must stay node-bounded when the GUI asked in nodes.
+
+    Falling through to the clock made the pondered move the ONLY timed move in
+    a node-budgeted game — applied to precisely the moves the prediction got
+    right. `current + N` rather than an absolute N, because ponder simulations
+    ran on the opponent's clock and are a bonus, not a draw against this move.
+    """
+    import chess
+    module = wrapper()
+    uci = module.UCIEngine.__new__(module.UCIEngine)
+    uci.config = EngineConfig()
+    uci.engine = _StubEngine(root_visits)
+    uci.board = chess.Board()
+    params = module.GoParams(["ponder", "wtime", "300000", "btime", "300000",
+                              "nodes", "25000"])
+    budget, deadline, nominal, source, _ = uci._plan_after_ponderhit(params)
+    assert source == "ponderhit"
+    assert deadline is None, "the GUI asked in nodes; the clock is not the bound"
+    assert budget - root_visits == 25_000
+    assert nominal == 25_000
+
+
+@requires_wrapper
+def test_an_ordinary_search_still_takes_the_fixed_branch():
+    """The other side of the same guard: FixedSims still means what it says."""
+    budget, deadline, nominal, source, _ = _plan_for(
+        EngineConfig(fixed_sims=4_000), ["wtime", "30000", "btime", "30000"],
+        root_visits=4_000)
+    assert (source, budget, nominal, deadline) == ("fixed", 4_000, 4_000, None)
+
+
+# ---------------------------------------------------------------------------
+# The ponder branch table
+# ---------------------------------------------------------------------------
+
+_BRANCHES = [("e7e5", 2140, 0.52), ("c7c5", 830, 0.20), ("g8f6", 410, 0.10)]
+
+
+def test_the_branch_table_marks_the_prediction_and_the_played_move_apart():
+    """A hit is exactly when they coincide, so both roles must be markable."""
+    lines = playv6.format_root_branches(_BRANCHES, predicted="e7e5",
+                                        played="c7c5")
+    assert "predicted" in lines[1] and "PLAYED" not in lines[1]
+    assert "PLAYED" in lines[2] and "predicted" not in lines[2]
+
+    hit = playv6.format_root_branches(_BRANCHES, predicted="e7e5",
+                                      played="e7e5")
+    assert "predicted" in hit[1] and "PLAYED" in hit[1]
+
+
+def test_the_branch_table_says_so_when_the_played_move_was_never_visited():
+    """The reference's near-zero case, named rather than left to inference:
+    if the played branch carries nothing, the next search starts from nothing."""
+    lines = playv6.format_root_branches(_BRANCHES, predicted="e7e5",
+                                        played="h7h6")
+    assert any("received NO visits" in line for line in lines)
+
+
+def test_a_played_move_outside_the_top_rows_is_still_shown_and_not_called_absent():
+    """Truncation is display-only. Caught in a real game: `root_branches`
+    returned the top 5, the played reply held 207 visits and ranked sixth, and
+    the table reported it as unvisited — while the engine printed `reused: 207`
+    on the very next move and contradicted it."""
+    branches = [(f"a{i}a{i}", 1000 - i, 0.1) for i in range(1, 8)]
+    played = branches[6][0]
+    lines = playv6.format_root_branches(branches, played=played, top_n=5,
+                                        min_share=0.0)
+    assert any(played in line and "PLAYED" in line for line in lines), lines
+    assert not any("received NO visits" in line for line in lines)
+    # The elided count must not include the row that was pulled back on.
+    assert any("and 1 more visited reply" in line for line in lines), lines
+
+
+# ---------------------------------------------------------------------------
+# Pruning low-probability replies from the ponder tables
+# ---------------------------------------------------------------------------
+
+
+def test_replies_below_the_share_threshold_are_pruned():
+    branches = [("a1a1", 900, 0.60), ("b1b1", 300, 0.25),
+                ("c1c1", 150, 0.10), ("d1d1", 50, 0.05)]
+    body = "\n".join(playv6.format_root_branches(branches))
+    assert "a1a1" in body and "b1b1" in body
+    assert "c1c1" not in body and "d1d1" not in body
+    assert "2 more visited replies below the 20% share threshold" in body
+
+
+def test_the_played_move_survives_the_threshold():
+    """The pruning is cosmetic; what the next search inherits is not.
+
+    A human plays a long shot often, and pruning the row that says how many
+    visits it carries would reintroduce exactly the defect the truncation fix
+    removed.
+    """
+    branches = [("a1a1", 900, 0.90), ("z1z1", 20, 0.02)]
+    body = "\n".join(playv6.format_root_branches(branches, played="z1z1"))
+    assert "z1z1" in body and "PLAYED" in body
+    assert "received NO visits" not in body
+
+
+def test_a_flat_distribution_still_shows_its_leader():
+    """Nothing clears 20% when the visits are spread over ten replies; an empty
+    table is strictly less useful than the leader."""
+    branches = [(f"a{i}a{i}", 100, 0.10) for i in range(1, 10)]
+    lines = playv6.format_root_branches(branches)
+    assert len(lines) >= 2, lines
+    assert "a1a1" in lines[1]
+
+
+def test_the_threshold_does_not_reach_the_arithmetic():
+    """`root_branches` is what the callers do sums over, and it prunes nothing.
+
+    `inherited_by_next_search` and `gained` are read off that list, so a
+    threshold applied there rather than at the display would silently report
+    zero inherited visits for any reply under 20%.
+    """
+    import inspect
+    source = inspect.getsource(playv6.Engine.root_branches)
+    assert "min_share" not in source and "PONDER_MIN_SHARE" not in source
+
+
+def test_root_branches_returns_every_visited_reply_by_default():
+    """The arithmetic callers — `inherited_by_next_search`, `gained` — look the
+    played move up in this list, so a truncated default silently reports zero
+    for anything outside it."""
+    import inspect
+    signature = inspect.signature(playv6.Engine.root_branches)
+    assert signature.parameters["top_n"].default is None
+
+
+def test_the_branch_table_columns_line_up_and_survive_an_empty_tree():
+    lines = playv6.format_root_branches(_BRANCHES)
+    header, first = lines[0], lines[1]
+    assert header.index("visits") + len("visits") == first.index("2,140") + len("2,140")
+    assert playv6.format_root_branches([]) == [
+        "[ponder]   (no visited replies - the ponder built nothing)"]
+
+
+def test_the_branch_table_is_ascii():
+    """stderr is UTF-8 by force_utf8_streams, but this line has no reason to
+    depend on that — `[book] opened ... —` already does and cost a run its
+    provenance verdict once."""
+    for line in playv6.format_root_branches(_BRANCHES, predicted="e7e5",
+                                            played="h7h6") + \
+            playv6.format_root_branches([]):
+        line.encode("ascii")
+
+
+def test_the_cli_budget_falls_back_to_default_sims():
+    """What `playv6.main` and `playv6_interactive` both compute.
+
+    There is no GUI in either, so the two fields collapse to "whichever was
+    set" — which is what made them redundant on the command line in the first
+    place.
+    """
+    assert (_cli([]).fixed_sims or _cli([]).default_sims) == 5000
+    config = _cli(["--sims", "300"])
+    assert (config.fixed_sims or config.default_sims) == 300
+
+
+# ---------------------------------------------------------------------------
 # Startup discipline
 # ---------------------------------------------------------------------------
 

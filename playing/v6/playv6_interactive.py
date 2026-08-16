@@ -116,6 +116,8 @@ from playing.v6.playv6 import (  # noqa: E402
     config_from_args,
     err,
     force_utf8_streams,
+    format_root_branches,
+    move_label,
     preimport_torch,
 )
 
@@ -481,6 +483,13 @@ class Session:
         self._ponder_thread: Optional[threading.Thread] = None
         self._ponder_stop = threading.Event()
         self._ponder_outcome: Optional[SearchOutcome] = None
+        # The branch table, read off the tree in `stop_ponder` and held until
+        # the human's move is known. See `report_ponder_outcome`.
+        self._ponder_branches: Optional[list[tuple[str, int, float]]] = None
+        self._ponder_predicted: Optional[str] = None
+        # {uci: visits} taken BEFORE the ponder ran, so the end table can show
+        # what the ponder itself added rather than only the running total.
+        self._ponder_before: dict = {}
         # Cumulative, for the end-of-game summary. Ponder simulations are never
         # folded into the per-move delivered counts — same discipline as the
         # UCI surface, and for the same reason: they ran on the human's clock.
@@ -537,18 +546,60 @@ class Session:
         except Exception:                                        # noqa: BLE001
             uci, source = None, "search"
         if uci is not None:
-            if self.args.telemetry:
-                err(f"[ponder] skipped: {source} answers {target.fen()} with "
-                    f"{uci}; the move is already determined")
+            # Also ungated: "no ponder happened" needs a reason attached, or
+            # the absence of the start line above reads as a broken feature.
+            err(f"[ponder] skipped: {source} answers {target.fen()} with "
+                f"{uci}; the move is already determined")
             return False
 
         moves = [m.uci() for m in target.move_stack]
         self._ponder_stop.clear()
         self._ponder_outcome = None
+        self._ponder_branches = None
+        self._ponder_predicted = None
+        self._ponder_before = {}
+
+        # ROOTED ON THE MAIN THREAD, and that is not a tidiness preference.
+        # Three things need it: the "before" snapshot has to be taken with
+        # nothing else inside the `Engine`, the start line has to be printed
+        # BEFORE `prompt` draws its input line rather than over the top of it,
+        # and a `set_position` that raises has to be able to decline to ponder
+        # instead of killing a thread that has no caller to raise into. No
+        # ponder thread exists yet — the guard at the top of this method
+        # guarantees it — so the engine is single-threaded here.
+        try:
+            self.engine.set_position(self.base_fen, moves)
+        except Exception as exc:                                 # noqa: BLE001
+            err(f"[ponder] could not root the tree at {target.fen()} "
+                f"({type(exc).__name__}: {exc}); not pondering this move")
+            return False
+
+        before = self.engine.root_branches()
+        self._ponder_before = {uci: visits for uci, visits, _ in before}
+        # The engine's own prediction, for the record. It is NOT used to steer
+        # the search — this frontend ponders the parent root, so every reply is
+        # covered — it is the most-visited child, i.e. the same quantity the
+        # reference's `predict_opponent_move` returned, kept so the end line
+        # can say whether the human agreed with it.
+        self._ponder_predicted = before[0][0] if before else None
+        # NOT GATED ON `--telemetry`, and the distinction is worth stating.
+        # `--telemetry` adds the engine's own `[search]` line — delivered vs
+        # nominal, cache traffic, inflation — which is instrumentation. These
+        # are the ponder's OWN output: what it is about to do, and what it did.
+        # The reference printed both unconditionally (core/mctsv4.py
+        # `ponder_start` / `apply_move`), and a feature whose entire effect is
+        # invisible unless a debug flag is passed is a feature nobody can tell
+        # is working.
+        err(f"[ponder] start:"
+            f"root_visits={int(self.engine.search.root_visits):,} "
+            f"predicted={move_label(target, self._ponder_predicted)}")
+        for line in format_root_branches(before,
+                                         predicted=self._ponder_predicted,
+                                         board=target):
+            err(line)
 
         def run() -> None:
             try:
-                self.engine.set_position(self.base_fen, moves)
                 self._ponder_outcome = self.engine.search_move(
                     budget=(int(self.engine.search.root_visits)
                             + self.engine.config.ponder_max_sims_resolved),
@@ -600,9 +651,69 @@ class Session:
         outcome = self._ponder_outcome
         if outcome is not None:
             self.ponder_sims_total += outcome.delivered
+            # THE BRANCH TABLE IS READ HERE AND NOWHERE ELSE, because this is
+            # the last moment it exists: the caller is about to apply a move,
+            # which promotes one child to the root and compacts the rest away.
+            # Cached on the session so `report_ponder_outcome` can print it
+            # AFTER the human's move is known — the reference printed the same
+            # table from inside `apply_move` for exactly that reason.
+            self._ponder_branches = self.engine.root_branches()
+            # `_ponder_predicted` is NOT refreshed here. It is the prediction
+            # made BEFORE the ponder ran, which is the only thing a prediction
+            # can honestly be; re-reading the top child now would report the
+            # ponder's own conclusion as though it had been foreseen. If the
+            # ponder changed its mind, the table shows it — the row marked
+            # `predicted` will not be the first one.
             if self.args.telemetry:
                 err(f"[ponder] {outcome.telemetry()}")
         return outcome
+
+    def report_ponder_outcome(self, played: str) -> None:
+        """The end-of-ponder record, once the human's move is known.
+
+        THE PARENT-ROOT FORM HAS NO MISS CASE, which is what makes this
+        different from the reference's and from the UCI wrapper's. This
+        frontend ponders the CURRENT position, so every legal reply is a child
+        of the pondered root and the human cannot play outside the tree — the
+        work always transfers. What varies is HOW MUCH: a reply the search
+        thought was bad may carry a few dozen visits where the predicted one
+        carries thousands.
+
+        So "hit" here means the human played what the search expected, and it
+        is reported as a prediction quality figure rather than as a
+        salvage/discard verdict. The number that actually matters either way is
+        the last column: what the next search inherits.
+        """
+        branches = getattr(self, "_ponder_branches", None)
+        if not branches:
+            return
+        predicted = self._ponder_predicted
+        before = self._ponder_before or {}
+        inherited = next((v for uci, v, _ in branches if uci == played), 0)
+        # WHAT THE PONDER ITSELF PUT THERE, as opposed to what the engine's own
+        # previous search had already left on that branch. Only the first is
+        # attributable to having pondered, and it is the number that says
+        # whether pondering was worth the human's clock.
+        gained = inherited - before.get(played, 0)
+        sims = self._ponder_outcome.delivered if self._ponder_outcome else 0
+        hit = predicted == played
+        # SAN against `self.board`, which is still the position these replies
+        # are replies TO — `report_ponder_outcome` is deliberately called
+        # before the push for exactly this reason.
+        err(f"[ponder] end: predicted={move_label(self.board, predicted)} "
+            f"played={move_label(self.board, played)} "
+            f"prediction={'hit' if hit else 'miss'} "
+            f"ponder_sims={sims} "
+            f"inherited_by_next_search={inherited} "
+            f"of_which_from_this_ponder={gained} "
+            f"transfer={gained / sims if sims else 0.0:.0%}")
+        for line in format_root_branches(branches, predicted=predicted,
+                                         played=played, before=before,
+                                         board=self.board):
+            err(line)
+        self._ponder_branches = None
+        self._ponder_predicted = None
+        self._ponder_before = {}
 
     # --- engine ---------------------------------------------------------
 
@@ -896,6 +1007,10 @@ class Session:
                 print(f"Could not parse {parts[0]!r} as a legal move "
                       f"({type(exc).__name__}). Try again.")
                 continue
+            # BEFORE the push, because the table is in this position's terms:
+            # the branches are replies TO the position the human just moved
+            # from, and `played` is the one they chose.
+            self.report_ponder_outcome(human_move.uci())
             self.board.push(human_move)
 
             if self.finished():

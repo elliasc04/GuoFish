@@ -142,6 +142,88 @@ def test_the_arena_default_is_sixty_nodes_per_simulation_of_both_budgets():
                                            + config.ponder_max_sims_resolved)
 
 
+def test_pondering_is_off_unless_a_caller_asks_for_it():
+    """The ENGINE default is off; only `playing/run_guofishv6.bat` opts in.
+
+    That split is what keeps the benches honest. Every measuring caller —
+    the cutechess `command.txt` runs, `tools/smoke_c11.py`,
+    `tools/uci_conform_c11.py` — invokes `uci_wrapper_v6.py` directly and
+    passes no `--ponder`, so they measure the ponder-off engine the throughput
+    anchors were recorded against. A default flipped here would make every one
+    of them spend the opponent's clock without saying so, and report a sims/s
+    divided by a wall time that never included it.
+
+    The competitive launcher turning it on is the whole point and is not a
+    reason to move the default: one caller wanting a knob is not the knob's
+    default.
+    """
+    import argparse
+    assert EngineConfig.ponder is False
+    assert EngineConfig().ponder is False
+
+    parser = argparse.ArgumentParser()
+    playv6.add_config_arguments(parser)
+    bare = playv6.config_from_args(parser.parse_args([]))
+    assert bare.ponder is False, (
+        "a bare uci_wrapper_v6.py invocation must not ponder; every bench in "
+        "benchmarking/engine/games/ is launched that way")
+    asked = playv6.config_from_args(parser.parse_args(["--ponder"]))
+    assert asked.ponder is True
+
+
+def test_a_pinned_fixed_budget_does_not_shrink_the_arena():
+    """The arena is sized from `sim_cap`, NOT from the budget actually pinned.
+
+    This is the invariant the `--sims`/`--fixed-sims` collapse rests on. Before
+    it, `--sims N` set `default_sims`, which feeds nothing in the derivation, so
+    the arena stayed at `sim_cap`'s. After it, `--sims N` sets `fixed_sims`,
+    which DOES feed `sims_per_move` — and a naive formula would have quietly
+    re-sized every fixed-budget run's arena downward by the ratio of the budget
+    to the cap.
+
+    That matters because the arena's real consumer is the ACCUMULATING tree, not
+    one search. DECISIONS.md's C12b entry is the record: a reuse arm of seven
+    20,000-simulation searches on one tree needed 1,436,625 nodes and exhausted
+    a 1.2M arena sized off one move's allowance. `playv6 --selfplay` accumulates
+    the same way, so a shrunk arena would surface as `arena_exhausted` mid-run
+    rather than as an error at startup.
+    """
+    reference = EngineConfig().arena_nodes
+    for budget in (2_000, 4_000, 16_000):
+        config = EngineConfig(fixed_sims=budget)
+        assert config.arena_nodes == reference, (
+            f"fixed_sims={budget} resized the arena to {config.arena_nodes:,} "
+            f"from {reference:,}; the sizing must follow sim_cap")
+    # It still follows `sim_cap`, which is the knob that IS allowed to move it.
+    assert EngineConfig(sim_cap=50_000).arena_nodes < reference
+
+
+def test_the_ponder_ceiling_still_follows_the_pinned_budget():
+    """The other half of the same split, and the reason it is a split at all.
+
+    Widening the ARENA to `sim_cap` is free headroom. Widening the PONDER
+    CEILING to `sim_cap` would not be: a ponder in a `--sims 2000` run could
+    then spend 60,000 simulations and hand the next 2,000-simulation search a
+    tree it cannot outvote. That is scope E6's over-commit defect verbatim, so
+    `ponder_max_sims_resolved` stays tied to `sims_per_move` while
+    `arena_sizing_terms` does not.
+    """
+    config = EngineConfig(fixed_sims=2_000)
+    assert config.sims_per_move == 2_000
+    assert config.ponder_max_sims_resolved == 2_000
+    assert config.coupling_holds
+    # The arena, meanwhile, is sized from the cap and is unmoved.
+    assert config.arena_sizing_terms == (config.sim_cap, config.sim_cap)
+
+
+def test_an_explicit_ponder_ceiling_is_honoured_by_the_arena_sizing():
+    """An operator who named `ponder_max_sims` meant it, so the arena is sized
+    for the ponder that will actually run rather than for the computed one."""
+    config = EngineConfig(ponder_max_sims=5_000)
+    assert config.arena_sizing_terms == (config.sim_cap, 5_000)
+    assert config.arena_nodes == 60 * (config.sim_cap + 5_000)
+
+
 def test_the_startup_line_reports_the_arena_and_its_memory_footprint():
     """Requirement 3c: "the engine prints the resolved value and its memory
     footprint at startup — `arena: 2 x 600k nodes (48 MB)`".
