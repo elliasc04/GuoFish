@@ -89,10 +89,22 @@ import chess  # noqa: E402
 import guofish_core  # noqa: E402
 
 from playing.v6.playv6 import (  # noqa: E402
-    ConfigError, Engine, EngineConfig, SearchOutcome, add_config_arguments,
-    apply_switch_interval, config_from_args, err, force_utf8_streams,
-    format_root_branches, move_label, preimport_torch,
+    DEFAULT_MODEL, ConfigError, Engine, EngineConfig, SearchOutcome,
+    add_config_arguments, apply_switch_interval, config_from_args, err,
+    force_utf8_streams, format_root_branches, move_label, preimport_torch,
 )
+
+# M2. The move-stats collector. Imported unconditionally because an import that
+# only happens under a flag is an import that is only ever broken under a flag.
+from telemetry.move_stats import (  # noqa: E402
+    MoveStatsCollector, build_record, position_stratifiers,
+)
+
+
+def _utc_now() -> str:
+    """UTC stamp for a move record. Ground rule 6 wants every artifact timed."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 
 ENGINE_NAME = "GuoFish v6"
 ENGINE_AUTHOR = "Guo"
@@ -349,9 +361,17 @@ class GoParams:
 class UCIEngine:
     """The protocol loop. Owns the board, the config, and one `Engine`."""
 
-    def __init__(self, config: EngineConfig):
+    def __init__(self, config: EngineConfig,
+                 move_stats: Optional[MoveStatsCollector] = None):
         self.config = config
         self.engine = Engine(config)
+        # M2. None unless `--move-stats` named a directory. Every use of it is
+        # guarded, and the guard is what makes "off means off" a property of the
+        # control flow rather than of the collector's behaviour.
+        self.move_stats = move_stats
+        self._ms_ply = 0
+        self._ms_go_t = None
+        self._ms_ponder: dict = {}
         self.board = chess.Board()
         self._base_fen = chess.STARTING_FEN
         self._moves: list[str] = []
@@ -527,6 +547,12 @@ class UCIEngine:
         self._base_fen = chess.STARTING_FEN
         self._moves = []
         self.engine.new_game()
+        # M2. `ucinewgame` is the only game boundary a UCI engine is given, and
+        # cutechess sends one per game. `begin_game` closes the previous file
+        # and opens the next.
+        if self.move_stats is not None:
+            self._ms_ply = 0
+            self.move_stats.begin_game()
 
     def handle_position(self, args: list[str]) -> None:
         if not args:
@@ -580,6 +606,11 @@ class UCIEngine:
     # --- go ---------------------------------------------------------------
 
     def handle_go(self, params: GoParams) -> None:
+        # M2. THE MOVE'S CLOCK STARTS HERE, before `set_position` and before
+        # `_plan`, because both are inside the window the GUI is timing. On a
+        # pondered move it starts at the ponderhit instead; see
+        # `handle_go_ponder`.
+        go_t = time.perf_counter()
         # `_stop` is NOT cleared here. The reader thread clears it when it sees
         # the `go` line, which is the only place that preserves stdin order: a
         # `stop` sent immediately after `go` arrives while this method is still
@@ -613,7 +644,9 @@ class UCIEngine:
         err(f"[go] {plan}")
 
         self._last_info = 0.0
+        self._ms_arm(go_t)
         self._searching.set()
+        ms_started = time.perf_counter()
         try:
             outcome = self.engine.search_move(
                 budget=budget,
@@ -625,10 +658,12 @@ class UCIEngine:
             )
         finally:
             self._searching.clear()
+        ms_ended = time.perf_counter()
 
         err(outcome.telemetry())
         self._emit_info(outcome, final=True)
         self._emit_bestmove(outcome)
+        self._ms_record(outcome, search_started=ms_started, search_ended=ms_ended)
 
     # --- C11c: pondering ---------------------------------------------------
 
@@ -751,6 +786,8 @@ class UCIEngine:
 
         hit = self._ponderhit.is_set() and not self._quit.is_set()
         self._ponderhit.clear()
+        # M2. Stamped here, the first statement after the verdict is known.
+        hit_t = time.perf_counter()
 
         # ONE CANONICAL VERDICT LINE PER RESOLVED PONDER, and exactly one.
         #
@@ -822,7 +859,13 @@ class UCIEngine:
         budget, deadline, nominal, source, plan = self._plan_after_ponderhit(params)
         err(f"[ponderhit] {plan}")
         self._last_info = 0.0
+        # M2. `hit_t` was stamped the instant the verdict was read, which is as
+        # close to the GUI's `ponderhit` as this process can observe. The gap
+        # between it and the first simulation is the ponder join plus the plan —
+        # R4's leading suspect, broken out as `pre_search_ms`.
+        self._ms_arm(hit_t)
         self._searching.set()
+        ms_started = time.perf_counter()
         try:
             outcome = self.engine.search_move(
                 budget=budget,
@@ -834,6 +877,7 @@ class UCIEngine:
             )
         finally:
             self._searching.clear()
+        ms_ended = time.perf_counter()
 
         # THE TWO SIM COUNTS, KEPT APART. `delivered` on this outcome is the
         # post-hit work and nothing else; the ponder's contribution rides
@@ -850,6 +894,22 @@ class UCIEngine:
         err(outcome.telemetry())
         self._emit_info(outcome, final=True)
         self._emit_bestmove(outcome)
+        self._ms_record(
+            outcome, search_started=ms_started, search_ended=ms_ended,
+            ponder={
+                "ponder_hit": True,
+                "ponder_sims": ponder_outcome.delivered if ponder_outcome else 0,
+                "ponder_wall_ms": round((ponder_outcome.wall_s * 1000.0), 3)
+                                  if ponder_outcome else 0.0,
+                # THE CAP, AS A FACT RATHER THAN A GUESS. `reason` is what the
+                # slice loop stopped on, so "the ponder reached its ceiling" is
+                # `budget` on a ponder outcome and nothing else.
+                "ponder_capped": (ponder_outcome.reason == "budget")
+                                 if ponder_outcome else None,
+                "ponder_reason": ponder_outcome.reason if ponder_outcome else None,
+                "ponder_arena_exhausted": (ponder_outcome.arena_exhausted
+                                           if ponder_outcome else None),
+            })
 
     def _predicted_san(self) -> str:
         """The GUI's ponder move in SAN, for the ponder log lines.
@@ -1152,6 +1212,95 @@ class UCIEngine:
                 or self._ponderhit.is_set())
 
     # --- output -----------------------------------------------------------
+
+    # --- M2: the move-stats session ---------------------------------------
+    #
+    # THREE CALLS, and they bracket the search rather than living inside it.
+    # `_ms_arm` is the last thing before `search_move` and `_ms_record` the
+    # first thing after, so the ladder covers exactly the simulations this move
+    # ran and the final checkpoint is taken while the tree is quiescent.
+    #
+    # Nothing here can raise into the search: a telemetry channel that can end a
+    # rated game is worse than no telemetry channel, so both methods swallow and
+    # disable rather than propagate.
+
+    def _ms_arm(self, go_t: Optional[float] = None) -> None:
+        if self.move_stats is None or not self.move_stats.enabled:
+            # A collector that disabled itself mid-game may have left the C++
+            # recorder armed. Disarm it: an armed recorder nobody drains keeps
+            # taking checkpoints for a record that will never be written.
+            self._ms_cancel()
+            return
+        try:
+            self._ms_go_t = go_t if go_t is not None else time.perf_counter()
+            self.engine.search.move_stats_begin()
+        except Exception as exc:                       # noqa: BLE001
+            self.move_stats._fail(f"arming the recorder: {exc!r}")
+
+    def _ms_cancel(self) -> None:
+        """Disarm the C++ recorder. Deliberately NOT gated on the collector.
+
+        The one caller that matters is the failure path, where the collector has
+        just disabled itself — a guard on `move_stats.enabled` here would make
+        this a no-op in exactly the case it exists for.
+        """
+        if self.move_stats is None:
+            return
+        try:
+            if self.engine.ready and self.engine.search.move_stats_armed:
+                self.engine.search.move_stats_cancel()
+        except Exception:                              # noqa: BLE001
+            pass
+
+    def _ms_record(self, outcome: SearchOutcome, *, search_started: float,
+                   search_ended: float, ponder: Optional[dict] = None) -> None:
+        if self.move_stats is None or not self.move_stats.enabled:
+            return
+        try:
+            checkpoints = {}
+            if self.engine.ready and self.engine.search.move_stats_armed:
+                checkpoints = self.engine.search.move_stats_finish()
+            self._ms_ply += 1
+            go_t = self._ms_go_t if self._ms_go_t is not None else search_started
+            now = time.perf_counter()
+            timings = {
+                # THE R4 DECOMPOSITION, MEASURED FROM THE INSIDE. `wall_s` covers
+                # the slice loop and nothing else, so these two are what the
+                # clock sees and the engine's own nps denominator does not: the
+                # ponder join plus `set_position` before, and
+                # `_principal_variation` plus the `info` lines after.
+                "pre_search_ms": round((search_started - go_t) * 1000.0, 3),
+                "post_search_ms": round((now - search_ended) * 1000.0, 3),
+                "go_to_bestmove_ms": round((now - go_t) * 1000.0, 3),
+                "wall_clock_utc": _utc_now(),
+            }
+            position = position_stratifiers(self.board)
+            cfg = {
+                "K": self.config.in_flight,
+                "max_batch": self.config.max_batch,
+                "threads": self.config.threads,
+                "sim_cap": self.config.sim_cap,
+                "ponder_enabled": self.config.ponder,
+            }
+            record = build_record(
+                ply=self._ms_ply,
+                side="w" if self.board.turn == chess.WHITE else "b",
+                fen=self.board.fen(),
+                outcome=outcome,
+                checkpoints=checkpoints,
+                timings=timings,
+                ponder=ponder or {"ponder_hit": False, "ponder_sims": 0,
+                                  "ponder_wall_ms": 0.0, "ponder_capped": None},
+                position=position,
+                config=cfg,
+            )
+            self.move_stats.record_move(record)
+        except Exception as exc:                       # noqa: BLE001
+            self.move_stats._fail(f"recording a move: {exc!r}")
+            # Leave nothing armed behind a failure.
+            self._ms_cancel()
+        finally:
+            self._ms_go_t = None
 
     def _emit_info(self, outcome: SearchOutcome, *, final: bool = False) -> None:
         """One `info` line. Runs on the main thread with no search in flight.
@@ -1500,6 +1649,8 @@ class UCIEngine:
                             f"reason={type(exc).__name__}")
                     self._send_bestmove(f"bestmove {uci}")
 
+        if self.move_stats is not None:
+            self.move_stats.close()
         self.engine.close()
         return 0
 
@@ -1539,6 +1690,37 @@ def main(argv: Optional[list[str]] = None) -> int:
     # owned a flag — the exact split C11 exists to have removed — and it left
     # `playv6_interactive` without one. See playv6.add_config_arguments.
     add_config_arguments(parser)
+    # --- M2: the telemetry channel, and it is a WRAPPER flag ----------------
+    #
+    # DELIBERATELY NOT AN `EngineConfig` FIELD, and that is what makes ground
+    # rule 1 structural. Every EngineConfig field is a UCI option (the process
+    # refuses to start if one is missing), so putting the channel there would
+    # add an `option name` line to the `uci` handshake — an OUTPUT CHANGE with
+    # the flag absent, which is exactly what M3's first check exists to forbid.
+    # The channel changes nothing the core can see; it does not belong in the
+    # core's configuration.
+    group = parser.add_argument_group("move-stats telemetry (M2)")
+    group.add_argument(
+        "--move-stats", metavar="DIR", default=None,
+        help="Record per-move cost and decision-trajectory records under "
+             "DIR/<run_id>/. Absent means the channel does not exist: no "
+             "collector is constructed, the C++ recorder is never armed, and "
+             "the engine's behaviour, timing and output are unchanged.")
+    group.add_argument(
+        "--move-stats-run-id", metavar="ID", default=None,
+        help="Name the run directory. Default is a UTC timestamp.")
+    group.add_argument(
+        "--move-stats-flush-every", metavar="N", type=int, default=10,
+        help="Flush the buffer every N moves (also at every game end). "
+             "Default 10.")
+    group.add_argument(
+        "--move-stats-note", metavar="TEXT", default="",
+        help="Free text recorded in the manifest: what this run is.")
+    group.add_argument(
+        "--move-stats-contaminated", metavar="F1,F2", default="",
+        help="Comma-separated record fields a downstream fit must NOT use. "
+             "A cutechess run at concurrency > 1 should name every wall-clock "
+             "field here; the manifest carries the list.")
     args = parser.parse_args(argv)
 
     if args.switch_interval != after:
@@ -1571,7 +1753,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     err(f"[init] torch imported in {preimport_torch():.1f}s "
         f"(before any thread; see playv6.preimport_torch)")
 
-    return UCIEngine(config).run()
+    collector = None
+    if args.move_stats:
+        contaminated = [f.strip() for f in args.move_stats_contaminated.split(",")
+                        if f.strip()]
+        collector = MoveStatsCollector(
+            Path(args.move_stats), run_id=args.move_stats_run_id,
+            flush_every=args.move_stats_flush_every,
+            contaminated_fields=contaminated, note=args.move_stats_note,
+            on_error=err)
+        collector.write_provenance(
+            config_line=config.as_kv(),
+            model_path=str(config.model_path or DEFAULT_MODEL),
+            repo=_PROJECT_ROOT)
+        err(f"[move-stats] ON -> {collector.dir} "
+            f"(flush every {collector.flush_every} moves; "
+            f"ladder {list(guofish_core.MOVE_STATS_LADDER)})")
+
+    return UCIEngine(config, move_stats=collector).run()
 
 
 if __name__ == "__main__":

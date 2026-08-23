@@ -265,6 +265,11 @@ endif ()
 # ---------------------------------------------------------------------------
 pybind11_add_module(guofish_core
         cpp/bindings.cpp
+        # M1. The `--move-stats` emitter. One translation unit of its own, per
+        # the telemetry brief's ground rule 4 — the only other change to the
+        # core is a bool test in `process_batch`.
+        cpp/move_stats.cpp
+        cpp/move_stats.hpp
         cpp/arena.hpp
         cpp/cache.hpp
         cpp/evaluator.hpp

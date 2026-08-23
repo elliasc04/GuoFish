@@ -23,6 +23,10 @@ coverage/
 /runs/c12
 /runs/c12b
 /probe
+/results
+/tuning
+/runs
+/telemetry
 
 # --- GuoFish multiPV data pipeline ---
 # Raw Lichess eval dump (~21GB) and any decompressed/derived form. Never committed.
@@ -45,7 +49,7 @@ coverage/
 /assets/syzygy
 /data/chessData.csv
 /benchmarking/player/friends
-/benchmarking/player/games
+/benchmarking/player/games  
 /training/logs
 /benchmarking/engine/logs
 # Next.js

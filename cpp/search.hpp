@@ -117,6 +117,7 @@
 #include "cache.hpp"
 #include "evaluator.hpp"
 #include "keys.hpp"
+#include "move_stats.hpp"
 #include "movegen.hpp"
 #include "parallel.hpp"
 #include "tablebase.hpp"
@@ -1667,6 +1668,44 @@ public:
     // still runs through all of this machinery — the queue, the dispatcher, the
     // PENDING CAS — rather than falling back to `search()`. A fallback would
     // make layer 1 a test of code layer 3 does not use.
+    // --- M1: the `--move-stats` channel ------------------------------------
+    //
+    // OFF IS THE DEFAULT AND OFF IS ONE BOOL. `move_stats_on_` is false until a
+    // host arms it for a move, and the whole of the cost when off is one
+    // predictable branch per BATCH inside `process_batch`. Nothing else in this
+    // class reads it, and nothing in `cpp/move_stats.hpp` can write to the tree.
+    //
+    // The ladder is denominated in the MOVE's delivered simulations, not the
+    // slice's: `delivered_` is reset by every `search_parallel`, and a move is
+    // many of them, so the recorder carries the running base across the slices
+    // and `search_parallel` adds each slice's contribution as it returns.
+
+    // Arm for one move, with the ladder to use. Clears any previous move's
+    // checkpoints. An empty ladder means "final checkpoint only".
+    void move_stats_begin(const std::vector<std::int64_t> &ladder) {
+        move_stats_.begin(ladder);
+        move_stats_on_ = true;
+    }
+
+    // Disarm without producing a record — for a search that was abandoned.
+    void move_stats_cancel() noexcept {
+        move_stats_on_ = false;
+        move_stats_.clear();
+    }
+
+    bool move_stats_armed() const noexcept { return move_stats_on_; }
+
+    // Take the final checkpoint and hand the record over. MUST be called with no
+    // search in flight: this is the one checkpoint that is exact, and it is
+    // exact because every worker has been joined.
+    MoveStatsRecord move_stats_finish() {
+        require_position();
+        MoveStatsRecord out = move_stats_.finish(move_stats_.base(), arena_, root_);
+        move_stats_on_ = false;
+        move_stats_.clear();
+        return out;
+    }
+
     SearchStats search_parallel(int num_simulations, const ParallelConfig &pc) {
         require_position();
         require_evaluation_source("search_parallel");
@@ -3830,6 +3869,12 @@ private:
         release_stranded_leaves();
         merge_worker_stats();
         par_.delivered = delivered_.load(std::memory_order_relaxed);
+        // M1. This slice's contribution to the MOVE's delivered count, which is
+        // what the checkpoint ladder is denominated in. After the join, so the
+        // load above is the settled figure.
+        if (move_stats_on_) {
+            move_stats_.add_base(par_.delivered);
+        }
         par_.select_collisions = collisions_;
         par_.worker_waits = waits_;
         par_.worker_terminals = par_.delivered - par_.queued_leaves;
@@ -4345,6 +4390,20 @@ private:
         for (std::size_t i = 0; i < batch_.size(); ++i) {
             expand_and_backup(*batch_[i], i);
         }
+
+        // M1. THE ONE CALL SITE THE MOVE-STATS CHANNEL HAS IN THE SEARCH, and
+        // it is here rather than per-simulation for two reasons. It is the
+        // finest-grained point at which `delivered_` is a settled number — the
+        // batch's backups have all landed — and it is the dispatcher thread,
+        // which is not the selection loop, so the O(root children) scan a
+        // checkpoint costs is charged to the thread that was going to wait on
+        // the GPU anyway. When the channel is off this is one bool test per
+        // batch and nothing else.
+        if (move_stats_on_) {
+            move_stats_.maybe_capture(
+                move_stats_.base() + delivered_.load(std::memory_order_relaxed),
+                arena_, root_);
+        }
     }
 
     // C10. Probe the cache for every leaf in the batch, hand the misses a row of
@@ -4690,6 +4749,12 @@ private:
     std::atomic<bool> deadline_hit_{false};
     std::atomic<bool> arena_exhausted_{false};
     std::atomic<std::int64_t> arena_exhausted_at_{0};
+
+    // M1. The move-stats channel. `move_stats_on_` is the whole of the off
+    // switch; the recorder holds no tree state and owns nothing the search
+    // reads.
+    MoveStatsRecorder move_stats_;
+    bool move_stats_on_ = false;
 
     std::mutex mutex_;
     std::condition_variable worker_cv_;

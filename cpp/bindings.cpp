@@ -2496,6 +2496,95 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
             "pinning threads to a layout that was inferred would be worse than not pinning "
             "them, because the resulting benchmark row would claim something untrue.")
 
+        // --- M1: the `--move-stats` decision-trajectory channel -------------
+
+        .def(
+            "move_stats_begin",
+            [](Search &self, py::object ladder) {
+                std::vector<std::int64_t> rungs;
+                if (ladder.is_none()) {
+                    rungs = guofish::default_ladder();
+                } else {
+                    rungs = ladder.cast<std::vector<std::int64_t>>();
+                    for (std::size_t i = 1; i < rungs.size(); ++i) {
+                        if (rungs[i] <= rungs[i - 1]) {
+                            throw std::invalid_argument(
+                                "move_stats_begin: the ladder must be strictly increasing");
+                        }
+                    }
+                    if (!rungs.empty() && rungs.front() < 1) {
+                        throw std::invalid_argument(
+                            "move_stats_begin: rungs are delivered-simulation counts and must be >= 1");
+                    }
+                }
+                self.move_stats_begin(rungs);
+            },
+            py::arg("ladder") = py::none(),
+            "Arm the move-stats channel for ONE move, clearing any previous move's "
+            "checkpoints.\n\n"
+            "`ladder` is a strictly increasing list of DELIVERED-simulation counts; None "
+            "selects the shipping ladder (`guofish_core.MOVE_STATS_LADDER`). An empty list "
+            "means 'final checkpoint only'.\n\n"
+            "OFF IS THE DEFAULT. Until this is called the channel costs one predictable "
+            "branch per batch and nothing else, and it cannot change move selection, visit "
+            "counts or search order: every arena access the recorder makes is a const "
+            "accessor.\n\n"
+            "The ladder is denominated in the MOVE's delivered simulations, summed across "
+            "the slices a host splits a move into, not in one `search_parallel` call's.")
+
+        .def("move_stats_cancel", &Search::move_stats_cancel,
+             "Disarm without producing a record. For a search that was abandoned; a "
+             "second call is harmless.")
+
+        .def_property_readonly("move_stats_armed", &Search::move_stats_armed,
+                               "Is the move-stats channel armed for the move in progress?")
+
+        .def(
+            "move_stats_finish",
+            [](Search &self) {
+                const guofish::MoveStatsRecord record = self.move_stats_finish();
+                py::list checkpoints;
+                for (const guofish::MoveCheckpoint &cp : record.checkpoints) {
+                    py::dict entry;
+                    entry["rung"] = (cp.rung == guofish::kFinalRung)
+                                        ? py::cast("final")
+                                        : py::cast(cp.rung);
+                    entry["n"] = cp.n;
+                    entry["root_visits"] = cp.root_visits;
+                    entry["root_q"] = cp.root_q;
+                    entry["root_children"] = cp.root_children;
+                    py::list top;
+                    for (std::uint8_t k = 0; k < cp.top_n; ++k) {
+                        py::dict child;
+                        child["move"] = move_to_uci(cp.top4[k].move);
+                        child["visits"] = cp.top4[k].visits;
+                        child["q"] = cp.top4[k].q;
+                        top.append(child);
+                    }
+                    entry["top4"] = top;
+                    checkpoints.append(entry);
+                }
+                py::dict d;
+                d["checkpoints"] = checkpoints;
+                d["best_move_changes"] = record.best_move_changes;
+                d["n_lock"] = (record.n_lock == guofish::kNoLock)
+                                  ? py::none()
+                                  : py::cast(record.n_lock);
+                d["delivered"] = record.delivered;
+                d["coalesced_rungs"] = record.coalesced_rungs;
+                return d;
+            },
+            "Take the FINAL checkpoint, disarm, and return the move's record.\n\n"
+            "MUST be called with no search in flight. Every ladder checkpoint is taken from "
+            "the dispatcher thread while W workers are still descending, so it is a "
+            "well-defined but not stopped-world read — up to `max_outstanding` backups have "
+            "not landed. This one is exact, because every worker has been joined.\n\n"
+            "Returns a dict: `checkpoints` (each with `rung`, `n`, `root_visits`, `root_q`, "
+            "`root_children` and `top4`, most-visited first), `best_move_changes`, `n_lock` "
+            "(None when the argmax was still moving at the final rung), `delivered`, and "
+            "`coalesced_rungs` (batches that crossed more than one rung, so a hole in the "
+            "ladder can be told from a bug).")
+
         // --- C8: tree reuse -------------------------------------------------
 
         .def(
@@ -2946,6 +3035,9 @@ PYBIND11_MODULE(guofish_core, m) {
     m.attr("NO_NODE") = guofish::kNoNode;
     m.attr("NO_MOVE") = guofish::kNoMove;
     m.attr("DEFAULT_ACCUMULATOR") = std::string(guofish::kDefaultAccumulator);
+    // M1. The shipping checkpoint ladder, exposed so a host and a test compare
+    // against the same object the search uses rather than a second copy of it.
+    m.attr("MOVE_STATS_LADDER") = guofish::default_ladder();
 
     m.attr("STATE_UNEXPANDED") = static_cast<std::uint8_t>(guofish::NodeState::Unexpanded);
     m.attr("STATE_PENDING") = static_cast<std::uint8_t>(guofish::NodeState::Pending);
