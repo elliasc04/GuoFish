@@ -846,3 +846,101 @@ def test_part1b_engine_principal_variation_end_to_end_matches_the_old_walk():
         assert search.max_visited_depth() == want_depth
         assert pv[0] == search.best_move, \
             "the PV head is the move that gets played, or the PV is wrong"
+
+
+# ---------------------------------------------------------------------------
+# D-TC-3 — the ponder-state race the Part 2 replay found
+# ---------------------------------------------------------------------------
+
+
+@requires_wrapper
+def test_dtc3_the_backstop_does_not_wipe_the_next_gos_ponder_flag():
+    """FOUND BY RUNNING PART 2's ACCEPTANCE, NOT BY READING THE CODE.
+
+    The main loop clears `_pondering` in a `finally` after `handle_go` returns —
+    a backstop for the paths `handle_go_ponder` never reaches. But that line
+    runs AFTER the `bestmove` has gone out, and by then the GUI's next
+    `position` + `go ponder` can already have been read by the reader thread,
+    which sets the flag for the NEXT move. The clear wipes it; the `ponderhit`
+    behind it is refused with "no ponder in flight"; `handle_go_ponder` waits
+    for a verdict that never comes; the engine hangs until `stop`, having burned
+    the opponent's entire clock and then started on its own.
+
+    It fired on the FIRST move of the `4YCsGtQ8` replay. It does not appear in
+    80 games of the deployed log because the window is the ~1 ms between the
+    `bestmove` and the backstop — and `--move-stats`, which the harness brief
+    wants left ON in deployment, widens it by putting `_ms_record` inside it.
+
+    ASSERTED AS THE ORDERING IT IS, with no threads: bump the generation the way
+    the reader does when it reads the next `go ponder`, then run the backstop.
+    A test that raced two real threads would pass on a fast box and prove
+    nothing.
+    """
+    module = wrapper()
+    import chess
+
+    uci = module.UCIEngine.__new__(module.UCIEngine)
+    uci.config = EngineConfig()
+    uci.board = chess.Board()
+    uci._pondering = __import__("threading").Event()
+    uci._pondering_gen = 0
+
+    # The main thread dispatches `go` number one and remembers the generation.
+    ponder_gen = uci._pondering_gen
+
+    # ... it answers, and while it is finishing, the READER reads the GUI's next
+    # `go ponder` and sets the flag for the move after this one.
+    uci._pondering.set()
+    uci._pondering_gen += 1
+
+    # ... and only now does the backstop run.
+    if uci._pondering_gen == ponder_gen:
+        uci._pondering.clear()
+
+    assert uci._pondering.is_set(), (
+        "the backstop wiped the NEXT go's ponder flag; its ponderhit will be "
+        "refused and the engine will hang in the idle wait")
+
+
+@requires_wrapper
+def test_dtc3_the_backstop_still_clears_its_own_gos_flag():
+    """The other side: the backstop must still do the job it exists for.
+
+    A `go ponder` on a finished position returns before `handle_go_ponder` runs,
+    so nothing else clears the flag, and a `_pondering` left set makes the
+    reader treat the GUI's next ordinary `position` as a ponder discontinuity.
+    """
+    module = wrapper()
+    import chess
+
+    uci = module.UCIEngine.__new__(module.UCIEngine)
+    uci.config = EngineConfig()
+    uci.board = chess.Board()
+    uci._pondering = __import__("threading").Event()
+    uci._pondering_gen = 0
+
+    uci._pondering.set()          # the reader saw `go ponder`
+    uci._pondering_gen += 1
+    ponder_gen = uci._pondering_gen   # the main thread dispatches THAT go
+
+    if uci._pondering_gen == ponder_gen:
+        uci._pondering.clear()
+
+    assert not uci._pondering.is_set()
+
+
+@requires_wrapper
+def test_dtc3_the_reader_bumps_the_generation_on_every_go():
+    """The generation has to move on a non-ponder `go` too.
+
+    The flag is CLEARED on those, and a clear is as much a write as a set: a
+    backstop that only noticed `set` would still wipe the state of a `go` that
+    followed a `go ponder`.
+    """
+    source = (REPO_ROOT / "playing/uci_wrapper_v6.py").read_text(encoding="utf-8")
+    head = source[source.index('            if command == "go":'):]
+    head = head[:head.index("            if command ==", 10)]
+    assert "self._pondering_gen += 1" in head
+    # After the flag is written, so a reader of both cannot see the new
+    # generation beside the old flag.
+    assert head.index("self._pondering.clear()") < head.index("self._pondering_gen += 1")

@@ -424,6 +424,23 @@ class UCIEngine:
         # reader that a `position` arriving now is a discontinuity to stop on
         # rather than an ordinary command to queue.
         self._pondering = threading.Event()
+        # D-TC-3. THE GENERATION OF `_pondering`, bumped by the reader every
+        # time it touches the flag — which is on every `go`.
+        #
+        # It exists because the main loop's backstop clear runs AFTER
+        # `handle_go` returns, i.e. after the `bestmove` has already gone out,
+        # and by then the GUI's NEXT `position` + `go ponder` can already have
+        # been read. Clearing then wipes a flag that belongs to the next move,
+        # and the `ponderhit` behind it is refused with "no ponder in flight"
+        # while `handle_go_ponder` waits for a verdict that will never come:
+        # the engine hangs until the GUI's `stop`. Reading the generation at
+        # dispatch and comparing it at the backstop is what makes the clear
+        # apply to the `go` it was dispatched for and to no other.
+        #
+        # An `int` and not an Event: written only by the reader thread, read
+        # only by the main thread, and integer assignment is atomic under the
+        # GIL. See `_reader` and the `go` branch of `run`.
+        self._pondering_gen = 0
         # Set by the reader when ANY of stop / ponderhit / quit arrives. It is
         # what the idle wait blocks on, so a ponder that has already spent its
         # simulation ceiling costs nothing while it waits for the GUI to say
@@ -1749,6 +1766,10 @@ class UCIEngine:
                     self._pondering.set()
                 else:
                     self._pondering.clear()
+                # D-TC-3. Bumped AFTER the flag is written, so a main thread
+                # that reads the generation and then reads the flag cannot see
+                # the new generation with the old flag.
+                self._pondering_gen += 1
                 self._commands.put(line)
                 continue
             if command == "stop":
@@ -1850,6 +1871,9 @@ class UCIEngine:
                     # THE LEDGER, reset here and nowhere else: one `bestmove`
                     # per `go`, counted from the moment the `go` is dispatched.
                     self._bestmove_sent = False
+                    # D-TC-3. The generation of `_pondering` AS OF THIS `go`.
+                    # See the backstop below and `UCIEngine.__init__`.
+                    ponder_gen = self._pondering_gen
                     try:
                         self.handle_go(GoParams(args))
                     finally:
@@ -1859,7 +1883,25 @@ class UCIEngine:
                         # search. A `_pondering` left set would make the reader
                         # treat the GUI's next ordinary `position` as a
                         # discontinuity to stop a ponder that is not running.
-                        self._pondering.clear()
+                        #
+                        # D-TC-3. ONLY IF THE FLAG IS STILL THIS `go`'s. This
+                        # line runs after the `bestmove` has gone out, so the
+                        # GUI's next `position` + `go ponder` can already have
+                        # been READ by the reader and the flag can already
+                        # belong to the next move. Clearing it then refuses that
+                        # move's `ponderhit` with "no ponder in flight" and
+                        # leaves `handle_go_ponder` waiting for a verdict that
+                        # never comes — the engine hangs until `stop`, having
+                        # burned the opponent's whole clock and then its own.
+                        #
+                        # MEASURED, not theorised: it fired on the FIRST move of
+                        # the `4YCsGtQ8` replay. It does not appear in 80 games
+                        # of the deployed log, because the window is the ~1 ms
+                        # between `bestmove` and this line — and `--move-stats`,
+                        # which the harness brief wants left ON in deployment,
+                        # widens it by putting `_ms_record` inside it.
+                        if self._pondering_gen == ponder_gen:
+                            self._pondering.clear()
                 elif command in ("stop", "ponderhit"):
                     # Reached only when they arrive with no search in flight;
                     # the reader thread handles the in-flight case. The spec says
