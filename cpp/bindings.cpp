@@ -2710,6 +2710,50 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
             "tuples. min_visits=0 emits every node; 1 emits the visited subtree.")
 
         .def(
+            "principal_variation",
+            [](const Search &self, int max_plies) {
+                py::list out;
+                for (const auto &step : self.principal_variation(max_plies)) {
+                    out.append(py::make_tuple(move_to_uci(step.move), step.visits,
+                                              step.value_sum));
+                }
+                return out;
+            },
+            py::arg("max_plies") = 12,
+            "The principal variation as [(uci, visits, value_sum)], most-visited child at "
+            "each step, at most max_plies long.\n\n"
+            "PART 1b. The Python walk this replaces read dump_tree_arrays(1) — the whole "
+            "visited subtree, eight NumPy arrays and a Python scan over all of it — to "
+            "answer a question about twelve nodes. Measured at 424 ms median and 3,899 ms "
+            "max on the deployed pondered tree, and charged to the game clock because "
+            "`wall_s` is sampled before it runs. This descends child slots and stops.")
+
+        .def(
+            "root_children",
+            [](const Search &self) {
+                py::list out;
+                for (const auto &row : self.root_children()) {
+                    out.append(py::make_tuple(move_to_uci(row.first), row.second));
+                }
+                return out;
+            },
+            "[(uci, visits)] for the root's VISITED children, in arena child order.\n\n"
+            "PART 1a. The same rows dump_tree_arrays(1) puts at depth 1, without the "
+            "subtree underneath them. Unvisited children are absent, which is "
+            "dump_tree(1)'s own filter — a reply with no visits is not a branch the search "
+            "built.")
+
+        .def("max_visited_depth", &Search::max_visited_depth,
+             "The deepest VISITED ply below the root: `dump_tree_arrays(1)[\"depth\"].max()` "
+             "without materialising anything.\n\n"
+             "A DIAGNOSTIC, NOT THE `seldepth` A UCI INFO LINE REPORTS — that comes from "
+             "SearchStats::max_depth folded across the move's slices, because this is still "
+             "a traversal of every child slot of every visited node and cost a measured "
+             "48 ms on a 200,000-visit fresh root. The two are identical on a fresh root and "
+             "differ on an inherited tree, where this one includes plies reached by earlier "
+             "searches. Exposed so that difference can be measured rather than assumed.")
+
+        .def(
             "dump_tree_arrays",
             [](const Search &self, std::int32_t min_visits) {
                 const std::vector<guofish::TreeRecord> records = self.dump_tree(min_visits);

@@ -1056,6 +1056,19 @@ class SearchOutcome:
     # ending and its absence is the interesting case.
     deadline_hit: bool = False
 
+    # PART 1c. THE PV WALK, TIMED, AND WHY IT IS A FIELD OF ITS OWN.
+    #
+    # D-L0-4 lists two fixes for "`wall_s` excludes the PV walk": move where
+    # `wall_s` is sampled, or make the excluded work small. The first changes
+    # reported nps and invalidates every constant measured against it, so the
+    # second is the one taken — and the number is still wanted, so it is
+    # reported here instead of being folded into `wall_s`.
+    #
+    # It covers `_principal_variation` alone: the argmax descent plus
+    # `max_visited_depth`. It is zero on the per-slice outcomes, which carry no
+    # PV, and on a bypassed move, where there is no tree to walk.
+    pv_ms: float = 0.0
+
     @property
     def search_sims(self) -> int:
         """Simulations delivered SINCE the ponderhit. An alias for `delivered`.
@@ -2067,6 +2080,11 @@ class Engine:
         exhausted = False
         exhausted_at = 0
         deadline_hit = False
+        # PART 1b. `seldepth`, accumulated across the move's slices. `max` and
+        # not a sum, because it is a maximum: `search_parallel` resets its own
+        # stats every call, so a move that did not fold them would report the
+        # last slice's depth as if it were the move's.
+        depth_reached = 0
         started = time.perf_counter()
         # Seeded from the shipping configuration's measured rate so the first
         # slice is already about the right size; every slice after it uses this
@@ -2105,7 +2123,13 @@ class Engine:
                     chunk = max(cfg.min_slice_sims, min(chunk, affordable))
                 target = min(budget, current + chunk)
 
-                self.search.search_parallel(target, parallel)
+                # PART 1b. `search_parallel`'s return value is the search's own
+                # SearchStats and carries `max_depth` — the deepest ply THIS
+                # move's simulations selected to. It was already being built and
+                # discarded; taking the running maximum of it is what lets
+                # `seldepth` be reported without a walk over the whole tree.
+                slice_stats = self.search.search_parallel(target, parallel)
+                depth_reached = max(depth_reached, int(slice_stats["max_depth"]))
                 par = self.search.parallel_stats()
                 evals = self.search.eval_stats()
                 delivered += int(par["delivered"])
@@ -2121,6 +2145,11 @@ class Engine:
                     rate = delivered / elapsed
 
                 if on_slice is not None:
+                    # `depth_reached` is deliberately NOT passed here. A
+                    # per-slice `info` line has reported `seldepth 1` since C11
+                    # — it carries no PV and no depth — and reporting a real one
+                    # only on the lines that never had it would be an output
+                    # change dressed as a performance fix.
                     on_slice(self._outcome(nominal, budget_source, inherited,
                                            delivered, elapsed, slices, eval_rows,
                                            eval_batches, stopped=False,
@@ -2172,7 +2201,8 @@ class Engine:
                              eval_rows, eval_batches,
                              stopped=stopped, reason=reason, with_pv=True,
                              exhausted=exhausted, exhausted_at=exhausted_at,
-                             deadline_hit=deadline_hit)
+                             deadline_hit=deadline_hit,
+                             depth_reached=depth_reached)
 
     # --- reporting internals ---------------------------------------------
 
@@ -2219,15 +2249,22 @@ class Engine:
                  eval_rows: int, eval_batches: int, *,
                  stopped: bool, reason: str, with_pv: bool,
                  exhausted: bool = False, exhausted_at: int = 0,
-                 deadline_hit: bool = False) -> SearchOutcome:
+                 deadline_hit: bool = False,
+                 depth_reached: int = 0) -> SearchOutcome:
         best = self.search.best_move
         mating = self.search.mating_move
         cache = self.search.cache_stats()
         root_visits = int(self.search.root_visits)
 
         q, pv, depth, max_depth = 0.0, [], 0, 0
+        pv_ms = 0.0
         if with_pv:
-            q, pv, depth, max_depth = self._principal_variation(best)
+            # PART 1c. Timed here rather than inside the walk, so the figure
+            # covers exactly what the clock is charged for and nothing else.
+            pv_started = time.perf_counter()
+            q, pv, depth = self._principal_variation(best)
+            max_depth = depth_reached
+            pv_ms = (time.perf_counter() - pv_started) * 1000.0
         else:
             # O(1) stand-in for the per-slice `info` line: the root's own Q,
             # negated because a node's value_sum reads from the perspective of
@@ -2269,6 +2306,7 @@ class Engine:
             arena_high_water=int(self.search.arena_high_water),
             arena_capacity=int(self.search.arena_capacity),
             deadline_hit=deadline_hit,
+            pv_ms=pv_ms,
         )
 
     def root_branches(self, top_n: Optional[int] = None
@@ -2296,77 +2334,84 @@ class Engine:
         two-reply position look like it had spent 3% of its effort somewhere
         invisible.
 
-        Reads `dump_tree_arrays(1)` — the VISITED subtree, one node per
-        simulation rather than the ~30 per expansion the arena holds — and takes
-        the depth-1 rows, which are exactly the root's children. Unvisited
-        children are absent by construction, which is correct: a reply with no
-        visits is not a branch the ponder built.
+        PART 1a. Reads `search.root_children()` — the root's child slots and
+        nothing below them. It used to read `dump_tree_arrays(1)`, the WHOLE
+        visited subtree, and keep the depth-1 rows: eight NumPy arrays over
+        every visited node and then a Python scan across all of them, to answer
+        a question about one ply. On the deployed pondered tree that is up to
+        2.4M rows for ~35 answers, and it is charged to the game clock.
+
+        The rows are the same rows. Unvisited children are absent by
+        construction on both sides, which is correct: a reply with no visits is
+        not a branch the ponder built. The sort is stable and the C++ walk
+        returns child-slot order, which is the order `dump_tree` emitted them
+        in, so equal-visit replies come out in the order they always did.
         """
         if self.search is None:
             return []
-        arrays = self.search.dump_tree_arrays(1)
-        depth = arrays["depth"]
-        if depth.size == 0:
-            return []
-        visits, packed = arrays["visits"], arrays["move"]
-        rows = [(int(visits[i]), int(packed[i]))
-                for i in range(int(depth.size)) if int(depth[i]) == 1]
+        rows = [(visits, uci) for uci, visits in self.search.root_children()]
         if not rows:
             return []
         rows.sort(key=lambda row: row[0], reverse=True)
         total = sum(count for count, _ in rows) or 1
-        return [(guofish_core.move_to_uci(move), count, count / total)
-                for count, move in (rows if top_n is None else rows[:top_n])]
+        return [(uci, count, count / total)
+                for count, uci in (rows if top_n is None else rows[:top_n])]
 
     def _principal_variation(self, best: Optional[str], max_plies: int = 12
-                             ) -> tuple[float, list[str], int, int]:
-        """(best child Q, PV, PV length, deepest visited ply).
+                             ) -> tuple[float, list[str], int]:
+        """(best child Q, PV, PV length). O(plies x branching), and that is all.
 
-        Walks `dump_tree_arrays(1)` — the VISITED subtree, which is ~1 node per
-        simulation rather than the ~30 per expansion the whole arena holds, so a
-        20,000-sim tree dumps ~20,000 rows and not ~600,000. The dump is DFS
-        preorder with a depth column, so a child of the node at index i is the
-        next entry with depth == depth[i] + 1 before the first entry with
-        depth <= depth[i]; the walk follows the most-visited child at each step,
-        which is what the reference's PV does.
+        PART 1b. This used to read `dump_tree_arrays(1)` — the whole visited
+        subtree, materialised as eight NumPy arrays — and then scan it in Python
+        to find twelve nodes. The scan is the expensive half: the inner loop
+        walks every row between a node and its next sibling, so a 316,000-visit
+        pondered tree costs a few hundred thousand Python-level integer
+        conversions for a twelve-ply answer. Measured on the wire at 424 ms
+        median and 3,899 ms max, and INVISIBLE TO THE ENGINE: `wall_s` is
+        sampled before this runs, so every millisecond of it was charged to the
+        clock and excluded from the reported nps (D-L0-4).
 
-        `dump_tree_arrays` rather than `dump_tree` because the array form carries
-        the depth column and the tuple form does not, and because it is one
-        traversal: the packed moves are turned into UCI one at a time, for the
-        dozen nodes the PV actually visits.
+        `search.principal_variation` is the same descent — most-visited child at
+        each step, first strict maximum in child-slot order, the same tie-break
+        — over the arena's child slots.
+
+        `seldepth` LEFT THIS FUNCTION, and that is the second half of Part 1b
+        rather than a tidy-up. It was `dump_tree_arrays(1)["depth"].max()`, a
+        property of the whole tree, and the exact C++ equivalent
+        (`Search::max_visited_depth`) still costs a traversal of every child
+        slot of every visited node — MEASURED at 48 ms median on a 200,000-visit
+        fresh root, which was the ENTIRE remaining gap after the rest of Part 1
+        landed, and which grows with the tree exactly as the leg it replaced
+        did. Part 1's goal is to remove the variance, not to halve it. It now
+        comes from `SearchStats::max_depth` folded across the move's slices —
+        the deepest ply this move's simulations selected to, which is what UCI's
+        `seldepth` means and which the search was already computing and
+        discarding.
+
+        THAT IS A REPORTED-OUTPUT CHANGE AND IT IS NAMED. On a fresh root the
+        two are IDENTICAL — asserted over the pinned corpus in
+        tests/test_tc_clock_and_ponder.py — because every visited node was put
+        there by this search. They differ on an INHERITED tree, where the old
+        figure included plies reached by previous searches that this one did not
+        re-descend. The new one is the narrower and more literal reading of the
+        protocol's word, and `Search::max_visited_depth()` stays bound and
+        tested for anyone who wants the tree's own depth.
+
+        WHERE `wall_s` IS SAMPLED IS UNCHANGED (Part 1c). Moving it is the other
+        listed fix for D-L0-4 and is the wrong one: it would change reported nps
+        and invalidate every constant measured against it. Making the excluded
+        work immaterial reaches the same end from the other side.
         """
-        arrays = self.search.dump_tree_arrays(1)
-        depth = arrays["depth"]
-        if depth.size == 0:
-            return 0.0, [], 0, 0
+        steps = self.search.principal_variation(max_plies)
 
-        visits = arrays["visits"]
-        value_sum = arrays["value_sum"]
-        packed = arrays["move"]
-        max_depth = int(depth.max())
-
-        pv: list[str] = []
+        pv: list[str] = [uci for uci, _visits, _value_sum in steps]
         q = 0.0
-        i = 0
-        while len(pv) < max_plies:
-            here = int(depth[i])
-            best_index = -1
-            best_visits = 0
-            j = i + 1
-            while j < depth.size and int(depth[j]) > here:
-                if int(depth[j]) == here + 1 and int(visits[j]) > best_visits:
-                    best_visits, best_index = int(visits[j]), j
-                j += 1
-            if best_index < 0:
-                break
-            if not pv:
-                # The engine's own move: its value_sum is already in the
-                # engine's perspective (the backup negates on the way up), so it
-                # is used as-is. Same convention as the reference's
-                # last_best_child_q.
-                q = float(value_sum[best_index]) / max(1, best_visits)
-            pv.append(guofish_core.move_to_uci(int(packed[best_index])))
-            i = best_index
+        if steps:
+            # The engine's own move: its value_sum is already in the engine's
+            # perspective (the backup negates on the way up), so it is used
+            # as-is. Same convention as the reference's last_best_child_q.
+            _uci, visits, value_sum = steps[0]
+            q = float(value_sum) / max(1, int(visits))
 
         # `best_move` is the core's answer and the one that gets played; if the
         # PV walk disagrees the PV is wrong, not the move, so say so rather than
@@ -2377,7 +2422,7 @@ class Engine:
             pv = [best]
         if best is not None and not pv:
             pv = [best]
-        return q, pv, len(pv), max_depth
+        return q, pv, len(pv)
 
 
 # Which fields force a rebuild of the C++ search object when they change.
@@ -2569,7 +2614,6 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                         "expired clock still makes progress instead of spinning")
     g.add_argument("--move-overhead-ms", type=int, default=EngineConfig.move_overhead_ms,
                    help="subtracted from every allotted move time")
-
     g = parser.add_argument_group("opening book / Syzygy (C11b; both default ON)")
     g.add_argument("--no-book", dest="use_book", action="store_false", default=True,
                    help="disable the Polyglot opening book. NOTE: a book move "

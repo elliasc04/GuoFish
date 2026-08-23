@@ -362,7 +362,8 @@ class UCIEngine:
     """The protocol loop. Owns the board, the config, and one `Engine`."""
 
     def __init__(self, config: EngineConfig,
-                 move_stats: Optional[MoveStatsCollector] = None):
+                 move_stats: Optional[MoveStatsCollector] = None,
+                 branch_table: bool = False):
         self.config = config
         self.engine = Engine(config)
         # M2. None unless `--move-stats` named a directory. Every use of it is
@@ -372,6 +373,26 @@ class UCIEngine:
         self._ms_ply = 0
         self._ms_go_t = None
         self._ms_ponder: dict = {}
+        # PART 1a. THE BRANCH TABLE IS DIAGNOSTIC AND IS OFF BY DEFAULT.
+        #
+        # It is one ply of a table for a human, printed to stderr, and it used
+        # to cost a full `dump_tree_arrays(1)` — the whole visited subtree — on
+        # every resolved ponder, i.e. on 53% of moves, on the moves where the
+        # tree is largest, charged to a rated game's clock. The walk itself is
+        # now O(children) (`Engine.root_branches`), so what is left here is the
+        # SAN labelling and the formatting; gating it as well is what makes
+        # "debug output does not run in deployed play" a property of the control
+        # flow rather than of how cheap the walk happens to be.
+        #
+        # Turned on by UCI's own `debug on` — the protocol already has this
+        # switch and it was being answered with a shrug — or by `--branch-table`
+        # at launch for a diagnostic run.
+        #
+        # A WRAPPER FLAG, NOT AN `EngineConfig` FIELD, for the reason
+        # `--move-stats` is one: every `EngineConfig` field is advertised as a
+        # UCI `option name` line, so putting it there would change the `uci`
+        # handshake and make the flag's ABSENCE observable.
+        self._debug = bool(branch_table)
         self.board = chess.Board()
         self._base_fen = chess.STARTING_FEN
         self._moves: list[str] = []
@@ -812,7 +833,7 @@ class UCIEngine:
             # next `[search]` line and the two can be reconciled; on a miss it
             # is what the GUI's next `position` will discard.
             f"root_visits_carried={carried}")
-        if ponder_outcome is not None and not self._quit.is_set():
+        if self._debug and ponder_outcome is not None and not self._quit.is_set():
             # The branch table, read while the pondered tree is still rooted
             # where the ponder left it. On a hit the GUI has confirmed the
             # prediction, so the whole root IS the branch that transfers and
@@ -1272,6 +1293,13 @@ class UCIEngine:
                 "pre_search_ms": round((search_started - go_t) * 1000.0, 3),
                 "post_search_ms": round((now - search_ended) * 1000.0, 3),
                 "go_to_bestmove_ms": round((now - go_t) * 1000.0, 3),
+                # PART 1c. `post_search_ms` is the PV walk plus the two `info`
+                # lines plus `bestmove`; this is the PV walk alone, which is the
+                # leg D-L0-4 is about and the one Part 1 set out to shrink.
+                # Reported rather than folded into `wall_s`, because moving
+                # where `wall_s` is sampled would change every nps constant
+                # measured against it.
+                "pv_ms": round(getattr(outcome, "pv_ms", 0.0), 3),
                 "wall_clock_utc": _utc_now(),
             }
             position = position_stratifiers(self.board)
@@ -1606,7 +1634,16 @@ class UCIEngine:
                     # bug in the GUI becomes visible.
                     err(f"[{command}] no search in flight; ignored")
                 elif command == "debug":
-                    err(f"[debug] {' '.join(args)} (this engine always logs to stderr)")
+                    # PART 1a. This used to be answered with a shrug. It is now
+                    # the switch on the branch table — the one piece of stderr
+                    # that costs the move's clock rather than a line of text.
+                    if args and args[0] == "on":
+                        self._debug = True
+                    elif args and args[0] == "off":
+                        self._debug = False
+                    err(f"[debug] {' '.join(args)}: branch table "
+                        f"{'ON' if self._debug else 'OFF'} "
+                        f"(everything else always logs to stderr)")
                 else:
                     err(f"[uci] ignoring unknown command {line!r}")
             except Exception as exc:                      # noqa: BLE001
@@ -1717,6 +1754,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--move-stats-note", metavar="TEXT", default="",
         help="Free text recorded in the manifest: what this run is.")
     group.add_argument(
+        "--branch-table", action="store_true",
+        help="PART 1a. Print the post-ponder root branch table to stderr. OFF by "
+             "default because it is diagnostic output charged to a rated game's "
+             "clock; UCI `debug on` turns it on mid-game.")
+    parser.add_argument(
         "--move-stats-contaminated", metavar="F1,F2", default="",
         help="Comma-separated record fields a downstream fit must NOT use. "
              "A cutechess run at concurrency > 1 should name every wall-clock "
@@ -1770,7 +1812,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"(flush every {collector.flush_every} moves; "
             f"ladder {list(guofish_core.MOVE_STATS_LADDER)})")
 
-    return UCIEngine(config, move_stats=collector).run()
+    return UCIEngine(config, move_stats=collector,
+                     branch_table=args.branch_table).run()
 
 
 if __name__ == "__main__":
