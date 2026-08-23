@@ -265,6 +265,11 @@ OPTIONS: tuple[Option, ...] = (
     Option("MinSliceSims", "min_slice_sims", "spin", int, "min 1 max 1000000"),
     Option("MoveOverhead", "move_overhead_ms", "spin", int, "min 0 max 10000"),
 
+    # PART 4b. `TreeMaxVisits` None computes `sims_per_move + ponder_max_sims`,
+    # which is the sum the arena was always sized from and was never enforced.
+    Option("TreeMaxVisits", "tree_max_visits", "spin", _parse_optional_int,
+           "min 0 max 100000000"),
+
     Option("Ponder", "ponder", "check", _parse_bool),
 )
 
@@ -1119,13 +1124,59 @@ class UCIEngine:
                     source_note = (f"go nodes {nodes} / decay {cfg.ponder_decay:g}"
                                    f", the GUI's budget for this move")
 
-            budget = current + cap
+            # PART 4b. ADDITIVE WITH A CEILING, not additive with nothing.
+            #
+            # `current + cap` is what let the resident tree grow without bound
+            # across consecutive ponder hits: 2,454,476 root visits measured in
+            # ordinary rated play, against the 866,667 the deployed arena was
+            # sized for. The tree is what both per-move legs scale with, so an
+            # unbounded tree is an unbounded move, and it is also how a game came
+            # to fill the arena and then play a move on ONE delivered simulation
+            # (D-L0-2).
+            #
+            # NOT PURELY ABSOLUTE. A `min(cap, ceiling)` target would deliver
+            # zero whenever the previous move already reached the ceiling, and
+            # then the engine does not think on the opponent's clock at all —
+            # which is free time and the one budget nothing competes for. It
+            # still extends beyond what is resident; it just stops somewhere.
+            ceiling = cfg.tree_ceiling
+            # NEVER BELOW `current`. A target under the root's own visit count
+            # is a negative amount of work: the slice loop breaks on the first
+            # pass either way, but `budget - current` is what every log line and
+            # every caller subtracts, and a negative there reads as a bug rather
+            # than as a ceiling.
+            budget = max(current, min(current + cap, ceiling))
+            ceiling_note = ""
+            if budget < current + cap:
+                allowed = budget - current
+                ceiling_note = (f" CAPPED at the {ceiling:,}-visit tree ceiling "
+                                f"(TreeMaxVisits), so only {allowed:,} of them")
+                if allowed == 0:
+                    # C11c'S NAMED FAILURE IS "PONDERING SILENTLY DOES NOTHING",
+                    # and the operative word is silently. A ponder that delivers
+                    # zero because the tree is already at the ceiling is the
+                    # ceiling working — growing a tree that is already at the
+                    # arena's design point is how D-L0-2's game came to report
+                    # `arena_exhausted` and then play a move on ONE delivered
+                    # simulation — but it is not something to find out about by
+                    # noticing `ponder_sims=0` on a verdict line nobody reads.
+                    #
+                    # It can only happen because the MOVE path put the tree
+                    # there, which it can while a pondered move is still
+                    # `current + N`. That is stated here because it is the pair
+                    # of bounds an operator would move.
+                    err(f"[ponder] NOT PONDERING: the root already holds "
+                        f"{current:,} visits, at or above the {ceiling:,}-visit "
+                        f"ceiling (TreeMaxVisits, = SimCap + PonderMaxSims). "
+                        f"The opponent's clock buys nothing this move because "
+                        f"the tree may not grow. Raise TreeMaxVisits, or bound "
+                        f"the MOVE's target too — which is what TC Part 3 is.")
             coupling = ("" if cfg.coupling_holds else
                         " WARNING: decay x ponder_max_sims exceeds sims_per_move; "
                         "a hit hands the next search a tree it cannot outvote")
             return (budget, None, None, "ponder",
                     f"ponder: up to {cap} new sims (root at {current}) "
-                    f"[{source_note}], no clock, "
+                    f"[{source_note}]{ceiling_note}, no clock, "
                     f"ending on ponderhit/stop.{coupling}")
 
         if params.infinite:

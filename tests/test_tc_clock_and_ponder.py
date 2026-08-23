@@ -1,4 +1,4 @@
-"""TC — clock safety and ponder semantics. Parts 1 and 2.
+"""TC — clock safety and ponder semantics. Parts 1, 2 and 4.
 
 The brief is `docs/TC/clock_and_ponder_brief.md`; the measurements it argues
 from are `docs/TC/{L0_LOGS,RECON,DEFECTS,PROBE_FRESH_ROOT}.md`.
@@ -29,6 +29,10 @@ WHAT EACH PART HAS TO PROVE HERE, AND WHAT IT CANNOT
           The `4YCsGtQ8` move-85 case is here as a planner assertion with the
           real clock off the wire, because that is the part of it that is
           deterministic. The replay is `telemetry/replay_lichess_game.py`.
+
+  Part 4  `PonderMaxSims`/`PonderDecay` resolve to the pinned ceiling and the
+          arena that follows from it, and the ponder's target is
+          additive-with-a-ceiling rather than unbounded.
 
 AMENDMENT D: no module-scope skip. `guofish_core` is a hard dependency of the
 suite; the Gate 1 dump and python-chess are not, so each test that needs one
@@ -644,6 +648,102 @@ def test_part2_the_move_stats_record_carries_what_the_invariant_needs():
         assert key in record, key
 
 
+# ---------------------------------------------------------------------------
+# Part 4 — the ponder ceiling and the arena
+# ---------------------------------------------------------------------------
+
+
+def test_part4a_the_deployed_ceiling_no_longer_comes_from_a_dead_decay():
+    """D-L0-1. `PonderDecay` does not decay anything.
+
+    `apply_move`'s `from_ponder` is never passed by any production caller, so
+    C8's inheritance decay is unreachable. What the deployed `PonderDecay: 0.3`
+    actually did was set the ponder ceiling to `SimCap / 0.3` = 666,667 — and it
+    BOUND: `ponder_sims` p99 and max are both exactly that — and commit a
+    3.78 GiB arena for it.
+
+    Pinning the ceiling says the same thing without routing it through a knob
+    that does not do what its name says.
+    """
+    dead = EngineConfig(sim_cap=200_000, ponder_decay=0.3)
+    assert dead.ponder_max_sims_resolved == 666_667
+
+    pinned = EngineConfig(sim_cap=200_000, ponder_decay=1.0,
+                          ponder_max_sims=200_000)
+    assert pinned.ponder_max_sims_resolved == 200_000
+    assert pinned.coupling_holds, \
+        "at decay 1.0 a ponder capped at the move budget cannot outvote it"
+
+
+def test_part4b_the_arena_follows_the_ceiling_down():
+    """3.78 GiB -> 1.74 GiB, and `coupling_holds` becomes a real statement.
+
+    `arena_nodes = 60 x (sims_per_move + ponder_max_sims)` at 78 B/node, both
+    ping-pong arenas included (RECON R2, measured against the running engine).
+    """
+    dead = EngineConfig(sim_cap=200_000, ponder_decay=0.3)
+    pinned = EngineConfig(sim_cap=200_000, ponder_decay=1.0,
+                          ponder_max_sims=200_000)
+
+    assert dead.arena_nodes == 60 * (200_000 + 666_667)
+    assert pinned.arena_nodes == 60 * (200_000 + 200_000) == 24_000_000
+    # MiB, the launcher's own unit.
+    assert pinned.arena_bytes / 2 ** 20 == pytest.approx(1785.3, abs=0.5)
+    assert dead.arena_bytes / 2 ** 20 == pytest.approx(3868.1, abs=0.5)
+    assert pinned.arena_bytes < 0.47 * dead.arena_bytes
+
+
+@requires_wrapper
+def test_part4b_the_ponder_target_is_additive_with_a_ceiling():
+    """D-L0-2. `current + cap` with no ceiling is how the tree ran away.
+
+    Measured in ordinary rated play: 2,454,476 resident root visits, against
+    the 866,667 the deployed arena was sized for — and then `arena_exhausted`,
+    and then a move played on ONE delivered simulation.
+
+    Two regimes, and the ceiling has to do the right thing in both: below it the
+    ponder is unchanged and still extends the tree, at it the ponder stops.
+    """
+    config = EngineConfig(sim_cap=200_000, ponder_decay=1.0,
+                          ponder_max_sims=200_000)
+    assert config.tree_ceiling == 400_000
+
+    uci, module = _uci_for_plan(config, root_visits=50_000)
+    params = module.GoParams(["ponder", "wtime", "300000", "btime", "300000",
+                              "nodes", "200000"])
+    budget, deadline, _n, source, note = uci._plan(params)
+    assert (source, deadline) == ("ponder", None)
+    assert budget == 250_000, "below the ceiling the ponder is unchanged"
+    assert "CAPPED" not in note
+
+    uci, module = _uci_for_plan(config, root_visits=300_000)
+    budget, _d, _n, _s, note = uci._plan(params)
+    assert budget == 400_000, "the ponder stops at the tree ceiling"
+    assert "CAPPED" in note
+
+
+@requires_wrapper
+def test_part4b_the_ponder_still_extends_beyond_what_is_resident():
+    """NOT PURELY ABSOLUTE, and the distinction is the whole of 4b.
+
+    A `min(cap, ceiling)` target would deliver zero whenever the previous move
+    already reached the ceiling, and then the engine does not think during the
+    opponent's turn at all — which is free time and the one budget nothing else
+    competes for.
+    """
+    config = EngineConfig(sim_cap=200_000, ponder_decay=1.0,
+                          ponder_max_sims=200_000)
+    uci, module = _uci_for_plan(config, root_visits=199_000)
+    params = module.GoParams(["ponder", "nodes", "200000"])
+    budget, _d, _n, _s, _note = uci._plan(params)
+    assert budget > 199_000, "a ponder that delivers nothing is not a ponder"
+
+
+def test_part4b_refuses_a_ceiling_under_the_move_budget():
+    """A fresh root would be unable to reach its own target."""
+    from playing.v6.playv6 import ConfigError
+    with pytest.raises(ConfigError, match="tree_max_visits"):
+        EngineConfig(sim_cap=200_000, tree_max_visits=100_000)
 
 
 @requires_dump

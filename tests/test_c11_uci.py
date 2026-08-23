@@ -596,16 +596,34 @@ def test_a_ponder_is_not_swallowed_by_a_fixed_budget(root_visits):
 
     Unreachable until `--sims` was collapsed onto `fixed_sims`, which put it
     behind the flag every fixed-budget run types.
+
+    TC PART 4b NARROWED THE SECOND HALF OF THIS TEST. It used to assert that the
+    ponder gets its FULL cap of fresh simulations on any tree; the ponder's
+    target is now `min(current + cap, tree_ceiling)`, so on a root already at or
+    above `SimCap + PonderMaxSims` it gets less, and at the top of the range it
+    gets none. That is the ceiling working rather than the defect returning:
+    D-L0-2 measured 2,454,476 resident root visits in ordinary rated play
+    against the 866,667 the arena was sized for, and the game that reached it
+    reported `arena_exhausted` and then played a move on ONE delivered
+    simulation. What this test is actually about — the FIXED branch must not
+    swallow the ponder, and a ponder below the ceiling gets everything it asked
+    for — is asserted unchanged. The starved case is loud on stderr, which is
+    the half of "pondering silently does nothing" that mattered.
     """
     config = EngineConfig(fixed_sims=4_000)
-    budget, deadline, nominal, source, _ = _plan_for(
+    budget, deadline, nominal, source, note = _plan_for(
         config, ["ponder", "wtime", "30000", "btime", "30000"], root_visits)
     assert source == "ponder", "the fixed branch swallowed the ponder"
     assert deadline is None, "a ponder has no clock"
-    assert budget - root_visits == config.ponder_max_sims_resolved, (
-        f"a ponder on a root holding {root_visits} visits must still get "
-        f"{config.ponder_max_sims_resolved} FRESH simulations, got "
-        f"{budget - root_visits}")
+
+    headroom = max(0, config.tree_ceiling - root_visits)
+    expected = min(config.ponder_max_sims_resolved, headroom)
+    assert budget - root_visits == expected, (
+        f"a ponder on a root holding {root_visits} visits against a "
+        f"{config.tree_ceiling}-visit ceiling must get {expected} FRESH "
+        f"simulations, got {budget - root_visits}")
+    if expected < config.ponder_max_sims_resolved:
+        assert "CAPPED" in note, "a clipped ponder must say so"
 
 
 @requires_wrapper

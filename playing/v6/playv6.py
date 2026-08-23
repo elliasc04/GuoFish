@@ -451,6 +451,10 @@ class EngineConfig:
     ponder: bool = False
     move_overhead_ms: int = 100
 
+    # PART 4b. THE CEILING ON TOTAL RESIDENT ROOT VISITS, or None for the
+    # computed one. See `tree_ceiling`.
+    tree_max_visits: Optional[int] = None
+
     def __post_init__(self) -> None:
         for name in ("model_path", "book_path", "syzygy_path"):
             value = getattr(self, name)
@@ -541,6 +545,38 @@ class EngineConfig:
         if self.ponder_max_sims is not None:
             return self.ponder_max_sims
         return max(1, int(math.ceil(self.sims_per_move / self.ponder_decay)))
+
+    @property
+    def tree_ceiling(self) -> int:
+        """PART 4b. The most root visits the resident tree may be driven to.
+
+            tree_ceiling = sims_per_move + ponder_max_sims_resolved
+
+        THE SAME SUM THE ARENA IS ALREADY SIZED FROM, and that is the whole
+        argument for it: `arena_nodes` is `60 x (sims_per_move +
+        ponder_max_sims)` because one move plus one ponder is what the engine
+        believed a tree could reach. It was not true. `_plan`'s ponder branch
+        targets `current + cap` with no ceiling at all, so across consecutive
+        ponder hits the resident tree grows without bound and reached 2,454,476
+        root visits in ordinary rated play — 6x the sum the arena was sized for,
+        which is how a game came to report `arena_exhausted` and then play a
+        move on ONE delivered simulation (D-L0-2).
+
+        ADDITIVE WITH A CEILING, NOT PURELY ABSOLUTE. A purely absolute ponder
+        target would deliver zero whenever the previous move already reached it,
+        and then the engine does not think on the opponent's clock at all — which
+        is free time and the one budget nothing is competing for. The ponder
+        still extends beyond what is resident; it just stops somewhere.
+
+        WHY NOT SIZE IT FROM THE ARENA. R2 measures 78 B/node, which says 10 GB
+        would permit a ceiling near 2.1M. That is the wrong conclusion: the
+        binding constraint is that BOTH per-move legs scale with the tree the
+        ponder builds, at ~2 us per root visit. Raising the ceiling buys a
+        slower move, not a safer one.
+        """
+        if self.tree_max_visits is not None:
+            return self.tree_max_visits
+        return self.sims_per_move + self.ponder_max_sims_resolved
 
     @property
     def coupling_holds(self) -> bool:
@@ -704,6 +740,14 @@ class EngineConfig:
                 f"{list(guofish_core.AFFINITY_POLICIES)}")
         if self.max_tree_depth < 1:
             raise ConfigError(f"max_tree_depth must be >= 1, got {self.max_tree_depth}")
+        # PART 4b. Pinning it below the move budget would make a fresh root
+        # unable to reach its own target, which is a stranger failure than any
+        # ceiling is worth.
+        if self.tree_max_visits is not None and self.tree_max_visits < self.sims_per_move:
+            raise ConfigError(
+                f"tree_max_visits ({self.tree_max_visits}) is below the move "
+                f"budget ({self.sims_per_move}); the ceiling would bind on a "
+                f"fresh root before the move's own budget did.")
         if self.cache_entries < 0:
             raise ConfigError(f"cache_entries must be >= 0, got {self.cache_entries}")
         # C11c. `None` is "compute it" and is the default; a pinned value is
@@ -2614,6 +2658,14 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                         "expired clock still makes progress instead of spinning")
     g.add_argument("--move-overhead-ms", type=int, default=EngineConfig.move_overhead_ms,
                    help="subtracted from every allotted move time")
+    # TC Part 4b; see EngineConfig.tree_ceiling.
+    g.add_argument("--tree-max-visits", type=int, default=None,
+                   help="ceiling on TOTAL resident root visits, which is what "
+                        "bounds a ponder. Omit for the computed "
+                        "sims_per_move + ponder_max_sims — the same sum the "
+                        "arena has always been sized from and which nothing was "
+                        "enforcing")
+
     g = parser.add_argument_group("opening book / Syzygy (C11b; both default ON)")
     g.add_argument("--no-book", dest="use_book", action="store_false", default=True,
                    help="disable the Polyglot opening book. NOTE: a book move "
