@@ -28,7 +28,8 @@ The command surface is deliberately identical, so muscle memory carries over:
   * `--pgn` / `--pgn-ply` walk-back: replay a file's mainline, then let the
     engine move at the loaded position
   * `undo` / `back`, `new` / `restart`, `quit` / `exit`, and a play-again prompt
-  * `--stats` for the root search distribution and the principal variation
+  * `--stats` for the root search distribution and the principal variation, or
+    `--pv` for the principal variation alone
 
 WHAT IS DIFFERENT, AND WHY
 ==========================
@@ -93,6 +94,7 @@ import argparse
 import io
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -119,6 +121,14 @@ from playing.v6.playv6 import (  # noqa: E402
     format_root_branches,
     move_label,
     preimport_torch,
+)
+
+# M2. The move-stats collector, so `--stats` and `--move-stats` are two
+# independent channels on the same frontend and M3's third check has something
+# to disambiguate. One writes a table for a human; the other writes JSONL to a
+# file, and neither can reach the other's medium.
+from telemetry.move_stats import (  # noqa: E402
+    MoveStatsCollector, build_record, position_stratifiers,
 )
 
 # Set to "" by `--no-color` and whenever stdout is not a terminal, so a piped
@@ -461,10 +471,15 @@ class Session:
     itself.
     """
 
-    def __init__(self, engine: Engine, args: argparse.Namespace, budget: int):
+    def __init__(self, engine: Engine, args: argparse.Namespace, budget: int,
+                 move_stats: Optional[MoveStatsCollector] = None):
         self.engine = engine
         self.args = args
         self.budget = budget
+        # M2. None unless `--move-stats` named a directory. Independent of
+        # `--stats`, which prints a table and touches no file.
+        self.move_stats = move_stats
+        self._ms_ply = 0
         self.base_fen = args.fen or chess.STARTING_FEN
         self.board = chess.Board(self.base_fen)
         self.human_side = chess.WHITE
@@ -735,8 +750,19 @@ class Session:
             return False
         self.engine.set_position(self.base_fen,
                                  [m.uci() for m in self.board.move_stack])
+        # M2. Armed immediately before the search and finished immediately
+        # after, so the ladder covers exactly this move's simulations.
+        ms_go = time.perf_counter()
+        if self.move_stats is not None and self.move_stats.enabled:
+            try:
+                self.engine.search.move_stats_begin()
+            except Exception as exc:                          # noqa: BLE001
+                self.move_stats._fail(f"arming the recorder: {exc!r}")
+        ms_started = time.perf_counter()
         outcome = self.engine.search_move(budget=self.budget, nominal=self.budget,
                                           budget_source="nodes")
+        ms_ended = time.perf_counter()
+        self._record_move_stats(outcome, ms_go, ms_started, ms_ended)
         if outcome.best_move is None:
             print("Engine has no move to play.")
             return False
@@ -764,13 +790,19 @@ class Session:
         # search and describes one that never ran.
         want_stats = self.args.stats and not outcome.bypassed
         rows = root_distribution(self.engine, self.board) if want_stats else []
-        pv = format_pv(self.board, outcome) if self.args.stats else ""
+        # `--stats` implies `--pv`, so passing both prints the line once. Unlike
+        # the root dump this is safe for a bypassed move: `format_pv` reads
+        # `outcome.pv`, which belongs to THIS decision, and says so when the
+        # decision was a book or tablebase hit rather than a search.
+        want_pv = self.args.stats or self.args.pv
+        pv = format_pv(self.board, outcome) if want_pv else ""
 
         print(f"{RED}Engine plays: {san}{RESET}  "
               f"[{format_engine_stats(outcome, white_to_move)}]")
         if self.args.stats:
             print()
             print(format_root_distribution(rows, move))
+        if want_pv:
             print()
             print(pv)
         if self.args.telemetry:
@@ -780,6 +812,51 @@ class Session:
         self.board.push(move)
         self.outcomes.append(outcome)
         return True
+
+    def _record_move_stats(self, outcome: SearchOutcome, go_t: float,
+                           started: float, ended: float) -> None:
+        """One record, or nothing. Never raises into the game."""
+        if self.move_stats is None or not self.move_stats.enabled:
+            return
+        try:
+            checkpoints = {}
+            if self.engine.ready and self.engine.search.move_stats_armed:
+                checkpoints = self.engine.search.move_stats_finish()
+            self._ms_ply += 1
+            record = build_record(
+                ply=self._ms_ply,
+                side="w" if self.board.turn == chess.WHITE else "b",
+                fen=self.board.fen(),
+                outcome=outcome,
+                checkpoints=checkpoints,
+                timings={
+                    "pre_search_ms": round((started - go_t) * 1000.0, 3),
+                    "post_search_ms": round((time.perf_counter() - ended) * 1000.0, 3),
+                    "go_to_bestmove_ms": round((time.perf_counter() - go_t) * 1000.0, 3),
+                    "wall_clock_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                    time.gmtime()),
+                },
+                ponder={
+                    # The interactive frontend ponders on the HUMAN's clock from
+                    # the current root rather than from a prediction, so there is
+                    # no hit or miss to report — only what it added.
+                    "ponder_hit": None,
+                    "ponder_sims": self.ponder_sims_total,
+                    "ponder_wall_ms": None,
+                    "ponder_capped": None,
+                },
+                position=position_stratifiers(self.board),
+                config={
+                    "K": self.engine.config.in_flight,
+                    "max_batch": self.engine.config.max_batch,
+                    "threads": self.engine.config.threads,
+                    "sim_cap": self.engine.config.sim_cap,
+                    "frontend": "playv6_interactive",
+                },
+            )
+            self.move_stats.record_move(record)
+        except Exception as exc:                              # noqa: BLE001
+            self.move_stats._fail(f"recording a move: {exc!r}")
 
     def inject(self, move: chess.Move, label: str = "injected") -> None:
         print(f"{RED}Engine plays: {self.board.san(move)}{RESET}  [{label}]\n")
@@ -937,6 +1014,9 @@ class Session:
         self.engine.new_game()
         self.board = chess.Board(self.base_fen)
         self.outcomes = []
+        if self.move_stats is not None:
+            self._ms_ply = 0
+            self.move_stats.begin_game()
 
         if pgn_preload is not None:
             for move in pgn_preload:
@@ -1067,10 +1147,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--pgn-ply", type=int, default=None,
                         help="with --pgn, replay only the first N plies. Set N "
                              "so the side you want analysed is to move")
+    parser.add_argument("--move-stats", metavar="DIR", default=None,
+                        help="record per-move cost and decision-trajectory "
+                             "records under DIR/<run_id>/. Independent of "
+                             "--stats: this writes JSONL to a file and nothing "
+                             "to stdout")
+    parser.add_argument("--move-stats-run-id", metavar="ID", default=None,
+                        help="name the --move-stats run directory (default: a "
+                             "UTC timestamp)")
     parser.add_argument("--stats", action="store_true",
                         help="after every searched move, print the root search "
                              "distribution (visits, share, prior, Q) and the "
                              "principal variation")
+    parser.add_argument("--pv", action="store_true",
+                        help="after every engine move, print the principal "
+                             "variation. The PV half of --stats without the root "
+                             "distribution; --stats implies it, so passing both "
+                             "prints the PV once")
     parser.add_argument("--telemetry", action="store_true",
                         help="also emit the engine's own [search] line per move "
                              "on stderr — delivered vs nominal sims, inflation, "
@@ -1113,6 +1206,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     budget = config.fixed_sims or config.default_sims
     engine = Engine(config)
+    collector: Optional[MoveStatsCollector] = None
     try:
         engine.ensure_ready()
         err(f"[init] book={engine.book_state}")
@@ -1122,7 +1216,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("The opening book is ON: early moves are looked up, not "
                   "searched. Pass --no-book to search them.")
 
-        session = Session(engine, args, budget)
+        if args.move_stats:
+            collector = MoveStatsCollector(
+                Path(args.move_stats), run_id=args.move_stats_run_id,
+                note="playv6_interactive", on_error=err)
+            collector.write_provenance(
+                config_line=config.as_kv(),
+                model_path=str(config.model_path or DEFAULT_MODEL),
+                repo=REPO_ROOT)
+            err(f"[move-stats] ON -> {collector.dir}")
+        session = Session(engine, args, budget, move_stats=collector)
         while True:                       # the restart loop
             try:
                 session.play(pgn_preload)
@@ -1135,6 +1238,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print("Quitting.")
                 return 0
     finally:
+        if collector is not None:
+            collector.close()
         engine.close()
 
 

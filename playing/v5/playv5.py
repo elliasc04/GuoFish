@@ -887,6 +887,12 @@ def main():
                              "(checkmate or 'quit'), also print a batch-size diagnostic "
                              "(average size, histogram, min/max saturation) useful for "
                              "tuning --turbo / GPU utilization.")
+    parser.add_argument("--pv", action="store_true",
+                        help="Print the principal variation after every engine move "
+                             "(requires --mcts). This is the PV half of --stats without "
+                             "the root search distribution or the end-of-game batch "
+                             "diagnostic; --stats already implies it, so passing both "
+                             "prints the PV once.")
     parser.add_argument("--pgn", type=Path, default=None,
                         help="Walk-back analysis: load this PGN file and replay its "
                              "mainline before interactive play starts, so the first game "
@@ -1090,11 +1096,16 @@ def main():
                     print("Engine has no legal moves!")
                     return False
                 print(f"{RED}Engine plays: {board.san(move)}{RESET}  [{format_engine_stats(stats)}]\n")
-                if args.stats and stats.get('root_dist'):
-                    print(format_search_distribution(stats, move))
-                    print()
-                    print(format_pv(stats))
-                    print()
+                # Both blocks hang off root_dist because that is what says MCTS
+                # actually ran: a raw-policy move (no --mcts) has no tree, so
+                # there is no distribution to show and no line to descend.
+                if stats.get('root_dist'):
+                    if args.stats:
+                        print(format_search_distribution(stats, move))
+                        print()
+                    if args.stats or args.pv:
+                        print(format_pv(stats))
+                        print()
                 board.push(move)
                 mcts_apply(move)
                 start_ponder()
