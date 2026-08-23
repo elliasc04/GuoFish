@@ -373,6 +373,7 @@ class UCIEngine:
         self._ms_ply = 0
         self._ms_go_t = None
         self._ms_ponder: dict = {}
+        self._ms_plan: dict = {}
         # PART 1a. THE BRANCH TABLE IS DIAGNOSTIC AND IS OFF BY DEFAULT.
         #
         # It is one ply of a table for a human, printed to stderr, and it used
@@ -632,6 +633,13 @@ class UCIEngine:
         # pondered move it starts at the ponderhit instead; see
         # `handle_go_ponder`.
         go_t = time.perf_counter()
+        # PART 2b. THE SAME INSTANT ON THE OTHER CLOCK. `perf_counter` is what
+        # the move-stats record is denominated in and `monotonic` is what
+        # `search_move`'s deadline is compared against; the two have different
+        # epochs, so an absolute deadline armed from the `go` line needs the
+        # `go` line stamped on the deadline's own scale. Read back to back, so
+        # the pair differs by the cost of one call.
+        go_mono = time.monotonic()
         # `_stop` is NOT cleared here. The reader thread clears it when it sees
         # the `go` line, which is the only place that preserves stdin order: a
         # `stop` sent immediately after `go` arrives while this method is still
@@ -661,11 +669,11 @@ class UCIEngine:
             self.handle_go_ponder(params)
             return
 
-        budget, deadline, nominal, source, plan = self._plan(params)
+        budget, deadline, nominal, source, plan = self._plan(params, since=go_mono)
         err(f"[go] {plan}")
 
         self._last_info = 0.0
-        self._ms_arm(go_t)
+        self._ms_arm(go_t, plan=self._clock_facts(params, deadline, go_mono))
         self._searching.set()
         ms_started = time.perf_counter()
         try:
@@ -809,6 +817,8 @@ class UCIEngine:
         self._ponderhit.clear()
         # M2. Stamped here, the first statement after the verdict is known.
         hit_t = time.perf_counter()
+        # PART 2b. The same instant on the deadline's clock; see `handle_go`.
+        hit_mono = time.monotonic()
 
         # ONE CANONICAL VERDICT LINE PER RESOLVED PONDER, and exactly one.
         #
@@ -877,14 +887,15 @@ class UCIEngine:
             self._send_bestmove(f"bestmove {bypass_uci}")
             return
 
-        budget, deadline, nominal, source, plan = self._plan_after_ponderhit(params)
+        budget, deadline, nominal, source, plan = self._plan_after_ponderhit(
+            params, since=hit_mono)
         err(f"[ponderhit] {plan}")
         self._last_info = 0.0
         # M2. `hit_t` was stamped the instant the verdict was read, which is as
         # close to the GUI's `ponderhit` as this process can observe. The gap
         # between it and the first simulation is the ponder join plus the plan —
         # R4's leading suspect, broken out as `pre_search_ms`.
-        self._ms_arm(hit_t)
+        self._ms_arm(hit_t, plan=self._clock_facts(params, deadline, hit_mono))
         self._searching.set()
         ms_started = time.perf_counter()
         try:
@@ -953,9 +964,15 @@ class UCIEngine:
             return self._moves[-1]
         return move_label(parent, self._moves[-1])
 
-    def _plan(self, params: GoParams
+    def _plan(self, params: GoParams, *, since: Optional[float] = None
               ) -> tuple[int, Optional[float], Optional[int], str, str]:
         """(root-visit target, deadline, requested sims, budget source, why).
+
+        PART 2b. `since` is `time.monotonic()` AS OF THE `go` LINE, and the
+        deadline is measured from it rather than from now. See the clock branch
+        below. It defaults to now, which is what a caller with no stamp of its
+        own — a test, or the ponder's phase 1, whose deadline is None anyway —
+        should get.
 
         `requested sims` is None whenever the GUI asked for a duration rather
         than a count — see SearchOutcome on why a ceiling must not be reported
@@ -1004,8 +1021,21 @@ class UCIEngine:
         if not params.ponder and not params.infinite:
             allotted = self._allot(params)
             if allotted is not None:
-                deadline = time.monotonic() + allotted
-                clock_note = f"{allotted * 1000:.0f} ms allotted"
+                # PART 2b. ARMED AGAINST AN ABSOLUTE INSTANT, NOT A RELATIVE
+                # ONE. `since` is `time.monotonic()` as of the `go` line;
+                # everything between it and here — `set_position`, which
+                # REBUILDS THE TREE on a ponder miss, and this method — is
+                # already spent and is charged to the clock the GUI is running.
+                # Computing `now + allotted` would hand that spend back as free
+                # time and let it leak straight through the guard. Small on this
+                # path (a measured 4 ms at the fresh-root median) and not small
+                # on the pondered one, which is why it is done identically in
+                # both places rather than only where it hurts.
+                base = time.monotonic() if since is None else since
+                deadline = base + allotted
+                spent = (time.monotonic() - base) * 1000.0
+                clock_note = (f"{allotted * 1000:.0f} ms allotted from the go "
+                              f"line ({spent:.0f} ms of it already spent)")
 
         nodes = params.get("nodes")
         if nodes is not None and not params.ponder:
@@ -1111,12 +1141,25 @@ class UCIEngine:
         return (current + cfg.default_sims, None, cfg.default_sims, "default",
                 f"no clock and no nodes: DefaultSims {cfg.default_sims} new sims")
 
-    def _plan_after_ponderhit(self, params: GoParams
+    def _plan_after_ponderhit(self, params: GoParams, *,
+                              since: Optional[float] = None
                               ) -> tuple[int, Optional[float], Optional[int], str, str]:
         """The budget for phase 2, measured FROM THE PONDERHIT INSTANT.
 
-        Both halves of that are requirement 2 of the brief and both are
-        structural here rather than remembered:
+        PART 2, AND THIS METHOD IS D-L0-7. It used to return `None` where the
+        deadline goes on the branch deployment actually takes — the one where
+        the GUI stated a node budget, which python-chess puts on every `go
+        ponder` when the Limit carries one, which lichess-bot's
+        `go_commands.nodes` makes always. So on 53% of moves the backstop
+        `lichess-bot/config.yml` documents did not exist, and it was absent on
+        exactly the moves where the resident tree is largest and the nps lowest.
+        Game `4YCsGtQ8` move 85 spent 7.164 s of a 4.283 s clock on this path
+        and lost the game on time; the two moves in the same sequence where the
+        ponder MISSED took the ordinary path, were timed, and ended at
+        `reason=time` under three seconds.
+
+        Both halves of the brief's requirement 2 are structural here rather than
+        remembered:
 
           the clock   `_allot` is called NOW, so the allotted time runs from
                       this instant. The `wtime`/`btime` on the original `go
@@ -1156,10 +1199,33 @@ class UCIEngine:
             # An absolute N would let a productive ponder arrive with the budget
             # already spent and return instantly with zero fresh work.
             budget = max(1, min(nodes, cfg.sim_cap))
-            return (current + budget, None, budget, "ponderhit",
+            # PART 2a. AND THE DEADLINE, WHICH USED TO BE `None` HERE.
+            #
+            # BOTH BOUNDS, exactly as the ordinary `go nodes N` branch of
+            # `_plan` returns both and exactly as `config.yml` says: "the node
+            # target is the operative one in practice; the clock is the backstop
+            # that keeps a pathological position from flagging the game."
+            # Whichever binds first ends the move. On a healthy move the node
+            # budget still wins and nothing changes; on move 85 of `4YCsGtQ8`
+            # the clock wins and the game is not lost.
+            #
+            # PART 2b. FROM THE PONDERHIT INSTANT, not from now. The pre-search
+            # leg on this path — the phase-1 slice exit, the verdict line, the
+            # branch table before Part 1a gated it — is a measured median of
+            # 343 ms and a maximum of 5,851 ms, and every millisecond of it is
+            # ALREADY SPENT when this runs. `now + allotted` would hand all of
+            # it back.
+            deadline = self._deadline_from(params, since)
+            if deadline is None:
+                clock_note = "clock not stated"
+            else:
+                base = time.monotonic() if since is None else since
+                clock_note = (f"backstopped by the clock "
+                              f"{(deadline - base) * 1000:.0f} ms from the "
+                              f"ponderhit")
+            return (current + budget, deadline, budget, "ponderhit",
                     f"ponderhit: {budget} FRESH sims on the pondered tree "
-                    f"(root at {current}; go nodes {nodes}, clock not consulted "
-                    f"because the GUI asked in nodes)")
+                    f"(root at {current}; go nodes {nodes}, {clock_note})")
 
         allotted = self._allot(params)
         if allotted is None:
@@ -1173,11 +1239,65 @@ class UCIEngine:
                     f"ponderhit with no clock: up to {cfg.sim_cap} fresh sims "
                     f"on the pondered tree (root at {current})")
 
-        deadline = time.monotonic() + allotted
+        # PART 2b, again: from the ponderhit instant rather than from now.
+        base = time.monotonic() if since is None else since
+        deadline = base + allotted
         return (current + cfg.sim_cap, deadline, None, "ponderhit",
-                f"ponderhit: {allotted * 1000:.0f} ms FROM NOW, ceiling "
-                f"{cfg.sim_cap} fresh sims on the pondered tree "
+                f"ponderhit: {allotted * 1000:.0f} ms FROM THE PONDERHIT "
+                f"({(time.monotonic() - base) * 1000:.0f} ms of it already "
+                f"spent), ceiling {cfg.sim_cap} fresh sims on the pondered tree "
                 f"(root at {current}, {current} inherited from the ponder)")
+
+    def _clock_facts(self, params: GoParams, deadline: Optional[float],
+                     since: float) -> dict:
+        """What the move-stats record needs to CHECK the Part 2 invariant.
+
+        THE ACCEPTANCE IS THE INVARIANT, NOT THE EVENT. A flagged game is one in
+        eighty and no smoke run demonstrates its absence; what a smoke run can
+        do is assert `go -> bestmove <= deadline + reserve` on EVERY move and
+        report the distribution of the slack. That needs three numbers per move
+        that nothing was recording: what the clock said, where the deadline was
+        put, and what margin was reserved behind it.
+
+        `deadline_from_go_ms` is deliberately measured from `since` — the
+        `go`/`ponderhit` instant — and not from when the deadline was computed,
+        because that is the whole of Part 2b and a record measured the other way
+        would report the leak as zero.
+
+        `reserve_ms` is the engine's own `MoveOverhead`, which `_allot` has
+        already subtracted; it is recorded rather than assumed so the check and
+        the code cannot drift. THE OTHER RESERVE IS THE HOST'S and is not
+        double-counted here: lichess-bot subtracts its own `move_overhead`
+        (2,000 ms in the deployed config) from `wtime`/`btime` before the `go`
+        line is written, so `clock_before_ms` is ALREADY net of it. The measured
+        `bestmove` -> move-POSTed leg is 630 ms at the median and 706 ms at p95,
+        flat across regimes because it is network rather than tree — so the
+        host's 2,000 ms covers it 2.8x over and the engine adds 100 ms on top of
+        that rather than a second copy of the same margin.
+        """
+        white = self.board.turn == chess.WHITE
+        return {
+            "clock_before_ms": params.get("wtime" if white else "btime"),
+            "clock_inc_ms": params.get("winc" if white else "binc"),
+            "movestogo": params.get("movestogo"),
+            "deadline_from_go_ms": (None if deadline is None
+                                    else round((deadline - since) * 1000.0, 3)),
+            "reserve_ms": float(self.config.move_overhead_ms),
+        }
+
+    def _deadline_from(self, params: GoParams,
+                       since: Optional[float]) -> Optional[float]:
+        """`_allot`'s allotment as an ABSOLUTE monotonic instant, or None.
+
+        PART 2b, in one place so the two planners cannot drift. `since` is the
+        `go`/`ponderhit` instant on `time.monotonic()`'s scale; the allotment is
+        measured from THERE, so whatever was spent getting here is charged to
+        the move rather than added to it.
+        """
+        allotted = self._allot(params)
+        if allotted is None:
+            return None
+        return (time.monotonic() if since is None else since) + allotted
 
     def _allot(self, params: GoParams) -> Optional[float]:
         """Seconds to spend on this move, or None when there is no clock.
@@ -1245,7 +1365,13 @@ class UCIEngine:
     # rated game is worse than no telemetry channel, so both methods swallow and
     # disable rather than propagate.
 
-    def _ms_arm(self, go_t: Optional[float] = None) -> None:
+    def _ms_arm(self, go_t: Optional[float] = None,
+                plan: Optional[dict] = None) -> None:
+        # PART 2. `plan` is `_clock_facts`: the clock, the deadline and the
+        # reserve as the planner resolved them. Carried on the record so the
+        # invariant is checkable offline against thousands of moves rather than
+        # by waiting for a rare flag.
+        self._ms_plan = plan or {}
         if self.move_stats is None or not self.move_stats.enabled:
             # A collector that disabled itself mid-game may have left the C++
             # recorder armed. Disarm it: an armed recorder nobody drains keeps
@@ -1300,7 +1426,12 @@ class UCIEngine:
                 # where `wall_s` is sampled would change every nps constant
                 # measured against it.
                 "pv_ms": round(getattr(outcome, "pv_ms", 0.0), 3),
+                # PART 2. Whether the clock, rather than the node budget, ended
+                # the move — and whether it was the C++ mutable deadline that
+                # cut the running slice.
+                "deadline_hit": getattr(outcome, "deadline_hit", None),
                 "wall_clock_utc": _utc_now(),
+                **self._ms_plan,
             }
             position = position_stratifiers(self.board)
             cfg = {
@@ -1329,6 +1460,7 @@ class UCIEngine:
             self._ms_cancel()
         finally:
             self._ms_go_t = None
+            self._ms_plan = {}
 
     def _emit_info(self, outcome: SearchOutcome, *, final: bool = False) -> None:
         """One `info` line. Runs on the main thread with no search in flight.

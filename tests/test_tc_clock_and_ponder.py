@@ -1,4 +1,4 @@
-"""TC — clock safety and ponder semantics. Part 1.
+"""TC — clock safety and ponder semantics. Parts 1 and 2.
 
 The brief is `docs/TC/clock_and_ponder_brief.md`; the measurements it argues
 from are `docs/TC/{L0_LOGS,RECON,DEFECTS,PROBE_FRESH_ROOT}.md`.
@@ -18,6 +18,17 @@ WHAT EACH PART HAS TO PROVE HERE, AND WHAT IT CANNOT
           and lives in `telemetry/probe_fresh_root.py`. A unit test can only
           show the walk is O(plies) rather than O(tree), which it does by
           growing the tree and watching the walk not grow.
+
+  Part 2  the deadline exists on the pondered path (D-L0-7) and is armed from
+          the `go`/`ponderhit` instant rather than from whenever the planner got
+          round to running (Part 2b). Both are planner-level facts and are
+          asserted directly; the end-to-end invariant
+          `go -> bestmove <= deadline + reserve` is a property of a match and
+          lives in `telemetry/check_deadline_invariant.py`.
+
+          The `4YCsGtQ8` move-85 case is here as a planner assertion with the
+          real clock off the wire, because that is the part of it that is
+          deterministic. The replay is `telemetry/replay_lichess_game.py`.
 
 AMENDMENT D: no module-scope skip. `guofish_core` is a hard dependency of the
 suite; the Gate 1 dump and python-chess are not, so each test that needs one
@@ -432,6 +443,205 @@ def test_part1c_the_outcome_carries_pv_ms_and_wall_s_still_means_what_it_did():
     assert "time.perf_counter() - started, slices," in source
 
 
+# ---------------------------------------------------------------------------
+# Part 2 — the deadline on the pondered path
+# ---------------------------------------------------------------------------
+
+
+def _uci_for_plan(config: EngineConfig, root_visits: int = 0):
+    import chess
+    module = wrapper()
+    uci = module.UCIEngine.__new__(module.UCIEngine)
+    uci.config = config
+    uci.engine = type("_E", (), {"ready": True,
+                                 "search": type("_S", (), {"root_visits": root_visits})()})()
+    uci.board = chess.Board()
+    return uci, module
+
+
+@requires_wrapper
+def test_part2a_a_ponderhit_with_a_node_budget_now_arms_the_deadline():
+    """D-L0-7, as a regression test.
+
+    This returned `None` where the deadline goes, on the branch deployment
+    actually takes: python-chess puts `nodes` on the ponder line whenever the
+    Limit carries one, and lichess-bot's `go_commands.nodes` makes it always. So
+    the backstop `config.yml` documents was absent on 53% of moves, and absent
+    on exactly the moves where the tree is largest and the nps lowest.
+
+    BOTH BOUNDS, not one instead of the other: the node budget is unchanged and
+    is still `current + N` fresh simulations. Whichever binds first ends the
+    move, which is what `_plan` and `config.yml` already intend.
+    """
+    uci, module = _uci_for_plan(EngineConfig(), root_visits=30_000)
+    params = module.GoParams(["ponder", "wtime", "300000", "btime", "300000",
+                              "nodes", "25000"])
+    budget, deadline, nominal, source, note = uci._plan_after_ponderhit(params)
+
+    assert source == "ponderhit"
+    assert nominal == 25_000
+    assert budget - 30_000 == 25_000, "the node budget is unchanged"
+    assert deadline is not None, "D-L0-7: the pondered path had no clock"
+    assert deadline > time.monotonic(), "an already-expired deadline is not a backstop"
+    assert "clock" in note
+
+
+@requires_wrapper
+def test_part2a_a_ponderhit_with_no_clock_still_has_no_deadline():
+    """The other side of it. A `go ponder` carrying no clock is legal UCI and
+    means the GUI gave the engine nothing to time against; inventing one would
+    be worse than the defect."""
+    uci, module = _uci_for_plan(EngineConfig(), root_visits=30_000)
+    params = module.GoParams(["ponder", "nodes", "25000"])
+    _budget, deadline, _nominal, source, _note = uci._plan_after_ponderhit(params)
+    assert (source, deadline) == ("ponderhit", None)
+
+
+@requires_wrapper
+def test_part2a_a_fixed_budget_arm_still_ignores_the_clock_after_a_hit():
+    """A fixed-budget run ignores the clock everywhere else and must ignore it
+    here too, or a pondered move is the one move in the match decided on time."""
+    uci, module = _uci_for_plan(EngineConfig(fixed_sims=4_000), root_visits=9_000)
+    params = module.GoParams(["ponder", "wtime", "300000", "btime", "300000"])
+    budget, deadline, nominal, source, _note = uci._plan_after_ponderhit(params)
+    assert (source, deadline, nominal) == ("fixed", None, 4_000)
+    assert budget == 9_000 + 4_000
+
+
+@requires_wrapper
+@pytest.mark.parametrize("argv,label", [
+    (["ponder", "wtime", "300000", "btime", "300000", "nodes", "25000"], "nodes"),
+    (["ponder", "wtime", "300000", "btime", "300000"], "timed"),
+])
+def test_part2b_the_ponderhit_deadline_is_absolute_not_relative(argv, label):
+    """PART 2b, AND IT IS THE HALF THAT IS EASY TO GET WRONG.
+
+    The pre-search leg is consumed BEFORE `_plan_after_ponderhit` runs — a
+    measured median of 343 ms on the pondered path and a maximum of 5,851 ms. A
+    deadline computed as `now + allotment` does not charge that leg, so it leaks
+    straight through the guard; the allotment has to run from the `ponderhit`
+    instant.
+
+    Asserted by handing the planner a `since` two seconds in the past and
+    watching the deadline come back two seconds earlier. A relative
+    implementation is indifferent to `since` and fails this by exactly the
+    amount it leaks.
+    """
+    uci, module = _uci_for_plan(EngineConfig(), root_visits=30_000)
+    params = module.GoParams(argv)
+
+    now = time.monotonic()
+    _b, from_now, _n, _s, _note = uci._plan_after_ponderhit(params, since=now)
+    _b, from_earlier, _n, _s, _note = uci._plan_after_ponderhit(params,
+                                                               since=now - 2.0)
+    assert from_now is not None and from_earlier is not None, label
+    assert from_now - from_earlier == pytest.approx(2.0, abs=5e-3), label
+
+
+@requires_wrapper
+def test_part2b_the_ordinary_path_arms_from_the_go_line_too():
+    """Done identically in both planners rather than only where it hurts.
+
+    On this path the leg is 4 ms at the fresh-root median, so the leak is small
+    — but `set_position` REBUILDS THE TREE on a ponder miss and that is the same
+    path, so "small" is a statement about the median and not about the tail.
+    """
+    uci, module = _uci_for_plan(EngineConfig(), root_visits=0)
+    params = module.GoParams(["wtime", "300000", "btime", "300000",
+                              "nodes", "25000"])
+    now = time.monotonic()
+    _b, from_now, _n, _s, _note = uci._plan(params, since=now)
+    _b, from_earlier, _n, _s, _note = uci._plan(params, since=now - 2.0)
+    assert from_now - from_earlier == pytest.approx(2.0, abs=5e-3)
+
+
+@requires_wrapper
+def test_part2_move_85_of_4YCsGtQ8_would_have_been_cut():
+    """THE GAME, AT THE PLANNER LEVEL.
+
+    `4YCsGtQ8`, 2026-08-17, lost `outoftime` at move 85. From the wire: a
+    ponderhit with 4,283 ms on our clock and a 3,000 ms increment, which spent
+    7,164 ms searching because no deadline was armed. The two moves in the same
+    sequence where the ponder MISSED took the ordinary path, were timed, and
+    ended at `reason=time` under three seconds.
+
+    `_allot` on those numbers: 4.283/30 + 0.8x3.0 = 2.543 s, capped by the
+    40%-of-clock guard at 0.4x4.283 = 1.713 s, less the 100 ms engine reserve.
+    The bar is not the exact figure — it is that the deadline exists, is under
+    the 7.164 s the move actually took, and is inside the 40% guard the engine
+    already documents and was violating on this move.
+
+    The end-to-end version, driving the engine over pipes from the recorded
+    positions, is `telemetry/replay_lichess_game.py`.
+    """
+    uci, module = _uci_for_plan(EngineConfig(), root_visits=37_356)
+    params = module.GoParams(["ponder", "wtime", "4283", "btime", "311140",
+                              "winc", "3000", "binc", "3000", "nodes", "200000"])
+    now = time.monotonic()
+    _b, deadline, _n, source, _note = uci._plan_after_ponderhit(params, since=now)
+
+    assert source == "ponderhit"
+    assert deadline is not None
+    allotted = deadline - now
+    assert allotted < 7.164, "the move that lost the game must be cut short"
+    assert allotted <= 0.4 * 4.283, "the 40%-of-clock guard must bind"
+    assert allotted == pytest.approx(0.4 * 4.283 - 0.1, abs=1e-3)
+
+
+@requires_wrapper
+def test_part2c_the_reserve_is_the_engines_own_move_overhead_and_is_recorded():
+    """PART 2c, AND THE ANSWER IS THAT THE RESERVE IS ALREADY THERE.
+
+    The unprotected residual after Part 1 is `bestmove` -> move POSTed: 630 ms
+    median, 706 ms p95, flat across regimes because it is network rather than
+    tree. The brief asks for it to be reserved at p95 AND checked against
+    lichess-bot's own `move_overhead` so the margin is not budgeted twice.
+
+    It is budgeted twice if the engine adds 706 ms of its own:
+    `game_clock_time` subtracts `pre_move_time + move_overhead` — 2,000 ms in
+    the deployed config — from `wtime`/`btime` before the `go` line is written,
+    so `clock_before_ms` is ALREADY net of it and covers the p95 leg 2.8x over.
+    What the engine adds on top is `MoveOverhead`, 100 ms, which `_allot`
+    subtracts from every allotment on every path.
+
+    So the change here is not a new constant. It is that the reserve is now
+    RECORDED per move, so the invariant can be checked rather than assumed.
+    """
+    uci, module = _uci_for_plan(EngineConfig(move_overhead_ms=100), root_visits=0)
+    params = module.GoParams(["wtime", "60000", "btime", "60000", "movetime", "5000"])
+    assert uci._allot(params) == pytest.approx(4.9), \
+        "movetime is taken literally minus the engine's own reserve"
+
+    facts = uci._clock_facts(params, deadline=time.monotonic() + 4.9,
+                             since=time.monotonic())
+    assert facts["reserve_ms"] == 100.0
+    assert facts["clock_before_ms"] == 60_000
+    assert facts["deadline_from_go_ms"] == pytest.approx(4900.0, abs=5.0)
+
+
+@requires_wrapper
+def test_part2_the_move_stats_record_carries_what_the_invariant_needs():
+    """Thousands of samples instead of counting rare events.
+
+    The base rate of a flag is 1 in 80 games, so the acceptance is the
+    INVARIANT — `go -> bestmove <= deadline + reserve` on every move — and that
+    needs three numbers per move that nothing was recording.
+    """
+    from telemetry.move_stats import build_record
+    from playing.v6.playv6 import SearchOutcome
+
+    outcome = SearchOutcome(best_move="e2e4", mating_move=None, nominal=200_000,
+                            inherited=0, delivered=200_000, wall_s=12.0,
+                            slices=240, root_visits=200_000, score_cp=15, q=0.05)
+    record = build_record(
+        ply=1, side="w", fen="startpos", outcome=outcome, checkpoints={},
+        timings={"go_to_bestmove_ms": 12_100.0, "pv_ms": 2.1,
+                 "deadline_hit": False, "clock_before_ms": 300_000,
+                 "deadline_from_go_ms": 9_900.0, "reserve_ms": 100.0},
+        ponder={}, position={}, config={})
+    for key in ("go_to_bestmove_ms", "pv_ms", "deadline_hit", "clock_before_ms",
+                "deadline_from_go_ms", "reserve_ms"):
+        assert key in record, key
 
 
 

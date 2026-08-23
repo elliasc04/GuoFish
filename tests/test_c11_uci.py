@@ -698,6 +698,16 @@ def test_a_ponderhit_honours_the_node_budget_as_fresh_sims(root_visits):
     a node-budgeted game — applied to precisely the moves the prediction got
     right. `current + N` rather than an absolute N, because ponder simulations
     ran on the opponent's clock and are a bonus, not a draw against this move.
+
+    TC PART 2 AMENDED THE OTHER HALF OF THIS TEST. It used to assert
+    `deadline is None` here, on the reading that "the GUI asked in nodes, so the
+    clock is not the bound". That reading is D-L0-7: `lichess-bot/config.yml`
+    says BOTH bounds are active and that the clock is "the backstop that keeps a
+    pathological position from flagging the game", and the backstop was missing
+    on 53% of moves — the ones where the tree is largest and the nps lowest.
+    Game `4YCsGtQ8` move 85 spent 7.164 s of a 4.283 s clock on this exact
+    branch. The node budget is still the operative bound and is asserted
+    unchanged below; the deadline is now armed behind it.
     """
     import chess
     module = wrapper()
@@ -709,7 +719,7 @@ def test_a_ponderhit_honours_the_node_budget_as_fresh_sims(root_visits):
                               "nodes", "25000"])
     budget, deadline, nominal, source, _ = uci._plan_after_ponderhit(params)
     assert source == "ponderhit"
-    assert deadline is None, "the GUI asked in nodes; the clock is not the bound"
+    assert deadline is not None, "TC Part 2a: the clock is the backstop (D-L0-7)"
     assert budget - root_visits == 25_000
     assert nominal == 25_000
 
