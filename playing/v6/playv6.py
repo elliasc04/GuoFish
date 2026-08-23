@@ -451,6 +451,46 @@ class EngineConfig:
     ponder: bool = False
     move_overhead_ms: int = 100
 
+    # PART 3. HOW MUCH OF THE MOVE BUDGET A PONDER HIT STILL HAS TO DELIVER.
+    #
+    # `_plan_after_ponderhit` targets `max(N, current + floor x N)` root visits,
+    # so this knob interpolates between the two designs the brief names and
+    # DEFAULTS TO THE ONE THAT SHIPS TODAY:
+    #
+    #   1.0   `current + N`. Today's behaviour, exactly. A hit runs a full N
+    #         FRESH simulations on top of whatever the ponder built — measured
+    #         over 918 pondered moves, `delivered` is 200,000 at the p5, the
+    #         median AND the p95 while `inherited` runs to 2,454,476. A ponder
+    #         hit never reduces `delivered` and never saves clock (R1.2).
+    #   0.0   `max(current, N)`. The move's target is ABSOLUTE: a pondered move
+    #         delivers only what it takes to bring the root to N total visits,
+    #         and delivers zero when the ponder already got there. That is the
+    #         "play instantly when you have already thought about it" behaviour,
+    #         and it is correct — at `ponderhit` the ponder tree's root IS the
+    #         position being moved from, so its visits are directly usable.
+    #   0<f<1 the middle option: floor the delivery at a fraction of N so the
+    #         change is roughly cost-neutral, and make instant-move behaviour
+    #         opt-in later.
+    #
+    # WHY THE DEFAULT IS 1.0 AND NOT 0.0. Part 3 is the only part of this change
+    # that can lose ELO and the only one whose acceptance needs a match. Today a
+    # pondered move sits on a median 316,376-visit tree and adds 200,000 fresh;
+    # after, it gets 316k and stops. That is real search given up in exchange
+    # for clock on 53% of moves, and NOTHING IN THIS CHANGE SPENDS THE FREED
+    # CLOCK — so shipping 0.0 by itself means strictly less search per game for
+    # the same result. The three ways to resolve that (raise `SimCap` to consume
+    # the saving, floor the delivery, or accept a possible small regression as
+    # the price of a bounded tree) are an operator's call, not a default's, and
+    # the 219 ELO/doubling figure cannot price it: it is measured at the
+    # 8k->16k rung and does not survive extrapolation to 300-500k, where
+    # ANALYSIS.md §1a measures only 3.17% of argmax changes across the last
+    # quarter of the budget.
+    #
+    # Setting this below 1.0 breaks R1's `delivered == nominal iff
+    # budget_source == "ponderhit" and reason == "budget"` by design: `nominal`
+    # stays the ask and `delivered` becomes what the tree still needed.
+    ponderhit_floor: float = 1.0
+
     # PART 4b. THE CEILING ON TOTAL RESIDENT ROOT VISITS, or None for the
     # computed one. See `tree_ceiling`.
     tree_max_visits: Optional[int] = None
@@ -740,6 +780,14 @@ class EngineConfig:
                 f"{list(guofish_core.AFFINITY_POLICIES)}")
         if self.max_tree_depth < 1:
             raise ConfigError(f"max_tree_depth must be >= 1, got {self.max_tree_depth}")
+        # PART 3. A fraction of the move budget, and both ends are meaningful:
+        # 1.0 is today's additive behaviour and 0.0 is the absolute target.
+        # Outside [0, 1] it is neither, and a negative would ask a hit to
+        # deliver less than nothing on a tree that is already short.
+        if not 0.0 <= self.ponderhit_floor <= 1.0:
+            raise ConfigError(
+                f"ponderhit_floor must be in [0, 1], got {self.ponderhit_floor}. "
+                f"1.0 is 'current + N' (today); 0.0 is 'max(current, N)'.")
         # PART 4b. Pinning it below the move budget would make a fresh root
         # unable to reach its own target, which is a stranger failure than any
         # ceiling is worth.
@@ -2658,7 +2706,18 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                         "expired clock still makes progress instead of spinning")
     g.add_argument("--move-overhead-ms", type=int, default=EngineConfig.move_overhead_ms,
                    help="subtracted from every allotted move time")
-    # TC Part 4b; see EngineConfig.tree_ceiling.
+    # TC Parts 3 and 4b. Both default to the behaviour that shipped before the
+    # change; see EngineConfig.ponderhit_floor and EngineConfig.tree_ceiling.
+    g.add_argument("--ponderhit-floor", type=float,
+                   default=EngineConfig.ponderhit_floor,
+                   help="fraction of the move budget a ponder HIT must still "
+                        "deliver. 1.0 (the default) is `current + N` and is the "
+                        "behaviour that shipped: the ponder's simulations are a "
+                        "bonus and a hit never saves clock. 0.0 makes the "
+                        "target absolute — `max(current, N)` — so a hit draws "
+                        "against the move's allocation and plays instantly when "
+                        "the ponder already got there. Anything between floors "
+                        "the delivery at that fraction")
     g.add_argument("--tree-max-visits", type=int, default=None,
                    help="ceiling on TOTAL resident root visits, which is what "
                         "bounds a ponder. Omit for the computed "

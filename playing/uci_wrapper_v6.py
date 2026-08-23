@@ -265,8 +265,11 @@ OPTIONS: tuple[Option, ...] = (
     Option("MinSliceSims", "min_slice_sims", "spin", int, "min 1 max 1000000"),
     Option("MoveOverhead", "move_overhead_ms", "spin", int, "min 0 max 10000"),
 
-    # PART 4b. `TreeMaxVisits` None computes `sims_per_move + ponder_max_sims`,
-    # which is the sum the arena was always sized from and was never enforced.
+    # PART 3 and PART 4b. Both default to the behaviour that shipped before this
+    # change: `PonderhitFloor` 1.0 is `current + N`, and `TreeMaxVisits` None
+    # computes `sims_per_move + ponder_max_sims`, which is the sum the arena was
+    # always sized from and was never enforced.
+    Option("PonderhitFloor", "ponderhit_floor", "string", float),
     Option("TreeMaxVisits", "tree_max_visits", "spin", _parse_optional_int,
            "min 0 max 100000000"),
 
@@ -1162,15 +1165,15 @@ class UCIEngine:
                     # noticing `ponder_sims=0` on a verdict line nobody reads.
                     #
                     # It can only happen because the MOVE path put the tree
-                    # there, which it can while a pondered move is still
-                    # `current + N`. That is stated here because it is the pair
-                    # of bounds an operator would move.
+                    # there, which it can while `PonderhitFloor` is 1.0 and a
+                    # pondered move is still `current + N`. That is stated here
+                    # because it is the pair of knobs an operator would move.
                     err(f"[ponder] NOT PONDERING: the root already holds "
                         f"{current:,} visits, at or above the {ceiling:,}-visit "
                         f"ceiling (TreeMaxVisits, = SimCap + PonderMaxSims). "
                         f"The opponent's clock buys nothing this move because "
-                        f"the tree may not grow. Raise TreeMaxVisits, or bound "
-                        f"the MOVE's target too — which is what TC Part 3 is.")
+                        f"the tree may not grow. Raise TreeMaxVisits, or lower "
+                        f"PonderhitFloor so the MOVE stops growing it.")
             coupling = ("" if cfg.coupling_holds else
                         " WARNING: decay x ponder_max_sims exceeds sims_per_move; "
                         "a hit hands the next search a tree it cannot outvote")
@@ -1250,6 +1253,16 @@ class UCIEngine:
             # An absolute N would let a productive ponder arrive with the budget
             # already spent and return instantly with zero fresh work.
             budget = max(1, min(nodes, cfg.sim_cap))
+            # PART 3. HOW MUCH OF THAT A HIT STILL HAS TO DELIVER.
+            #
+            # `target = max(N, current + floor x N)`. At the default floor of
+            # 1.0 this is exactly `current + N` and nothing about a pondered
+            # move changes; at 0.0 it is `max(current, N)`, an ABSOLUTE target,
+            # and the ponder's visits are drawn against the move's allocation
+            # instead of being a bonus on top of it. See
+            # `EngineConfig.ponderhit_floor` for why the default is the old
+            # behaviour and what the operator is choosing between.
+            target = self._ponderhit_target(current, budget)
             # PART 2a. AND THE DEADLINE, WHICH USED TO BE `None` HERE.
             #
             # BOTH BOUNDS, exactly as the ordinary `go nodes N` branch of
@@ -1274,8 +1287,12 @@ class UCIEngine:
                 clock_note = (f"backstopped by the clock "
                               f"{(deadline - base) * 1000:.0f} ms from the "
                               f"ponderhit")
-            return (current + budget, deadline, budget, "ponderhit",
-                    f"ponderhit: {budget} FRESH sims on the pondered tree "
+            fresh = max(0, target - current)
+            how = (f"{fresh} FRESH sims" if cfg.ponderhit_floor >= 1.0 else
+                   f"{fresh} fresh sims to reach an absolute {target} "
+                   f"(floor {cfg.ponderhit_floor:g} x {budget})")
+            return (target, deadline, budget, "ponderhit",
+                    f"ponderhit: {how} on the pondered tree "
                     f"(root at {current}; go nodes {nodes}, {clock_note})")
 
         allotted = self._allot(params)
@@ -1293,11 +1310,44 @@ class UCIEngine:
         # PART 2b, again: from the ponderhit instant rather than from now.
         base = time.monotonic() if since is None else since
         deadline = base + allotted
-        return (current + cfg.sim_cap, deadline, None, "ponderhit",
+        # PART 3, on the branch where the GUI asked in time rather than nodes.
+        # The ceiling is `sim_cap` FRESH simulations either way; the floor
+        # decides whether the ponder's visits count towards it.
+        return (self._ponderhit_target(current, cfg.sim_cap), deadline, None,
+                "ponderhit",
                 f"ponderhit: {allotted * 1000:.0f} ms FROM THE PONDERHIT "
                 f"({(time.monotonic() - base) * 1000:.0f} ms of it already "
                 f"spent), ceiling {cfg.sim_cap} fresh sims on the pondered tree "
                 f"(root at {current}, {current} inherited from the ponder)")
+
+    def _ponderhit_target(self, current: int, budget: int) -> int:
+        """PART 3. The root-visit target for phase 2 of a pondered move.
+
+            target = max(budget, current + floor x budget)
+
+        ONE KNOB SPANNING BOTH DESIGNS, because which one is right is an
+        operator's decision and not a code change:
+
+          floor 1.0   `current + budget`. The behaviour that shipped. The
+                      ponder's simulations are a BONUS and a hit therefore never
+                      reduces `delivered` and never saves clock.
+          floor 0.0   `max(current, budget)`. Absolute. At `ponderhit` the
+                      ponder tree's root IS the position being moved from, so
+                      its visits are directly usable and there is no reason to
+                      pay for them twice. A hit that already reached the target
+                      plays instantly.
+          in between  the delivery is floored at a fraction of the budget, which
+                      is what makes the change roughly cost-neutral while the
+                      instant-move behaviour waits for a time manager to spend
+                      the saving.
+
+        `max(budget, ...)` and not `min` on the low side: a hit arriving on a
+        tree SHORTER than the budget must still be brought up to it. That is the
+        case a naive absolute target gets right and a naive additive one
+        over-serves.
+        """
+        floor = self.config.ponderhit_floor
+        return max(budget, current + int(floor * budget))
 
     def _clock_facts(self, params: GoParams, deadline: Optional[float],
                      since: float) -> dict:

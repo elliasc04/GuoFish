@@ -739,6 +739,70 @@ def test_part4b_the_ponder_still_extends_beyond_what_is_resident():
     assert budget > 199_000, "a ponder that delivers nothing is not a ponder"
 
 
+@requires_wrapper
+@pytest.mark.parametrize("floor,current,expected_delivered", [
+    # The default: today's behaviour, exactly, on every tree size.
+    (1.0, 0, 200_000),
+    (1.0, 316_376, 200_000),
+    (1.0, 2_454_476, 200_000),
+    # Absolute: a hit draws against the move's allocation instead of adding to
+    # it, and delivers nothing once the ponder already got there.
+    (0.0, 0, 200_000),
+    (0.0, 150_000, 50_000),
+    (0.0, 316_376, 0),
+    # Floored: cost-neutral-ish, and never zero.
+    (0.5, 316_376, 100_000),
+    (0.5, 0, 200_000),
+])
+def test_part3_the_floor_spans_both_designs(floor, current, expected_delivered):
+    """PART 3, AS ONE KNOB RATHER THAN A CODE CHANGE.
+
+    `target = max(N, current + floor x N)`. 1.0 is `current + N` and is what
+    ships today; 0.0 is `max(current, N)` and is the absolute target the brief
+    argues for; anything between floors the delivery at a fraction of N.
+
+    The choice between them is the operator's — it is the only part of this
+    change that can lose ELO and the only one whose acceptance needs a match —
+    so it is a config value with the old behaviour as its default, not a new
+    default with the old behaviour as an escape hatch.
+
+    `max(N, ...)` on the low side matters: a hit arriving on a tree SHORTER than
+    the budget must still be brought up to it. That is the (0.0, 0) row and the
+    (0.0, 150_000) row.
+    """
+    config = EngineConfig(sim_cap=200_000, ponderhit_floor=floor)
+    uci, module = _uci_for_plan(config, root_visits=current)
+    params = module.GoParams(["ponder", "wtime", "300000", "btime", "300000",
+                              "nodes", "200000"])
+    target, deadline, nominal, source, _note = uci._plan_after_ponderhit(params)
+
+    assert (source, nominal) == ("ponderhit", 200_000), \
+        "`nominal` stays the ASK; `delivered` becomes what the tree still needed"
+    assert deadline is not None, "Part 2 holds whatever Part 3 is set to"
+    assert max(0, target - current) == expected_delivered
+
+
+def test_part3_the_default_is_the_behaviour_that_ships_today():
+    """Stated as a test because it is the load-bearing claim of the delivery.
+
+    Parts 1, 2 and 4 are safety and a bounded tree and are strength-neutral by
+    construction. Part 3 is a strength change whose acceptance is a match that
+    has not been run. Shipping it inert is what keeps the first three
+    acceptable on their own evidence.
+    """
+    assert EngineConfig().ponderhit_floor == 1.0
+    assert EngineConfig().tree_max_visits is None
+
+
+def test_part3_refuses_a_floor_outside_the_unit_interval():
+    """1.0 is `current + N` and 0.0 is `max(current, N)`; outside is neither."""
+    from playing.v6.playv6 import ConfigError
+    with pytest.raises(ConfigError, match="ponderhit_floor"):
+        EngineConfig(ponderhit_floor=-0.1)
+    with pytest.raises(ConfigError, match="ponderhit_floor"):
+        EngineConfig(ponderhit_floor=1.5)
+
+
 def test_part4b_refuses_a_ceiling_under_the_move_budget():
     """A fresh root would be unable to reach its own target."""
     from playing.v6.playv6 import ConfigError
