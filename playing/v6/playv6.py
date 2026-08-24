@@ -495,6 +495,27 @@ class EngineConfig:
     # computed one. See `tree_ceiling`.
     tree_max_visits: Optional[int] = None
 
+    # TM PART 2. THE TIME MANAGER, AND IT IS OFF.
+    #
+    # False means byte-identical: `_plan` and `_plan_after_ponderhit` return
+    # exactly what they returned before, the slice loop takes exactly the budget
+    # they returned, and the only difference anywhere in the process is the
+    # `option name TimeManager type check default false` line the `uci`
+    # handshake now carries. That line is a normal capability declaration and is
+    # the one permitted difference; see `tc_manager_brief.md` Part 2.
+    #
+    # True means the manager owns the move budget WHENEVER THE GUI SENT A CLOCK.
+    # It stays subordinate to a `go nodes N`: N is honoured as an absolute cap
+    # and the manager may only ask for less, which is the rollback path — an
+    # operator who wants the old behaviour back edits `config.yml` and needs no
+    # rebuild and no restart semantics to reason about.
+    #
+    # SHADOW MODE IS NOT THIS FLAG. With the manager off and `--move-stats` on,
+    # the plan is still computed and written to the record and then ignored, so
+    # a week of ordinary rated play prices the manager at zero risk. See
+    # `UCIEngine._tm_make_plan` and `_tm_shadow`.
+    time_manager: bool = False
+
     def __post_init__(self) -> None:
         for name in ("model_path", "book_path", "syzygy_path"):
             value = getattr(self, name)
@@ -2094,6 +2115,7 @@ class Engine:
                     nominal: Optional[int] = None, budget_source: str = "nodes",
                     should_stop: Optional[Callable[[], bool]] = None,
                     on_slice: Optional[Callable[["SearchOutcome"], None]] = None,
+                    budget_hook: Optional[Callable[[int, int], Optional[int]]] = None,
                     allow_bypass: bool = True, count_decision: bool = True
                     ) -> SearchOutcome:
         """Run to `budget` root visits, in slices, honouring clock and stop flag.
@@ -2114,6 +2136,20 @@ class Engine:
         partial outcome after each slice, for `info` emission — it runs on this
         thread with no search in flight, which is the only moment Python may run
         without competing with the dispatcher for the GIL.
+
+        TM PART 1. `budget_hook(delivered, root_visits)` is called between
+        slices and MAY REVISE THE BUDGET: it returns a new absolute root-visit
+        target, or None to leave it alone. It exists for the time manager's one
+        evaluation at the smart-pruning floor — grow the target on a contested
+        position, or end the move on a decided one by returning the visit count
+        the root already holds. It runs in exactly the window `on_slice` does,
+        with no search in flight.
+
+        DEFAULT None, AND THAT IS THE IDENTITY GUARANTEE. With no hook this
+        method is the method it was: one `is not None` test per slice, which is
+        the same test `on_slice` and `should_stop` already carry, and the loop
+        below is otherwise unchanged. A hook that returns None on every call is
+        likewise a no-op — that is shadow mode.
 
         C11c ADDS TWO FLAGS AND ONE CLOCK.
 
@@ -2235,6 +2271,17 @@ class Engine:
                 elapsed = time.perf_counter() - started
                 if delivered > 0 and elapsed > 0:
                     rate = delivered / elapsed
+
+                if budget_hook is not None:
+                    # TM PART 1. Between slices, never inside one. The hook may
+                    # RAISE the target (a contested position deserves more) or
+                    # LOWER it to the root's own visit count, which ends the
+                    # move on the next pass of the loop's first test — the early
+                    # exit, expressed as a budget rather than as a second break
+                    # so there is exactly one place a search can end on nodes.
+                    revised = budget_hook(delivered, int(self.search.root_visits))
+                    if revised is not None and int(revised) != budget:
+                        budget = int(revised)
 
                 if on_slice is not None:
                     # `depth_reached` is deliberately NOT passed here. A
@@ -2718,6 +2765,15 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                         "against the move's allocation and plays instantly when "
                         "the ponder already got there. Anything between floors "
                         "the delivery at that fraction")
+    # TM Part 2. Off by default and byte-identical when off; see
+    # EngineConfig.time_manager.
+    g.add_argument("--time-manager", action="store_true",
+                   default=EngineConfig.time_manager,
+                   help="TM Part 2. Let the engine's own time manager choose "
+                        "the node budget from the clock. OFF by default, and "
+                        "off is byte-identical to the build before it. It stays "
+                        "subordinate to a `go nodes N`, which is honoured as an "
+                        "absolute cap")
     g.add_argument("--tree-max-visits", type=int, default=None,
                    help="ceiling on TOTAL resident root visits, which is what "
                         "bounds a ponder. Omit for the computed "

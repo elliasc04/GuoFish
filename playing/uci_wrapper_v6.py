@@ -100,6 +100,12 @@ from telemetry.move_stats import (  # noqa: E402
     MoveStatsCollector, build_record, position_stratifiers,
 )
 
+# TM Parts 1 and 3. Same reasoning: imported unconditionally, constructed
+# unconditionally, and CONSULTED only where the two gates below say so. The
+# module imports nothing but `math` and `dataclasses`, which is what lets the
+# offline replay run it with no engine, no model and no GPU.
+from playing.v6.time_manager import TimeManager, TMPlan  # noqa: E402
+
 
 def _utc_now() -> str:
     """UTC stamp for a move record. Ground rule 6 wants every artifact timed."""
@@ -273,6 +279,16 @@ OPTIONS: tuple[Option, ...] = (
     Option("TreeMaxVisits", "tree_max_visits", "spin", _parse_optional_int,
            "min 0 max 100000000"),
 
+    # TM PART 2. THE ONE ADDED LINE IN THE `uci` HANDSHAKE, and the brief says
+    # so explicitly: unlike `--move-stats`, where R3 kept the channel off the
+    # UCI surface because zero observable difference was required, a time
+    # manager is a capability and declaring it is what a capability declaration
+    # is for. Any test asserting on the exact handshake needs updating.
+    #
+    # `type check default false`, and false is byte-identical to the build
+    # before it. See EngineConfig.time_manager.
+    Option("TimeManager", "time_manager", "check", _parse_bool),
+
     Option("Ponder", "ponder", "check", _parse_bool),
 )
 
@@ -382,6 +398,15 @@ class UCIEngine:
         self._ms_go_t = None
         self._ms_ponder: dict = {}
         self._ms_plan: dict = {}
+        # TM PARTS 1 AND 3. CONSTRUCTED ALWAYS, CONSULTED UNDER TWO GATES.
+        #
+        # `config.time_manager` decides whether the plan CHOOSES the budget.
+        # `_tm_shadow` decides whether it is COMPUTED at all — which it is
+        # whenever anything would read it, i.e. when the manager is live or when
+        # `--move-stats` is recording. With both off nothing here runs: the
+        # object exists and is never asked a question, which is what keeps
+        # "off means byte-identical" a property of the control flow.
+        self.tm = TimeManager()
         # PART 1a. THE BRANCH TABLE IS DIAGNOSTIC AND IS OFF BY DEFAULT.
         #
         # It is one ply of a table for a human, printed to stderr, and it used
@@ -594,6 +619,11 @@ class UCIEngine:
         self._base_fen = chess.STARTING_FEN
         self._moves = []
         self.engine.new_game()
+        # TM. The nps smoother is PER GAME, because `alpha = 0.474` was measured
+        # from a lag-1 autocorrelation computed within games and never across a
+        # boundary (L0 §8). Carrying an endgame estimate into the first move of
+        # the next game is exactly where a stale one does the most damage.
+        self.tm.new_game()
         # M2. `ucinewgame` is the only game boundary a UCI engine is given, and
         # cutechess sends one per game. `begin_game` closes the previous file
         # and opens the next.
@@ -694,7 +724,12 @@ class UCIEngine:
             self.handle_go_ponder(params)
             return
 
-        budget, deadline, nominal, source, plan = self._plan(params, since=go_mono)
+        # TM. BEFORE `_plan`, because `_plan` consults it, and before the
+        # search, because the record needs it either way. Returns None when
+        # nothing would read it.
+        tm_plan = self._tm_make_plan(params)
+        budget, deadline, nominal, source, plan = self._plan(
+            params, since=go_mono, tm=tm_plan)
         err(f"[go] {plan}")
 
         self._last_info = 0.0
@@ -709,15 +744,18 @@ class UCIEngine:
                 budget_source=source,
                 should_stop=self._should_stop,
                 on_slice=self._emit_info,
+                budget_hook=self._tm_budget_hook(tm_plan, budget),
             )
         finally:
             self._searching.clear()
         ms_ended = time.perf_counter()
 
+        self._tm_observe(outcome)
         err(outcome.telemetry())
         self._emit_info(outcome, final=True)
         self._emit_bestmove(outcome)
-        self._ms_record(outcome, search_started=ms_started, search_ended=ms_ended)
+        self._ms_record(outcome, search_started=ms_started, search_ended=ms_ended,
+                        tm=tm_plan)
 
     # --- C11c: pondering ---------------------------------------------------
 
@@ -912,8 +950,9 @@ class UCIEngine:
             self._send_bestmove(f"bestmove {bypass_uci}")
             return
 
+        tm_plan = self._tm_make_plan(params)
         budget, deadline, nominal, source, plan = self._plan_after_ponderhit(
-            params, since=hit_mono)
+            params, since=hit_mono, tm=tm_plan)
         err(f"[ponderhit] {plan}")
         self._last_info = 0.0
         # M2. `hit_t` was stamped the instant the verdict was read, which is as
@@ -931,11 +970,13 @@ class UCIEngine:
                 budget_source=source,
                 should_stop=self._should_stop,
                 on_slice=self._emit_info,
+                budget_hook=self._tm_budget_hook(tm_plan, budget),
             )
         finally:
             self._searching.clear()
         ms_ended = time.perf_counter()
 
+        self._tm_observe(outcome)
         # THE TWO SIM COUNTS, KEPT APART. `delivered` on this outcome is the
         # post-hit work and nothing else; the ponder's contribution rides
         # alongside it. Merging them would make the engine look 2-3x faster than
@@ -953,6 +994,7 @@ class UCIEngine:
         self._emit_bestmove(outcome)
         self._ms_record(
             outcome, search_started=ms_started, search_ended=ms_ended,
+            tm=tm_plan,
             ponder={
                 "ponder_hit": True,
                 "ponder_sims": ponder_outcome.delivered if ponder_outcome else 0,
@@ -989,9 +1031,216 @@ class UCIEngine:
             return self._moves[-1]
         return move_label(parent, self._moves[-1])
 
-    def _plan(self, params: GoParams, *, since: Optional[float] = None
+    # --- TM Parts 1 and 3: the time manager ------------------------------
+
+    @property
+    def _tm_shadow(self) -> bool:
+        """Is anyone going to read a plan? If not, do not compute one.
+
+        TM PART 3 IS THE POINT OF THIS PROPERTY. Shadow mode is not the manager
+        being on; it is the manager being COMPUTED and IGNORED, which is what
+        makes a week of ordinary rated play into an evaluation at zero risk. It
+        needs somewhere to write, so it follows `--move-stats`.
+
+        With the manager off AND no move-stats channel — a bare pipe, a
+        benchmark, every existing test — this is False and not one line of the
+        manager executes.
+        """
+        return bool(self.config.time_manager
+                    or (self.move_stats is not None and self.move_stats.enabled))
+
+    def _tm_make_plan(self, params: GoParams) -> Optional[TMPlan]:
+        """The manager's allocation for the move about to be searched.
+
+        Pure and side-effect-free apart from reading the board. The clock comes
+        off the `go` line for OUR side — on a `ponderhit` that is the clock the
+        GUI had when it sent the `go ponder`, which is the best information
+        available and is what every engine uses; `_plan_after_ponderhit` already
+        makes the same choice for the deadline.
+
+        `ply` is `chess.Board.ply()`: half-moves since the start of a standard
+        game, which is the `p` `MOVES_LEFT.md`'s estimator is fitted in and not
+        a move number. It is correct for a `position fen` too, because
+        python-chess derives it from the fullmove counter and the side to move.
+        """
+        if not self._tm_shadow:
+            return None
+        white = self.board.turn == chess.WHITE
+        clock = params.get("wtime" if white else "btime")
+        increment = params.get("winc" if white else "binc")
+        try:
+            piece_count = chess.popcount(self.board.occupied)
+            n_legal = self.board.legal_moves.count()
+            ply = self.board.ply()
+        except Exception:                              # noqa: BLE001
+            return None
+        current = int(self.engine.search.root_visits) if self.engine.ready else 0
+        return self.tm.plan(
+            clock_ms=None if clock is None else float(clock),
+            increment_ms=increment, ply=ply, piece_count=piece_count,
+            current_root_visits=current, n_legal=n_legal,
+            node_cap=params.get("nodes"))
+
+    def _tm_nodes(self, plan: Optional[TMPlan]) -> Optional[int]:
+        """The node budget the manager CHOOSES, or None if it does not choose.
+
+        Two gates and both must pass: the switch is on, and there was a clock to
+        divide. A `go nodes N` with no clock leaves this None and the GUI's N
+        stands — which is the identity case and also the fixed-budget benchmark
+        case, and neither should acquire a time manager by accident.
+        """
+        if plan is None or not self.config.time_manager or not plan.applicable:
+            return None
+        return plan.target_nodes
+
+    def _tm_movestogo(self, plan: Optional[TMPlan]) -> Optional[float]:
+        """`_allot`'s divisor, from the SAME estimate the manager just used.
+
+        SAME GATE AS `_tm_nodes`, because this is the other half of the same
+        decision: `_allot` computes a deadline independently of the manager's
+        target, using a hard-coded `movestogo` of 30 when the GUI states none —
+        which lichess-bot never does (`go_movestogo_ms` is null on every move
+        in three parsed logs). Two allocators dividing the same clock by two
+        different numbers is not a safety problem — the deadline is still an
+        upper bound — but it IS why the deployment run measured `reason=time`
+        on 35% of middlegame moves: the manager (dividing by a fitted ~26) asks
+        for more than `_allot` (dividing by 30) permits, and the deadline
+        truncates a target the manager thought it could afford. See
+        `CLOCK_AND_PONDER.md` section 8.
+
+        RETURNS THE PLAN'S OWN `moves_left`, WHICH IS ALREADY FLOORED. This is
+        load-bearing and not a detail: `TimeManager.moves_left` returns
+        `max(FLOOR, fitted)`, and the floor is the whole reason `2mLvILE3`
+        didn't flag at ply 385 — the fitted estimator alone says 1.6 moves
+        remaining there, which would ask `_allot` to divide by 1.6 rather than
+        by 23 and hand back most of the clock in one move. Reading anything
+        other than `plan.moves_left` here — the un-floored ply-space value, a
+        recomputed one — would silently drop that protection with nothing
+        failing loudly to say so.
+
+        NOT ROUNDED. `_allot` accepts any positive number as a divisor and the
+        manager's own `base_time` used this exact float, so passing it
+        unrounded is what makes the two allocators divide by "the same number"
+        rather than by two numbers that merely agree to the nearest integer.
+
+        A GUI-STATED `movestogo` STILL WINS, at the call site: `_allot` takes
+        `params.get("movestogo") or movestogo_override or 30`, so real protocol
+        truth about a stage-based time control is never overridden by a guess —
+        this returns a guess, and a good one, but a guess.
+        """
+        if plan is None or not self.config.time_manager or not plan.applicable:
+            return None
+        return plan.moves_left
+
+    def _tm_budget_hook(self, plan: Optional[TMPlan], budget: int
+                        ) -> Optional[Callable[[int, int], Optional[int]]]:
+        """The one evaluation at the smart-pruning floor, as a slice callback.
+
+        TM PART 1's three outcomes, and it fires ONCE per move:
+
+            n_competing == 1 and leader unreachable  -> exit
+            n_competing == 1                         -> target x m(1)
+            n_competing >= 2                         -> target x m(n)
+
+        THE THIRD BRANCH IS THE BRIEF'S AND THE SECOND IS NOT. The brief says
+        "run to target" on a single uncontested competitor, but `m(1)` is 0.92
+        and not 1.0 — the brief's OWN mean-neutrality constraint cannot be met
+        with `m(1)` pinned at 1.0, because every other rung is above it. Applying
+        the multiplier on every branch is what makes `E[m] = 1.0`. See
+        `time_manager.MULTIPLIERS`.
+
+        IN SHADOW MODE THE HOOK RETURNS None ON EVERY CALL. It still reads the
+        root's children and still fills the record, so the distribution of
+        `n_competing` in deployment is measured against Arm B's before anything
+        acts on it — which is one of the four checks Part 3 exists for.
+        """
+        if plan is None:
+            return None
+        cfg = self.config
+        live = bool(cfg.time_manager and plan.applicable)
+        state = {"fired": False}
+        # THE MULTIPLIER MAY NOT SPEND WHAT THE PLANNER WAS NOT ALLOWED TO ASK
+        # FOR, and this is the guard that says so. `_plan` clamps its node
+        # budget at `SimCap`; a 1.39x applied afterwards to the UNCLAMPED target
+        # would walk straight past it, and past `TreeMaxVisits` with it —
+        # undoing TC Part 4b, whose whole content is that the resident tree is
+        # bounded. Two bounds, in the engine's own idiom:
+        #
+        #   `at_go + SimCap`   `sim_cap` FRESH simulations, which is exactly
+        #                      what `_plan`'s timed branch means by a ceiling.
+        #   `tree_ceiling`     TOTAL resident root visits (Part 4b).
+        #
+        # Never below `budget`: whatever the planner already allowed stands,
+        # including the pondered path's `current + floor x N`, which can exceed
+        # the tree ceiling while `PonderhitFloor` is above 0 and is not this
+        # hook's defect to fix.
+        at_go = int(self.engine.search.root_visits) if self.engine.ready else 0
+        ceiling = max(int(budget),
+                      min(at_go + cfg.sim_cap, cfg.tree_ceiling))
+
+        def hook(delivered: int, root_visits: int) -> Optional[int]:
+            if state["fired"] or delivered < plan.floor_at:
+                return None
+            state["fired"] = True
+            try:
+                children = self.engine.search.root_children()
+            except Exception as exc:                   # noqa: BLE001
+                # A telemetry read that can end a rated game is worse than no
+                # telemetry read. Same contract as `_ms_record`.
+                err(f"[tm] root_children failed at the floor: {exc!r}")
+                return None
+            decision = self.tm.at_floor(plan, children, delivered, root_visits,
+                                        governing_total=budget)
+            if not live:
+                return None
+            if decision.exit_now:  # noqa: SIM102 - the branches read better apart
+                # Expressed as a BUDGET and not as a break, so there is exactly
+                # one place in the slice loop where a search ends on nodes.
+                # `max(root_visits, 1)` because a target under the root's own
+                # count is a negative amount of work, which every log line that
+                # subtracts them would report as a bug.
+                err(f"[tm] exit at {delivered:,} delivered: one competitor and "
+                    f"the leader is unreachable")
+                return max(int(root_visits), 1)
+            revised = min(decision.new_target_total, ceiling)
+            if revised != decision.new_target_total:
+                err(f"[tm] the {decision.multiplier:g}x on {decision.n_competing} "
+                    f"competitors wanted {decision.new_target_total:,} root "
+                    f"visits; capped at {ceiling:,} (SimCap {cfg.sim_cap:,}, "
+                    f"tree ceiling {cfg.tree_ceiling:,})")
+            return revised
+
+        return hook
+
+    def _tm_observe(self, outcome: SearchOutcome) -> None:
+        """Fold the finished search into its bucket's nps estimate.
+
+        Deliberately AFTER the move, from `SearchOutcome` rather than from the
+        clock: `delivered / wall_s` is the same `delivered_nps` F2's per-bucket
+        medians were fitted on, so the estimator is updated in the units it was
+        seeded in. A move too short to have a rate is dropped by `observe`.
+        """
+        if not self._tm_shadow or outcome.bypassed:
+            return
+        try:
+            piece_count = chess.popcount(self.board.occupied)
+        except Exception:                              # noqa: BLE001
+            return
+        self.tm.observe(piece_count, int(outcome.delivered), float(outcome.wall_s))
+
+    def _plan(self, params: GoParams, *, since: Optional[float] = None,
+              tm: Optional[TMPlan] = None
               ) -> tuple[int, Optional[float], Optional[int], str, str]:
         """(root-visit target, deadline, requested sims, budget source, why).
+
+        TM PART 1/2. `tm` is the time manager's allocation for this move, or
+        None. It is CONSULTED and not obeyed: `_tm_nodes` returns a number only
+        when the switch is on and the GUI gave a clock to divide, and where it
+        does the number enters as if the GUI had sent `nodes` — the SAME branch,
+        the same `SimCap` clamp, the same deadline. That is deliberate. A time
+        manager that took its own path through the planner would be a second
+        budget model to keep correct; this one is the existing model with a
+        different source for one integer.
 
         PART 2b. `since` is `time.monotonic()` AS OF THE `go` LINE, and the
         deadline is measured from it rather than from now. See the clock branch
@@ -1044,7 +1293,14 @@ class UCIEngine:
         deadline: Optional[float] = None
         clock_note = "no clock"
         if not params.ponder and not params.infinite:
-            allotted = self._allot(params)
+            # TM. `tm` was computed before `nodes`/`source` are known below, but
+            # the gate `_tm_movestogo` checks — `config.time_manager` and
+            # `plan.applicable` — does not depend on either, so the override is
+            # available here regardless of which branch this move eventually
+            # takes. On a `go nodes N` with `TimeManager` on this deadline still
+            # arms (both bounds are always live) and now divides by the same
+            # `moves_left` the manager's own target used.
+            allotted = self._allot(params, movestogo_override=self._tm_movestogo(tm))
             if allotted is not None:
                 # PART 2b. ARMED AGAINST AN ABSOLUTE INSTANT, NOT A RELATIVE
                 # ONE. `since` is `time.monotonic()` as of the `go` line;
@@ -1063,6 +1319,17 @@ class UCIEngine:
                               f"line ({spent:.0f} ms of it already spent)")
 
         nodes = params.get("nodes")
+        source = "nodes"
+        # TM PART 2, ROWS 3 AND 4 OF THE SWITCH TABLE. `min` and not
+        # replacement: a `go nodes N` states the GUI's ceiling for this move and
+        # the manager is SUBORDINATE to it, so it may ask for less and never for
+        # more. That is what makes `go_commands.nodes: 200000` the rollback —
+        # put it back in `config.yml` and the manager cannot exceed today's
+        # budget no matter what it computes.
+        tm_nodes = self._tm_nodes(tm)
+        if tm_nodes is not None and not params.ponder:
+            nodes = tm_nodes if nodes is None else min(nodes, tm_nodes)
+            source = "manager"
         if nodes is not None and not params.ponder:
             # `not params.ponder` FOR THE SAME REASON THE FIXED BRANCH CARRIES
             # IT, and this is the door that is actually open in deployment.
@@ -1081,10 +1348,19 @@ class UCIEngine:
             # move; it is speculative work on the opponent's clock, and the
             # quantity that bounds it is `ponder_max_sims_resolved`.
             budget = max(1, min(nodes, cfg.sim_cap))
-            note = f"go nodes {nodes} -> budget {budget}"
+            if source == "manager":
+                note = (f"TimeManager: {tm.note} -> budget {budget}"
+                        if tm is not None else f"TimeManager -> budget {budget}")
+            else:
+                note = f"go nodes {nodes} -> budget {budget}"
             if nodes > cfg.sim_cap:
+                # WORTH SAYING OUT LOUD ON THE MANAGER'S PATH, because the
+                # offline replay measures the manager asking for more than
+                # `SimCap` on 92% of moves at the deployed 200,000 — i.e. the
+                # cap, not the clock, is what usually decides. See
+                # `docs/TC/TM_REPLAY.md` §2a.
                 err(f"[go] nodes {nodes} exceeds SimCap {cfg.sim_cap}; clamped")
-            return budget, deadline, budget, "nodes", f"{note}, {clock_note}"
+            return budget, deadline, budget, source, f"{note}, {clock_note}"
 
         if params.ponder:
             # C11c. THE PONDER CEILING IS `ponder_max_sims`, NOT `sim_cap`.
@@ -1213,7 +1489,8 @@ class UCIEngine:
                 f"no clock and no nodes: DefaultSims {cfg.default_sims} new sims")
 
     def _plan_after_ponderhit(self, params: GoParams, *,
-                              since: Optional[float] = None
+                              since: Optional[float] = None,
+                              tm: Optional[TMPlan] = None
                               ) -> tuple[int, Optional[float], Optional[int], str, str]:
         """The budget for phase 2, measured FROM THE PONDERHIT INSTANT.
 
@@ -1257,6 +1534,18 @@ class UCIEngine:
                     f"tree (root at {current}; clock ignored, FixedSims is set)")
 
         nodes = params.get("nodes")
+        # TM PART 2, on the pondered path. Same rule as `_plan`: the manager may
+        # lower the GUI's ceiling and never raise it.
+        #
+        # AND IT SUPPLIES `N`, NOT THE TARGET. What a hit has to deliver is
+        # `_ponderhit_target`'s business and is `PonderhitFloor`'s decision,
+        # which is a SEPARATE operator choice already made and already
+        # deployed at 0.4. A manager that imposed its own absolute target here
+        # would silently override it — and the brief's own rule is that the
+        # switches stay independent.
+        tm_nodes = self._tm_nodes(tm)
+        if tm_nodes is not None:
+            nodes = tm_nodes if nodes is None else min(nodes, tm_nodes)
         if nodes is not None:
             # THE GUI ASKED FOR A NODE BUDGET AND STILL MEANS IT. Without this,
             # a `go ponder ... nodes N` that HITS fell through to the clock
@@ -1296,7 +1585,12 @@ class UCIEngine:
             # 343 ms and a maximum of 5,851 ms, and every millisecond of it is
             # ALREADY SPENT when this runs. `now + allotted` would hand all of
             # it back.
-            deadline = self._deadline_from(params, since)
+            #
+            # TM. Same override as the ordinary path, from the SAME `tm` plan —
+            # `_tm_make_plan` was computed at the ponderhit instant, on this
+            # position's ply, so `moves_left` here is not stale.
+            deadline = self._deadline_from(
+                params, since, movestogo_override=self._tm_movestogo(tm))
             if deadline is None:
                 clock_note = "clock not stated"
             else:
@@ -1312,7 +1606,10 @@ class UCIEngine:
                     f"ponderhit: {how} on the pondered tree "
                     f"(root at {current}; go nodes {nodes}, {clock_note})")
 
-        allotted = self._allot(params)
+        # TM. The no-`nodes` ponderhit path: the manager did not shrink `N`
+        # above because there was none, but it still has an opinion about how
+        # many moves are left, and `_allot` should use it here too.
+        allotted = self._allot(params, movestogo_override=self._tm_movestogo(tm))
         if allotted is None:
             # A `go ponder` with no clock on it. Legal, and it means the GUI
             # gave the engine nothing to time against, so the node ceiling is
@@ -1404,26 +1701,53 @@ class UCIEngine:
         }
 
     def _deadline_from(self, params: GoParams,
-                       since: Optional[float]) -> Optional[float]:
+                       since: Optional[float], *,
+                       movestogo_override: Optional[float] = None
+                       ) -> Optional[float]:
         """`_allot`'s allotment as an ABSOLUTE monotonic instant, or None.
 
         PART 2b, in one place so the two planners cannot drift. `since` is the
         `go`/`ponderhit` instant on `time.monotonic()`'s scale; the allotment is
         measured from THERE, so whatever was spent getting here is charged to
         the move rather than added to it.
+
+        `movestogo_override` passes straight through to `_allot`; see
+        `_tm_movestogo` for what it is and why it exists.
         """
-        allotted = self._allot(params)
+        allotted = self._allot(params, movestogo_override=movestogo_override)
         if allotted is None:
             return None
         return (time.monotonic() if since is None else since) + allotted
 
-    def _allot(self, params: GoParams) -> Optional[float]:
+    def _allot(self, params: GoParams, *,
+              movestogo_override: Optional[float] = None) -> Optional[float]:
         """Seconds to spend on this move, or None when there is no clock.
 
         `movetime` is taken literally minus the move overhead. Otherwise the
         classic split: an equal share of the remaining time over `movestogo`
         (30 when the GUI does not say), plus most of the increment, capped at a
         fraction of what is left so a long think cannot flag the game.
+
+        `movestogo_override` IS THE MANAGER'S OWN `moves_left`, threaded in by
+        `_tm_movestogo` on the manager path and `None` everywhere else — a
+        TimeManager-off game passes `None` at every call site and this method
+        behaves exactly as it did before this parameter existed.
+
+        A GUI-STATED `movestogo` WINS OVER IT, because that is protocol truth
+        about an actual stage-based time control and the override is a fitted
+        guess, however good. `or` reads right-to-left in priority here: GUI
+        value, then the override, then the 30 this always fell back to.
+
+        WHY THIS MATTERS AND WHY IT IS SAFE EITHER WAY. Before this parameter,
+        `_allot` and `TimeManager.plan` divided the same clock by two different
+        numbers whenever the manager was live — 30 here, a fitted ~26 there —
+        and the deadline this method computes is what actually ends a move when
+        it binds. Measured in the first deployment run: `reason=time` on 35% of
+        middlegame moves, because `_allot`'s more conservative divisor kept
+        truncating a target the manager believed it could afford
+        (`CLOCK_AND_PONDER.md` section 8). SAFE EITHER WAY because the deadline
+        was always a valid upper bound — a mismatched divisor cost search, not
+        clock; aligning it recovers that search rather than fixing a hazard.
         """
         cfg = self.config
         overhead = cfg.move_overhead_ms / 1000.0
@@ -1437,13 +1761,18 @@ class UCIEngine:
         if remaining is None:
             return None
         increment = params.get("winc" if white else "binc") or 0
-        movestogo = params.get("movestogo") or 30
+        movestogo = params.get("movestogo") or movestogo_override or 30
 
         seconds = remaining / 1000.0
         budget = seconds / max(1, movestogo) + 0.8 * (increment / 1000.0)
         # Never commit more than 40% of what is on the clock to one move: with
         # `movestogo` absent the divisor is a guess, and this is the guard that
-        # keeps a wrong guess from being fatal.
+        # keeps a wrong guess from being fatal — INCLUDING the manager's own
+        # guess. A `movestogo_override` below 2.5 (`0.4 = 1/2.5`) would ask for
+        # more than 40% of the clock before this line, and it still cannot
+        # after it: the floor in `TimeManager.moves_left` keeps the override
+        # well above that, but the guard does not trust the caller to have
+        # gotten that right.
         budget = min(budget, 0.4 * seconds)
         return max(0.001, budget - overhead)
 
@@ -1518,7 +1847,8 @@ class UCIEngine:
             pass
 
     def _ms_record(self, outcome: SearchOutcome, *, search_started: float,
-                   search_ended: float, ponder: Optional[dict] = None) -> None:
+                   search_ended: float, ponder: Optional[dict] = None,
+                   tm: Optional[TMPlan] = None) -> None:
         if self.move_stats is None or not self.move_stats.enabled:
             return
         try:
@@ -1550,6 +1880,18 @@ class UCIEngine:
                 "deadline_hit": getattr(outcome, "deadline_hit", None),
                 "wall_clock_utc": _utc_now(),
                 **self._ms_plan,
+                # TM PART 3. THE SHADOW RECORD, and it is the highest-value
+                # thing in the brief because it costs nothing: with
+                # `TimeManager` false these eight-plus fields say what the
+                # manager WOULD have allocated on a move the engine played
+                # exactly as it does today. A week of ordinary rated play then
+                # answers four questions — would it have flagged, would it have
+                # under-spent, is the nps estimator tracking, does the
+                # multiplier fire where Arm B said it would — before anything is
+                # switched on. `tm_live` is what tells the analysis which of
+                # those a given record is evidence for.
+                **({"tm_live": bool(self.config.time_manager)} if tm else {}),
+                **(tm.record() if tm else {}),
             }
             position = position_stratifiers(self.board)
             cfg = {

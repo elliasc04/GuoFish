@@ -73,6 +73,15 @@ REM                  alone; drop this flag to turn it off everywhere else.
 REM   --switch-interval
 REM                  NOT SET. The default 0.0005 is scope 2.1's GIL mitigation
 REM                  and is what C10/C10b measured throughput against. Leave it.
+REM   --move-stats   SET HERE. CLOCK_EFFICIENCY.md Part 4: the previous
+REM                  overnight run had no checkpoint ladder, so "did a
+REM                  truncated move's argmax have settled" was unanswerable
+REM                  from the log -- only the coarser delivered/target bound
+REM                  could be reported. The channel is free when off and, per
+REM                  that doc, cheap when on (Arm B bounded its cost by the
+REM                  checkpoint cadence, not the search); TMPlan's tm_ fields
+REM                  are already computed every move and were just being
+REM                  discarded. Writes under runs\live_ms\<UTC timestamp>\.
 REM
 REM UCI OPTIONS vs FLAGS: both work, and the split matters
 REM ============================================================================
@@ -159,4 +168,5 @@ REM                      sims_per_move, which is the coupling that stops a
 REM                      pondered tree out-weighing the fresh search it feeds.
 REM ---------------------------------------------------------------------------
 
-"%PYTHON%" "%REPO%\playing\uci_wrapper_v6.py" --model "%MODEL%" --ponder
+"%PYTHON%" "%REPO%\playing\uci_wrapper_v6.py" --model "%MODEL%" --ponder ^
+    --move-stats "%REPO%\runs\live_ms" --move-stats-note "overnight live lichess run"
