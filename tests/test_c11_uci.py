@@ -596,16 +596,34 @@ def test_a_ponder_is_not_swallowed_by_a_fixed_budget(root_visits):
 
     Unreachable until `--sims` was collapsed onto `fixed_sims`, which put it
     behind the flag every fixed-budget run types.
+
+    TC PART 4b NARROWED THE SECOND HALF OF THIS TEST. It used to assert that the
+    ponder gets its FULL cap of fresh simulations on any tree; the ponder's
+    target is now `min(current + cap, tree_ceiling)`, so on a root already at or
+    above `SimCap + PonderMaxSims` it gets less, and at the top of the range it
+    gets none. That is the ceiling working rather than the defect returning:
+    D-L0-2 measured 2,454,476 resident root visits in ordinary rated play
+    against the 866,667 the arena was sized for, and the game that reached it
+    reported `arena_exhausted` and then played a move on ONE delivered
+    simulation. What this test is actually about — the FIXED branch must not
+    swallow the ponder, and a ponder below the ceiling gets everything it asked
+    for — is asserted unchanged. The starved case is loud on stderr, which is
+    the half of "pondering silently does nothing" that mattered.
     """
     config = EngineConfig(fixed_sims=4_000)
-    budget, deadline, nominal, source, _ = _plan_for(
+    budget, deadline, nominal, source, note = _plan_for(
         config, ["ponder", "wtime", "30000", "btime", "30000"], root_visits)
     assert source == "ponder", "the fixed branch swallowed the ponder"
     assert deadline is None, "a ponder has no clock"
-    assert budget - root_visits == config.ponder_max_sims_resolved, (
-        f"a ponder on a root holding {root_visits} visits must still get "
-        f"{config.ponder_max_sims_resolved} FRESH simulations, got "
-        f"{budget - root_visits}")
+
+    headroom = max(0, config.tree_ceiling - root_visits)
+    expected = min(config.ponder_max_sims_resolved, headroom)
+    assert budget - root_visits == expected, (
+        f"a ponder on a root holding {root_visits} visits against a "
+        f"{config.tree_ceiling}-visit ceiling must get {expected} FRESH "
+        f"simulations, got {budget - root_visits}")
+    if expected < config.ponder_max_sims_resolved:
+        assert "CAPPED" in note, "a clipped ponder must say so"
 
 
 @requires_wrapper
@@ -698,6 +716,16 @@ def test_a_ponderhit_honours_the_node_budget_as_fresh_sims(root_visits):
     a node-budgeted game — applied to precisely the moves the prediction got
     right. `current + N` rather than an absolute N, because ponder simulations
     ran on the opponent's clock and are a bonus, not a draw against this move.
+
+    TC PART 2 AMENDED THE OTHER HALF OF THIS TEST. It used to assert
+    `deadline is None` here, on the reading that "the GUI asked in nodes, so the
+    clock is not the bound". That reading is D-L0-7: `lichess-bot/config.yml`
+    says BOTH bounds are active and that the clock is "the backstop that keeps a
+    pathological position from flagging the game", and the backstop was missing
+    on 53% of moves — the ones where the tree is largest and the nps lowest.
+    Game `4YCsGtQ8` move 85 spent 7.164 s of a 4.283 s clock on this exact
+    branch. The node budget is still the operative bound and is asserted
+    unchanged below; the deadline is now armed behind it.
     """
     import chess
     module = wrapper()
@@ -709,7 +737,7 @@ def test_a_ponderhit_honours_the_node_budget_as_fresh_sims(root_visits):
                               "nodes", "25000"])
     budget, deadline, nominal, source, _ = uci._plan_after_ponderhit(params)
     assert source == "ponderhit"
-    assert deadline is None, "the GUI asked in nodes; the clock is not the bound"
+    assert deadline is not None, "TC Part 2a: the clock is the backstop (D-L0-7)"
     assert budget - root_visits == 25_000
     assert nominal == 25_000
 

@@ -451,6 +451,71 @@ class EngineConfig:
     ponder: bool = False
     move_overhead_ms: int = 100
 
+    # PART 3. HOW MUCH OF THE MOVE BUDGET A PONDER HIT STILL HAS TO DELIVER.
+    #
+    # `_plan_after_ponderhit` targets `max(N, current + floor x N)` root visits,
+    # so this knob interpolates between the two designs the brief names and
+    # DEFAULTS TO THE ONE THAT SHIPS TODAY:
+    #
+    #   1.0   `current + N`. Today's behaviour, exactly. A hit runs a full N
+    #         FRESH simulations on top of whatever the ponder built — measured
+    #         over 918 pondered moves, `delivered` is 200,000 at the p5, the
+    #         median AND the p95 while `inherited` runs to 2,454,476. A ponder
+    #         hit never reduces `delivered` and never saves clock (R1.2).
+    #   0.0   `max(current, N)`. The move's target is ABSOLUTE: a pondered move
+    #         delivers only what it takes to bring the root to N total visits,
+    #         and delivers zero when the ponder already got there. That is the
+    #         "play instantly when you have already thought about it" behaviour,
+    #         and it is correct — at `ponderhit` the ponder tree's root IS the
+    #         position being moved from, so its visits are directly usable.
+    #   0<f<1 the middle option: floor the delivery at a fraction of N so the
+    #         change is roughly cost-neutral, and make instant-move behaviour
+    #         opt-in later.
+    #
+    # WHY THE DEFAULT IS 1.0 AND NOT 0.0. Part 3 is the only part of this change
+    # that can lose ELO and the only one whose acceptance needs a match. Today a
+    # pondered move sits on a median 316,376-visit tree and adds 200,000 fresh;
+    # after, it gets 316k and stops. That is real search given up in exchange
+    # for clock on 53% of moves, and NOTHING IN THIS CHANGE SPENDS THE FREED
+    # CLOCK — so shipping 0.0 by itself means strictly less search per game for
+    # the same result. The three ways to resolve that (raise `SimCap` to consume
+    # the saving, floor the delivery, or accept a possible small regression as
+    # the price of a bounded tree) are an operator's call, not a default's, and
+    # the 219 ELO/doubling figure cannot price it: it is measured at the
+    # 8k->16k rung and does not survive extrapolation to 300-500k, where
+    # ANALYSIS.md §1a measures only 3.17% of argmax changes across the last
+    # quarter of the budget.
+    #
+    # Setting this below 1.0 breaks R1's `delivered == nominal iff
+    # budget_source == "ponderhit" and reason == "budget"` by design: `nominal`
+    # stays the ask and `delivered` becomes what the tree still needed.
+    ponderhit_floor: float = 1.0
+
+    # PART 4b. THE CEILING ON TOTAL RESIDENT ROOT VISITS, or None for the
+    # computed one. See `tree_ceiling`.
+    tree_max_visits: Optional[int] = None
+
+    # TM PART 2. THE TIME MANAGER, AND IT IS OFF.
+    #
+    # False means byte-identical: `_plan` and `_plan_after_ponderhit` return
+    # exactly what they returned before, the slice loop takes exactly the budget
+    # they returned, and the only difference anywhere in the process is the
+    # `option name TimeManager type check default false` line the `uci`
+    # handshake now carries. That line is a normal capability declaration and is
+    # the one permitted difference; see `tc_manager_brief.md` Part 2.
+    #
+    # True means the manager owns the move budget WHENEVER THE GUI SENT A CLOCK.
+    # It stays subordinate to a `go nodes N`: N is honoured as an absolute cap
+    # and the manager may only ask for less, which is the rollback path — an
+    # operator who wants the old behaviour back edits `config.yml` and needs no
+    # rebuild and no restart semantics to reason about.
+    #
+    # SHADOW MODE IS NOT THIS FLAG. With the manager off and `--move-stats` on,
+    # the plan is still computed and written to the record and then ignored, so
+    # a week of ordinary rated play prices the manager at zero risk. See
+    # `UCIEngine._tm_make_plan` and `_tm_shadow`.
+    time_manager: bool = False
+
     def __post_init__(self) -> None:
         for name in ("model_path", "book_path", "syzygy_path"):
             value = getattr(self, name)
@@ -541,6 +606,38 @@ class EngineConfig:
         if self.ponder_max_sims is not None:
             return self.ponder_max_sims
         return max(1, int(math.ceil(self.sims_per_move / self.ponder_decay)))
+
+    @property
+    def tree_ceiling(self) -> int:
+        """PART 4b. The most root visits the resident tree may be driven to.
+
+            tree_ceiling = sims_per_move + ponder_max_sims_resolved
+
+        THE SAME SUM THE ARENA IS ALREADY SIZED FROM, and that is the whole
+        argument for it: `arena_nodes` is `60 x (sims_per_move +
+        ponder_max_sims)` because one move plus one ponder is what the engine
+        believed a tree could reach. It was not true. `_plan`'s ponder branch
+        targets `current + cap` with no ceiling at all, so across consecutive
+        ponder hits the resident tree grows without bound and reached 2,454,476
+        root visits in ordinary rated play — 6x the sum the arena was sized for,
+        which is how a game came to report `arena_exhausted` and then play a
+        move on ONE delivered simulation (D-L0-2).
+
+        ADDITIVE WITH A CEILING, NOT PURELY ABSOLUTE. A purely absolute ponder
+        target would deliver zero whenever the previous move already reached it,
+        and then the engine does not think on the opponent's clock at all — which
+        is free time and the one budget nothing is competing for. The ponder
+        still extends beyond what is resident; it just stops somewhere.
+
+        WHY NOT SIZE IT FROM THE ARENA. R2 measures 78 B/node, which says 10 GB
+        would permit a ceiling near 2.1M. That is the wrong conclusion: the
+        binding constraint is that BOTH per-move legs scale with the tree the
+        ponder builds, at ~2 us per root visit. Raising the ceiling buys a
+        slower move, not a safer one.
+        """
+        if self.tree_max_visits is not None:
+            return self.tree_max_visits
+        return self.sims_per_move + self.ponder_max_sims_resolved
 
     @property
     def coupling_holds(self) -> bool:
@@ -704,6 +801,22 @@ class EngineConfig:
                 f"{list(guofish_core.AFFINITY_POLICIES)}")
         if self.max_tree_depth < 1:
             raise ConfigError(f"max_tree_depth must be >= 1, got {self.max_tree_depth}")
+        # PART 3. A fraction of the move budget, and both ends are meaningful:
+        # 1.0 is today's additive behaviour and 0.0 is the absolute target.
+        # Outside [0, 1] it is neither, and a negative would ask a hit to
+        # deliver less than nothing on a tree that is already short.
+        if not 0.0 <= self.ponderhit_floor <= 1.0:
+            raise ConfigError(
+                f"ponderhit_floor must be in [0, 1], got {self.ponderhit_floor}. "
+                f"1.0 is 'current + N' (today); 0.0 is 'max(current, N)'.")
+        # PART 4b. Pinning it below the move budget would make a fresh root
+        # unable to reach its own target, which is a stranger failure than any
+        # ceiling is worth.
+        if self.tree_max_visits is not None and self.tree_max_visits < self.sims_per_move:
+            raise ConfigError(
+                f"tree_max_visits ({self.tree_max_visits}) is below the move "
+                f"budget ({self.sims_per_move}); the ceiling would bind on a "
+                f"fresh root before the move's own budget did.")
         if self.cache_entries < 0:
             raise ConfigError(f"cache_entries must be >= 0, got {self.cache_entries}")
         # C11c. `None` is "compute it" and is the default; a pinned value is
@@ -1055,6 +1168,19 @@ class SearchOutcome:
     # ended the last slice. On a ponderhit-converted search this is the normal
     # ending and its absence is the interesting case.
     deadline_hit: bool = False
+
+    # PART 1c. THE PV WALK, TIMED, AND WHY IT IS A FIELD OF ITS OWN.
+    #
+    # D-L0-4 lists two fixes for "`wall_s` excludes the PV walk": move where
+    # `wall_s` is sampled, or make the excluded work small. The first changes
+    # reported nps and invalidates every constant measured against it, so the
+    # second is the one taken — and the number is still wanted, so it is
+    # reported here instead of being folded into `wall_s`.
+    #
+    # It covers `_principal_variation` alone: the argmax descent plus
+    # `max_visited_depth`. It is zero on the per-slice outcomes, which carry no
+    # PV, and on a bypassed move, where there is no tree to walk.
+    pv_ms: float = 0.0
 
     @property
     def search_sims(self) -> int:
@@ -1989,6 +2115,7 @@ class Engine:
                     nominal: Optional[int] = None, budget_source: str = "nodes",
                     should_stop: Optional[Callable[[], bool]] = None,
                     on_slice: Optional[Callable[["SearchOutcome"], None]] = None,
+                    budget_hook: Optional[Callable[[int, int], Optional[int]]] = None,
                     allow_bypass: bool = True, count_decision: bool = True
                     ) -> SearchOutcome:
         """Run to `budget` root visits, in slices, honouring clock and stop flag.
@@ -2009,6 +2136,20 @@ class Engine:
         partial outcome after each slice, for `info` emission — it runs on this
         thread with no search in flight, which is the only moment Python may run
         without competing with the dispatcher for the GIL.
+
+        TM PART 1. `budget_hook(delivered, root_visits)` is called between
+        slices and MAY REVISE THE BUDGET: it returns a new absolute root-visit
+        target, or None to leave it alone. It exists for the time manager's one
+        evaluation at the smart-pruning floor — grow the target on a contested
+        position, or end the move on a decided one by returning the visit count
+        the root already holds. It runs in exactly the window `on_slice` does,
+        with no search in flight.
+
+        DEFAULT None, AND THAT IS THE IDENTITY GUARANTEE. With no hook this
+        method is the method it was: one `is not None` test per slice, which is
+        the same test `on_slice` and `should_stop` already carry, and the loop
+        below is otherwise unchanged. A hook that returns None on every call is
+        likewise a no-op — that is shadow mode.
 
         C11c ADDS TWO FLAGS AND ONE CLOCK.
 
@@ -2067,6 +2208,11 @@ class Engine:
         exhausted = False
         exhausted_at = 0
         deadline_hit = False
+        # PART 1b. `seldepth`, accumulated across the move's slices. `max` and
+        # not a sum, because it is a maximum: `search_parallel` resets its own
+        # stats every call, so a move that did not fold them would report the
+        # last slice's depth as if it were the move's.
+        depth_reached = 0
         started = time.perf_counter()
         # Seeded from the shipping configuration's measured rate so the first
         # slice is already about the right size; every slice after it uses this
@@ -2105,7 +2251,13 @@ class Engine:
                     chunk = max(cfg.min_slice_sims, min(chunk, affordable))
                 target = min(budget, current + chunk)
 
-                self.search.search_parallel(target, parallel)
+                # PART 1b. `search_parallel`'s return value is the search's own
+                # SearchStats and carries `max_depth` — the deepest ply THIS
+                # move's simulations selected to. It was already being built and
+                # discarded; taking the running maximum of it is what lets
+                # `seldepth` be reported without a walk over the whole tree.
+                slice_stats = self.search.search_parallel(target, parallel)
+                depth_reached = max(depth_reached, int(slice_stats["max_depth"]))
                 par = self.search.parallel_stats()
                 evals = self.search.eval_stats()
                 delivered += int(par["delivered"])
@@ -2120,7 +2272,23 @@ class Engine:
                 if delivered > 0 and elapsed > 0:
                     rate = delivered / elapsed
 
+                if budget_hook is not None:
+                    # TM PART 1. Between slices, never inside one. The hook may
+                    # RAISE the target (a contested position deserves more) or
+                    # LOWER it to the root's own visit count, which ends the
+                    # move on the next pass of the loop's first test — the early
+                    # exit, expressed as a budget rather than as a second break
+                    # so there is exactly one place a search can end on nodes.
+                    revised = budget_hook(delivered, int(self.search.root_visits))
+                    if revised is not None and int(revised) != budget:
+                        budget = int(revised)
+
                 if on_slice is not None:
+                    # `depth_reached` is deliberately NOT passed here. A
+                    # per-slice `info` line has reported `seldepth 1` since C11
+                    # — it carries no PV and no depth — and reporting a real one
+                    # only on the lines that never had it would be an output
+                    # change dressed as a performance fix.
                     on_slice(self._outcome(nominal, budget_source, inherited,
                                            delivered, elapsed, slices, eval_rows,
                                            eval_batches, stopped=False,
@@ -2172,7 +2340,8 @@ class Engine:
                              eval_rows, eval_batches,
                              stopped=stopped, reason=reason, with_pv=True,
                              exhausted=exhausted, exhausted_at=exhausted_at,
-                             deadline_hit=deadline_hit)
+                             deadline_hit=deadline_hit,
+                             depth_reached=depth_reached)
 
     # --- reporting internals ---------------------------------------------
 
@@ -2219,15 +2388,22 @@ class Engine:
                  eval_rows: int, eval_batches: int, *,
                  stopped: bool, reason: str, with_pv: bool,
                  exhausted: bool = False, exhausted_at: int = 0,
-                 deadline_hit: bool = False) -> SearchOutcome:
+                 deadline_hit: bool = False,
+                 depth_reached: int = 0) -> SearchOutcome:
         best = self.search.best_move
         mating = self.search.mating_move
         cache = self.search.cache_stats()
         root_visits = int(self.search.root_visits)
 
         q, pv, depth, max_depth = 0.0, [], 0, 0
+        pv_ms = 0.0
         if with_pv:
-            q, pv, depth, max_depth = self._principal_variation(best)
+            # PART 1c. Timed here rather than inside the walk, so the figure
+            # covers exactly what the clock is charged for and nothing else.
+            pv_started = time.perf_counter()
+            q, pv, depth = self._principal_variation(best)
+            max_depth = depth_reached
+            pv_ms = (time.perf_counter() - pv_started) * 1000.0
         else:
             # O(1) stand-in for the per-slice `info` line: the root's own Q,
             # negated because a node's value_sum reads from the perspective of
@@ -2269,6 +2445,7 @@ class Engine:
             arena_high_water=int(self.search.arena_high_water),
             arena_capacity=int(self.search.arena_capacity),
             deadline_hit=deadline_hit,
+            pv_ms=pv_ms,
         )
 
     def root_branches(self, top_n: Optional[int] = None
@@ -2296,77 +2473,84 @@ class Engine:
         two-reply position look like it had spent 3% of its effort somewhere
         invisible.
 
-        Reads `dump_tree_arrays(1)` — the VISITED subtree, one node per
-        simulation rather than the ~30 per expansion the arena holds — and takes
-        the depth-1 rows, which are exactly the root's children. Unvisited
-        children are absent by construction, which is correct: a reply with no
-        visits is not a branch the ponder built.
+        PART 1a. Reads `search.root_children()` — the root's child slots and
+        nothing below them. It used to read `dump_tree_arrays(1)`, the WHOLE
+        visited subtree, and keep the depth-1 rows: eight NumPy arrays over
+        every visited node and then a Python scan across all of them, to answer
+        a question about one ply. On the deployed pondered tree that is up to
+        2.4M rows for ~35 answers, and it is charged to the game clock.
+
+        The rows are the same rows. Unvisited children are absent by
+        construction on both sides, which is correct: a reply with no visits is
+        not a branch the ponder built. The sort is stable and the C++ walk
+        returns child-slot order, which is the order `dump_tree` emitted them
+        in, so equal-visit replies come out in the order they always did.
         """
         if self.search is None:
             return []
-        arrays = self.search.dump_tree_arrays(1)
-        depth = arrays["depth"]
-        if depth.size == 0:
-            return []
-        visits, packed = arrays["visits"], arrays["move"]
-        rows = [(int(visits[i]), int(packed[i]))
-                for i in range(int(depth.size)) if int(depth[i]) == 1]
+        rows = [(visits, uci) for uci, visits in self.search.root_children()]
         if not rows:
             return []
         rows.sort(key=lambda row: row[0], reverse=True)
         total = sum(count for count, _ in rows) or 1
-        return [(guofish_core.move_to_uci(move), count, count / total)
-                for count, move in (rows if top_n is None else rows[:top_n])]
+        return [(uci, count, count / total)
+                for count, uci in (rows if top_n is None else rows[:top_n])]
 
     def _principal_variation(self, best: Optional[str], max_plies: int = 12
-                             ) -> tuple[float, list[str], int, int]:
-        """(best child Q, PV, PV length, deepest visited ply).
+                             ) -> tuple[float, list[str], int]:
+        """(best child Q, PV, PV length). O(plies x branching), and that is all.
 
-        Walks `dump_tree_arrays(1)` — the VISITED subtree, which is ~1 node per
-        simulation rather than the ~30 per expansion the whole arena holds, so a
-        20,000-sim tree dumps ~20,000 rows and not ~600,000. The dump is DFS
-        preorder with a depth column, so a child of the node at index i is the
-        next entry with depth == depth[i] + 1 before the first entry with
-        depth <= depth[i]; the walk follows the most-visited child at each step,
-        which is what the reference's PV does.
+        PART 1b. This used to read `dump_tree_arrays(1)` — the whole visited
+        subtree, materialised as eight NumPy arrays — and then scan it in Python
+        to find twelve nodes. The scan is the expensive half: the inner loop
+        walks every row between a node and its next sibling, so a 316,000-visit
+        pondered tree costs a few hundred thousand Python-level integer
+        conversions for a twelve-ply answer. Measured on the wire at 424 ms
+        median and 3,899 ms max, and INVISIBLE TO THE ENGINE: `wall_s` is
+        sampled before this runs, so every millisecond of it was charged to the
+        clock and excluded from the reported nps (D-L0-4).
 
-        `dump_tree_arrays` rather than `dump_tree` because the array form carries
-        the depth column and the tuple form does not, and because it is one
-        traversal: the packed moves are turned into UCI one at a time, for the
-        dozen nodes the PV actually visits.
+        `search.principal_variation` is the same descent — most-visited child at
+        each step, first strict maximum in child-slot order, the same tie-break
+        — over the arena's child slots.
+
+        `seldepth` LEFT THIS FUNCTION, and that is the second half of Part 1b
+        rather than a tidy-up. It was `dump_tree_arrays(1)["depth"].max()`, a
+        property of the whole tree, and the exact C++ equivalent
+        (`Search::max_visited_depth`) still costs a traversal of every child
+        slot of every visited node — MEASURED at 48 ms median on a 200,000-visit
+        fresh root, which was the ENTIRE remaining gap after the rest of Part 1
+        landed, and which grows with the tree exactly as the leg it replaced
+        did. Part 1's goal is to remove the variance, not to halve it. It now
+        comes from `SearchStats::max_depth` folded across the move's slices —
+        the deepest ply this move's simulations selected to, which is what UCI's
+        `seldepth` means and which the search was already computing and
+        discarding.
+
+        THAT IS A REPORTED-OUTPUT CHANGE AND IT IS NAMED. On a fresh root the
+        two are IDENTICAL — asserted over the pinned corpus in
+        tests/test_tc_clock_and_ponder.py — because every visited node was put
+        there by this search. They differ on an INHERITED tree, where the old
+        figure included plies reached by previous searches that this one did not
+        re-descend. The new one is the narrower and more literal reading of the
+        protocol's word, and `Search::max_visited_depth()` stays bound and
+        tested for anyone who wants the tree's own depth.
+
+        WHERE `wall_s` IS SAMPLED IS UNCHANGED (Part 1c). Moving it is the other
+        listed fix for D-L0-4 and is the wrong one: it would change reported nps
+        and invalidate every constant measured against it. Making the excluded
+        work immaterial reaches the same end from the other side.
         """
-        arrays = self.search.dump_tree_arrays(1)
-        depth = arrays["depth"]
-        if depth.size == 0:
-            return 0.0, [], 0, 0
+        steps = self.search.principal_variation(max_plies)
 
-        visits = arrays["visits"]
-        value_sum = arrays["value_sum"]
-        packed = arrays["move"]
-        max_depth = int(depth.max())
-
-        pv: list[str] = []
+        pv: list[str] = [uci for uci, _visits, _value_sum in steps]
         q = 0.0
-        i = 0
-        while len(pv) < max_plies:
-            here = int(depth[i])
-            best_index = -1
-            best_visits = 0
-            j = i + 1
-            while j < depth.size and int(depth[j]) > here:
-                if int(depth[j]) == here + 1 and int(visits[j]) > best_visits:
-                    best_visits, best_index = int(visits[j]), j
-                j += 1
-            if best_index < 0:
-                break
-            if not pv:
-                # The engine's own move: its value_sum is already in the
-                # engine's perspective (the backup negates on the way up), so it
-                # is used as-is. Same convention as the reference's
-                # last_best_child_q.
-                q = float(value_sum[best_index]) / max(1, best_visits)
-            pv.append(guofish_core.move_to_uci(int(packed[best_index])))
-            i = best_index
+        if steps:
+            # The engine's own move: its value_sum is already in the engine's
+            # perspective (the backup negates on the way up), so it is used
+            # as-is. Same convention as the reference's last_best_child_q.
+            _uci, visits, value_sum = steps[0]
+            q = float(value_sum) / max(1, int(visits))
 
         # `best_move` is the core's answer and the one that gets played; if the
         # PV walk disagrees the PV is wrong, not the move, so say so rather than
@@ -2377,7 +2561,7 @@ class Engine:
             pv = [best]
         if best is not None and not pv:
             pv = [best]
-        return q, pv, len(pv), max_depth
+        return q, pv, len(pv)
 
 
 # Which fields force a rebuild of the C++ search object when they change.
@@ -2569,6 +2753,33 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> None:
                         "expired clock still makes progress instead of spinning")
     g.add_argument("--move-overhead-ms", type=int, default=EngineConfig.move_overhead_ms,
                    help="subtracted from every allotted move time")
+    # TC Parts 3 and 4b. Both default to the behaviour that shipped before the
+    # change; see EngineConfig.ponderhit_floor and EngineConfig.tree_ceiling.
+    g.add_argument("--ponderhit-floor", type=float,
+                   default=EngineConfig.ponderhit_floor,
+                   help="fraction of the move budget a ponder HIT must still "
+                        "deliver. 1.0 (the default) is `current + N` and is the "
+                        "behaviour that shipped: the ponder's simulations are a "
+                        "bonus and a hit never saves clock. 0.0 makes the "
+                        "target absolute — `max(current, N)` — so a hit draws "
+                        "against the move's allocation and plays instantly when "
+                        "the ponder already got there. Anything between floors "
+                        "the delivery at that fraction")
+    # TM Part 2. Off by default and byte-identical when off; see
+    # EngineConfig.time_manager.
+    g.add_argument("--time-manager", action="store_true",
+                   default=EngineConfig.time_manager,
+                   help="TM Part 2. Let the engine's own time manager choose "
+                        "the node budget from the clock. OFF by default, and "
+                        "off is byte-identical to the build before it. It stays "
+                        "subordinate to a `go nodes N`, which is honoured as an "
+                        "absolute cap")
+    g.add_argument("--tree-max-visits", type=int, default=None,
+                   help="ceiling on TOTAL resident root visits, which is what "
+                        "bounds a ponder. Omit for the computed "
+                        "sims_per_move + ponder_max_sims — the same sum the "
+                        "arena has always been sized from and which nothing was "
+                        "enforcing")
 
     g = parser.add_argument_group("opening book / Syzygy (C11b; both default ON)")
     g.add_argument("--no-book", dest="use_book", action="store_false", default=True,

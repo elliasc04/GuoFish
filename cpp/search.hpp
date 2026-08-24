@@ -1091,6 +1091,20 @@ struct TreeRecord {
     float terminal_value;
 };
 
+// One ply of the principal variation: the argmax-visits descent from the root.
+//
+// PART 1b. The PV used to be walked off `dump_tree(1)` — the WHOLE visited
+// subtree, materialised as eight NumPy arrays and then scanned in Python — to
+// answer a question about twelve nodes. On a pondered tree of 2.4M visits that
+// cost a measured 424 ms at the median and 3,899 ms at the maximum, and it is
+// charged to the move's clock because `wall_s` is sampled before it runs. The
+// descent itself is O(plies x branching) and is what this record carries.
+struct PvStep {
+    std::uint16_t move;        // packed, normalised
+    std::int32_t visits;
+    double value_sum;
+};
+
 // One terminal node, as the invariants test and the promotion probes read it.
 struct TerminalNode {
     std::string path;     // normalised UCI moves from the root
@@ -2103,6 +2117,108 @@ public:
             stack.emplace_back(child, 0);
         }
         return out;
+    }
+
+    // PART 1b. The argmax-visits descent from the root, at most `max_plies`
+    // deep. O(plies x branching), against dump_tree(1)'s O(tree).
+    //
+    // IDENTICAL TO THE WALK IT REPLACES, and that is the acceptance bar rather
+    // than a hope. `dump_tree(1)` emits a node's children in child-slot order
+    // and prunes at the first unvisited one, and the Python walk took the first
+    // strict maximum over the depth+1 rows between a node and its next sibling
+    // — which is that same run, in that same order. Iterating the child slots
+    // with a strict `>` and a zero floor reproduces both the choice and the
+    // tie-break, and `tests/test_tc_part1.py` asserts the two agree node for
+    // node over the pinned corpus rather than taking the argument on trust.
+    std::vector<PvStep> principal_variation(int max_plies) const {
+        require_position();
+        std::vector<PvStep> out;
+        if (max_plies <= 0) {
+            return out;
+        }
+        std::uint32_t node = root_;
+        while (static_cast<int>(out.size()) < max_plies) {
+            const std::uint16_t count = arena_.children_count(node);
+            std::uint32_t best = kNoNode;
+            std::int32_t best_visits = 0;
+            for (std::uint16_t k = 0; k < count; ++k) {
+                const std::uint32_t child = arena_.child(node, k);
+                const std::int32_t visits = arena_.visit_count(child);
+                // A zero-visit child is absent from dump_tree(1) entirely, so
+                // the floor at 0 is the pruning rule and not a guard.
+                if (visits > best_visits) {
+                    best_visits = visits;
+                    best = child;
+                }
+            }
+            if (best == kNoNode) {
+                break;
+            }
+            out.push_back(PvStep{arena_.move(best), best_visits,
+                                 static_cast<double>(arena_.value_sum(best))});
+            node = best;
+        }
+        return out;
+    }
+
+    // PART 1a. The root's children, and nothing below them.
+    //
+    // The branch table is one ply deep and was reading the whole subtree to get
+    // there. The root's children are a contiguous run of arena slots; this
+    // reads them and stops. Unvisited children are dropped, which is
+    // `dump_tree(1)`'s own filter and is what makes this substitutable.
+    std::vector<std::pair<std::uint16_t, std::int32_t>> root_children() const {
+        require_position();
+        std::vector<std::pair<std::uint16_t, std::int32_t>> out;
+        const std::uint16_t count = arena_.children_count(root_);
+        out.reserve(count);
+        for (std::uint16_t k = 0; k < count; ++k) {
+            const std::uint32_t child = arena_.child(root_, k);
+            const std::int32_t visits = arena_.visit_count(child);
+            if (visits < 1) {
+                continue;
+            }
+            out.emplace_back(arena_.move(child), visits);
+        }
+        return out;
+    }
+
+    // PART 1b. `seldepth`: the deepest VISITED ply below the root.
+    //
+    // This is the one quantity the old PV walk took that is genuinely a
+    // property of the whole tree, so it stays a full traversal — but a C++ one
+    // over the arena rather than a Python `depth.max()` over eight freshly
+    // allocated NumPy arrays. Same nodes, same pruning as dump_tree(1), no
+    // record materialised per node.
+    //
+    // It is kept exact rather than re-derived from `SearchStats::max_depth`
+    // because that counter is the depth THIS search's simulations reached,
+    // which on an inherited tree is not the depth of the tree, and swapping one
+    // for the other would silently change a reported field.
+    std::uint16_t max_visited_depth() const {
+        require_position();
+        std::uint16_t deepest = 0;
+        std::vector<std::pair<std::uint32_t, std::uint16_t>> stack;
+        stack.emplace_back(root_, 0);
+        while (!stack.empty()) {
+            auto &frame = stack.back();
+            const std::uint16_t count = arena_.children_count(frame.first);
+            if (frame.second >= count) {
+                stack.pop_back();
+                continue;
+            }
+            const std::uint32_t child = arena_.child(frame.first, frame.second);
+            ++frame.second;
+            if (arena_.visit_count(child) < 1) {
+                continue;
+            }
+            const std::uint16_t depth = static_cast<std::uint16_t>(stack.size());
+            if (depth > deepest) {
+                deepest = depth;
+            }
+            stack.emplace_back(child, 0);
+        }
+        return deepest;
     }
 
     // Every node carrying the terminal bit, with the FEN it stands for.
