@@ -30,6 +30,8 @@ The command surface is deliberately identical, so muscle memory carries over:
   * `undo` / `back`, `new` / `restart`, `quit` / `exit`, and a play-again prompt
   * `--stats` for the root search distribution and the principal variation, or
     `--pv` for the principal variation alone
+  * `--alternate N` for the top N replies with a score and a LINE each — new
+    here, and described under point 4 below
 
 WHAT IS DIFFERENT, AND WHY
 ==========================
@@ -104,6 +106,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import chess          # noqa: E402
 import chess.pgn      # noqa: E402
+import numpy as np    # noqa: E402
 
 import guofish_core   # noqa: E402
 
@@ -121,6 +124,7 @@ from playing.v6.playv6 import (  # noqa: E402
     format_root_branches,
     move_label,
     preimport_torch,
+    q_to_centipawns,
 )
 
 # M2. The move-stats collector, so `--stats` and `--move-stats` are two
@@ -317,14 +321,86 @@ def format_engine_stats(outcome: SearchOutcome, white_to_move: bool) -> str:
     return " | ".join(parts)
 
 
-def root_distribution(engine: Engine, board: chess.Board) -> list[dict]:
-    """The root's children: visits, prior and backed-up Q, most-visited first.
+def visited_tree(engine: Engine):
+    """`dump_tree_arrays(1)`, taken ONCE per move and shared by every reader.
+
+    THE DUMP IS THE EXPENSIVE PART AND THERE IS EXACTLY ONE OF IT. `--stats` and
+    `--alternate` are independent flags that both describe the root's children,
+    and each calling `dump_tree_arrays` for itself would materialise eight NumPy
+    arrays over the whole visited subtree twice for one move. `engine_move`
+    takes it when either flag is on and hands the same arrays to both.
 
     `dump_tree_arrays(1)` is the VISITED subtree, which is ~1 node per simulation
     rather than the ~30 per expansion the whole arena holds — the same choice
     `playv6._principal_variation` makes and for the same reason. The dump is DFS
-    preorder with an ABSOLUTE depth column, so `depth == 1` selects the root's
-    children exactly, wherever they fall in the traversal.
+    preorder with an ABSOLUTE depth column, and row 0 is the root at depth 0.
+
+    None when the tree is empty, which is what every caller tests.
+    """
+    arrays = engine.search.dump_tree_arrays(1)
+    return arrays if arrays["depth"].size else None
+
+
+def root_child_rows(arrays) -> "np.ndarray":
+    """The absolute indices of the root's children, in DFS (child-slot) order.
+
+    `depth == 1` selects them exactly, wherever they fall in the traversal —
+    and because the dump is preorder, child k's whole subtree is the contiguous
+    run `[idx[k], idx[k + 1])`, with the last one running to the end. That is
+    what makes `_line_from` able to descend a chosen alternate without ever
+    scanning outside it, and it is why the boundaries are computed once here
+    rather than searched for per alternate.
+
+    ONE VECTORISED PASS, not a Python loop over the tree. The loop this replaces
+    ran `int(depth[i])` for every row of a dump that can hold 2.4M of them, to
+    answer a question about ~35 — the same shape of defect TC Part 1a fixed on
+    the C++ side, still present on this one.
+    """
+    return np.flatnonzero(arrays["depth"] == 1)
+
+
+def _line_from(arrays, start: int, end: int, max_plies: int) -> list[str]:
+    """The most-visited descent from the node at `start`, `start`'s move first.
+
+    IDENTICAL TO THE WALK `playv6._principal_variation` REPLACED, generalised to
+    begin at a root child instead of at the root. `search.principal_variation`
+    descends from `root_` and takes no start node, so a line below a move the
+    engine did NOT play has no C++ entry point and this is the only way to get
+    one; see the module docstring.
+
+    Same rule, same tie-break: at each step the children of the current node are
+    the rows at `depth + 1` inside its subtree, and the winner is the first
+    strict maximum in child-slot order. `np.argmax` returns the first occurrence
+    of the maximum, which is that tie-break exactly. A zero-visit child is absent
+    from the dump entirely, so there is no floor to apply.
+
+    THE COST IS THE SUBTREE, NOT THE TREE, and that is the whole reason the
+    boundaries are passed in. Each alternate descends only inside `[start, end)`,
+    the alternates' subtrees are disjoint, and the levels below the first are
+    strictly smaller — so N alternate lines cost about one pass over the dump in
+    total rather than N of them.
+    """
+    depth, visits, packed = arrays["depth"], arrays["visits"], arrays["move"]
+    line = [guofish_core.move_to_uci(int(packed[start]))]
+    node, stop = int(start), int(end)
+    while len(line) < max_plies:
+        here = int(depth[node])
+        kids = np.flatnonzero(depth[node + 1:stop] == here + 1) + node + 1
+        if kids.size == 0:
+            break
+        best = int(kids[int(np.argmax(visits[kids]))])
+        # The chosen child's own subtree runs to the next sibling, or to the end
+        # of the parent's. Read off the sibling list rather than searched for,
+        # so the walk never looks at a row outside the node it is inside.
+        after = kids[kids > best]
+        stop = int(after[0]) if after.size else stop
+        line.append(guofish_core.move_to_uci(int(packed[best])))
+        node = best
+    return line
+
+
+def root_distribution(board: chess.Board, arrays) -> list[dict]:
+    """The root's children: visits, prior and backed-up Q, most-visited first.
 
     Q is `value_sum / visits`, then flipped to the board convention. The backup
     negates on the way up, so a child's stored value arrives in the ROOT MOVER's
@@ -332,19 +408,19 @@ def root_distribution(engine: Engine, board: chess.Board) -> list[dict]:
     negation for the whole table correct. playv5 displayed this raw and called
     the column `Q(stm)`; here it is `Q(white)`, so a losing position reads
     negative whichever colour the engine has. See `white_relative`.
+
+    `arrays` comes from `visited_tree`, and None (an empty tree, or a bypassed
+    move that never searched) yields no rows.
     """
-    arrays = engine.search.dump_tree_arrays(1)
-    depth = arrays["depth"]
-    if depth.size == 0:
+    if arrays is None:
         return []
     visits, value_sum = arrays["visits"], arrays["value_sum"]
     prior, packed = arrays["prior"], arrays["move"]
     white_to_move = board.turn == chess.WHITE
 
     rows: list[dict] = []
-    for i in range(depth.size):
-        if int(depth[i]) != 1:
-            continue
+    for i in root_child_rows(arrays):
+        i = int(i)
         count = int(visits[i])
         uci = guofish_core.move_to_uci(int(packed[i]))
         try:
@@ -354,7 +430,7 @@ def root_distribution(engine: Engine, board: chess.Board) -> list[dict]:
             # have drifted apart; showing the raw UCI is more useful than
             # dropping the row and pretending the search was narrower.
             san = uci
-        rows.append({"uci": uci, "san": san, "visits": count,
+        rows.append({"uci": uci, "san": san, "visits": count, "index": i,
                      "prior": float(prior[i]),
                      "q": white_relative(
                          float(value_sum[i]) / count if count else 0.0,
@@ -384,19 +460,18 @@ def format_root_distribution(rows: list[dict], played: Optional[chess.Move],
     return "\n".join(lines)
 
 
-def format_pv(board: chess.Board, outcome: SearchOutcome) -> str:
-    """The engine's principal variation in SAN, from the position before it moved.
+def _san_entries(board: chess.Board, line: list[str]) -> list[tuple[int, bool, str]]:
+    """A UCI line as `_numbered` triples, TRUNCATED at the first illegal move.
 
-    The walk stops at the first move that is not legal in the line so far rather
-    than raising. A PV is a most-visited descent through a tree that reuse can
-    leave holding stale children, so an illegal continuation is a real
-    possibility and truncating is the honest response to one.
+    Shared by `format_pv` and `format_alternates` so the two can never disagree
+    about where a line ends. A PV is a most-visited descent through a tree that
+    reuse can leave holding stale children, so an illegal continuation is a real
+    possibility and truncating is the honest response to one — the alternative
+    is raising into the move the frontend is trying to print.
     """
-    if outcome.bypassed or not outcome.pv:
-        return "(no PV - book/tablebase move, MCTS did not run)"
     replay = board.copy()
     entries: list[tuple[int, bool, str]] = []
-    for uci in outcome.pv:
+    for uci in line:
         try:
             move = chess.Move.from_uci(uci)
         except ValueError:
@@ -406,9 +481,111 @@ def format_pv(board: chess.Board, outcome: SearchOutcome) -> str:
         entries.append((replay.fullmove_number, replay.turn == chess.WHITE,
                         replay.san(move)))
         replay.push(move)
+    return entries
+
+
+def format_pv(board: chess.Board, outcome: SearchOutcome) -> str:
+    """The engine's principal variation in SAN, from the position before it moved.
+
+    `outcome.pv` is the C++ descent (`search.principal_variation`), so this is
+    the engine's own line and not one this frontend walked. The alternates in
+    `root_lines` are walked here because the core offers no descent from a node
+    other than the root; the two agree on the played move by construction, since
+    both take the first strict maximum in child-slot order at every step.
+    """
+    if outcome.bypassed or not outcome.pv:
+        return "(no PV - book/tablebase move, MCTS did not run)"
+    entries = _san_entries(board, outcome.pv)
     if not entries:
         return "(no PV)"
     return f"Principal variation ({len(entries)} plies): {_numbered(entries)}"
+
+
+def root_lines(board: chess.Board, arrays, rows: list[dict],
+               value_scale: Optional[float], top_n: int,
+               max_plies: int = 8) -> list[dict]:
+    """The top `top_n` replies, each with its own evaluation and its own line.
+
+    THE MULTI-PV THIS ENGINE DOES NOT OTHERWISE HAVE. `SearchOutcome.pv` is one
+    line, below the move that gets played; `--stats` is a table of replies with
+    no lines under them. This is the join: for each of the most-visited root
+    children, what the search thinks it is worth and what it expects to follow.
+
+    IT IS A DISPLAY FACILITY AND IT IS DELIBERATELY NOT ON `Engine`. The engine's
+    reporting surface carries what a UCI `info` line needs, and this frontend is
+    the only caller; putting it here keeps `playv6.py` owning the parameters and
+    the accounting and nothing else. A `MultiPV` option over UCI would want the
+    C++ descent instead — `Search::principal_variation` with a start node — at
+    which point this becomes a call to that and the display below is unchanged.
+
+    `value_scale` is `Engine.value_scale`, so the score column is the same
+    calibrated number the bracket after the played move carries. The SIGN IS
+    APPLIED AFTER the conversion, exactly as `format_engine_stats` does it:
+    `q_to_centipawns` inverts a mover-relative Q and negating the centipawns is
+    exact, where flipping the Q first and re-clamping would not be.
+
+    `rows` is `root_distribution`'s output, passed in rather than recomputed so
+    that `--stats` and `--alternate` together do the SAN work once.
+    """
+    if arrays is None or not rows:
+        return []
+    bounds = root_child_rows(arrays)
+    end_of = {int(start): int(bounds[k + 1]) if k + 1 < bounds.size
+              else int(arrays["depth"].size)
+              for k, start in enumerate(bounds)}
+    white_to_move = board.turn == chess.WHITE
+    total = sum(row["visits"] for row in rows) or 1
+
+    out: list[dict] = []
+    for row in rows[:top_n]:
+        start = row["index"]
+        line = _line_from(arrays, start, end_of[start], max_plies)
+        # From the RAW mover-relative Q, then negated, so this column and the
+        # `score:` field of the played move are the same arithmetic.
+        raw_q = row["q"] if white_to_move else -row["q"]
+        score_cp = q_to_centipawns(raw_q, value_scale or 1.0)
+        out.append({**row,
+                    "share": row["visits"] / total,
+                    "score_cp": score_cp if white_to_move else -score_cp,
+                    "entries": _san_entries(board, line)})
+    return out
+
+
+def format_alternates(lines: list[dict], played: Optional[chess.Move],
+                      considered: int = 0, visits: int = 0) -> str:
+    """The `--alternate` table: one row per reply, with its line beside it.
+
+    Scores are White-relative like every other number on this screen — `+` means
+    White stands better whichever side the engine has. See `white_relative`, and
+    note `format_pawns`'s +-8.70 ceiling: a won position and a forced mate print
+    the same, so read the rail as "winning" rather than as a magnitude.
+
+    A LOSING SIDE'S BEST MOVE IS THE LOWEST NUMBER IN THE COLUMN, not the
+    highest, and that follows from the convention rather than contradicting it:
+    the rows are ranked by VISITS, and when the engine has Black the move it
+    picked is the one that leaves White worst off. The `Q(white)` column of
+    `--stats` reads the same way.
+
+    `visits` is the CHILDREN's total, which is the share column's denominator —
+    the same quantity `format_root_distribution` heads its table with, and not
+    `root_visits`, which carries the root's own seed visit and would leave the
+    percentages summing to slightly under a total nobody could check.
+    """
+    if not lines:
+        return ("(no alternatives - book/tablebase move, MCTS did not run)")
+    width = max(4, max(len(row["san"]) for row in lines))
+    played_uci = played.uci() if played is not None else None
+    head = (f"Alternatives: top {len(lines)} of {considered} replies"
+            f" across {visits:,} root visits")
+    out = [head,
+           f"  {'move':<{width}}  {'score':>7}  {'visits':>9}  {'share':>6}  line"]
+    for row in lines:
+        mark = "   <-- played" if row["uci"] == played_uci else ""
+        line = _numbered(row["entries"]) if row["entries"] else "(no line)"
+        out.append(f"  {row['san']:<{width}}  "
+                   f"{format_pawns(row['score_cp']):>7}  "
+                   f"{row['visits']:>9,}  {row['share']:>5.1%}  {line}{mark}")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -788,8 +965,21 @@ class Session:
         # last search left it, so a dump here would render the PREVIOUS
         # position's children against this board — a table that looks like a
         # search and describes one that never ran.
+        #
+        # ONE DUMP FOR BOTH READERS. `--stats` and `--alternate` are independent
+        # flags over the same arrays, and `dump_tree_arrays(1)` materialises
+        # eight of them over the whole visited subtree — which on a pondered
+        # tree is the expensive thing on this path. Taken once here and passed
+        # down; see `visited_tree`.
         want_stats = self.args.stats and not outcome.bypassed
-        rows = root_distribution(self.engine, self.board) if want_stats else []
+        want_alt = self.args.alternate > 0 and not outcome.bypassed
+        arrays = (visited_tree(self.engine)
+                  if (want_stats or want_alt) else None)
+        rows = root_distribution(self.board, arrays)
+        alternates = (root_lines(self.board, arrays, rows,
+                                 self.engine.value_scale, self.args.alternate,
+                                 self.args.alternate_plies)
+                      if want_alt else [])
         # `--stats` implies `--pv`, so passing both prints the line once. Unlike
         # the root dump this is safe for a bypassed move: `format_pv` reads
         # `outcome.pv`, which belongs to THIS decision, and says so when the
@@ -802,6 +992,12 @@ class Session:
         if self.args.stats:
             print()
             print(format_root_distribution(rows, move))
+        if self.args.alternate > 0:
+            print()
+            # The totals describe the WHOLE root, not the truncated table, so
+            # "top 4 of 31" reads against the search that actually happened.
+            print(format_alternates(alternates, move, len(rows),
+                                    sum(row["visits"] for row in rows)))
         if want_pv:
             print()
             print(pv)
@@ -1164,6 +1360,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                              "variation. The PV half of --stats without the root "
                              "distribution; --stats implies it, so passing both "
                              "prints the PV once")
+    parser.add_argument("--alternate", type=int, default=0, metavar="N",
+                        help="after every searched move, print the top N "
+                             "alternative replies with their evaluations and "
+                             "their principal variations. 0 (the default) is "
+                             "off. Independent of --stats")
+    parser.add_argument("--alternate-plies", type=int, default=8, metavar="P",
+                        help="how many plies of each --alternate line to show "
+                             "(default: 8). Longer lines are more informative "
+                             "and much wider")
     parser.add_argument("--telemetry", action="store_true",
                         help="also emit the engine's own [search] line per move "
                              "on stderr — delivered vs nominal sims, inflation, "
@@ -1171,6 +1376,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--no-color", dest="color", action="store_false",
                         default=True, help="suppress ANSI colour")
     add_config_arguments(parser)
+
+    parser.set_defaults(ponder_decay=0.3)
     args = parser.parse_args(argv)
 
     global GREEN, RED, DIM, RESET
@@ -1180,6 +1387,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # `--model` owns the field, so the positional only fills it when it is empty.
     if args.checkpoint is not None and args.model_path is None:
         args.model_path = args.checkpoint
+
+    if args.alternate < 0:
+        parser.error("--alternate must be 0 (off) or a positive count")
+    if args.alternate_plies < 1:
+        parser.error("--alternate-plies must be at least 1")
 
     if args.switch_interval != after:
         sys.setswitchinterval(args.switch_interval)
