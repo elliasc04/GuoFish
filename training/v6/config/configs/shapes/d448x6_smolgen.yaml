@@ -1,0 +1,3 @@
+extends: ../base.yaml
+run:   {name: v6-d448x6-sg}
+model: {d_model: 448, n_heads: 7, d_ff: 1792, attn_bias: smolgen}

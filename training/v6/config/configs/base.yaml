@@ -1,0 +1,73 @@
+# v6 base config (§4). Values are starting points; §13 says which ones screening sets.
+# Paths are checked at run start, not at load, so any config resolves and hashes anywhere.
+run:      {name: v6-base, seed: 20260924, out_root: models/v6}
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+  d_ff: 1536
+  head_dim: 64
+  dropout: 0.0
+  final_norm: true
+  init: independent          # independent | v5_deepcopy
+  token_scheme: v5_68        # v5_68 | canonical_65
+  attn_bias: none            # none | static | smolgen
+  smolgen: {compress: 16, hidden: 128, gen: 128}
+  value_head: {pool: cls_mlp}          # cls_mlp | flatten
+  value_repr: {kind: scalar}           # scalar | hlgauss
+  aux_policy_head: false
+data:
+  corpus: data/processed/multipv_v2
+  manifest: data/processed/multipv_v2/manifest.json
+  split: train
+  strata: data/processed/multipv_v2/strata_train_v1.npy
+  workers: 8
+  prefetch_factor: 2
+mixture:  {groups: natural}
+targets:
+  policy_soft: {weight: 1.0, source: stored, temperature: null, epsilon: 0.05}
+  policy_hard: {weight: 0.0, epsilon: 0.1, head: main}
+  value:       {weight: 1.0, stratum_weights: {exact_zero: 1.0, mate: 1.0, middle: 1.0}}
+  mirror_prob: 0.5
+optim:
+  name: adamw                # adamw | muon_adamw
+  lr: 3.5e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.01
+  decay_embedding: false
+  grad_clip: 1.0
+  micro_batch: 512
+  accum: 2
+  muon: {momentum: 0.95, nesterov: true, ns_steps: 5}
+schedule:
+  kind: wsd                  # wsd | onecycle
+  total_samples: 360e6
+  warmup_samples: 7.2e6
+  decay_frac: 0.2
+  decay_shape: one_minus_sqrt   # one_minus_sqrt | linear | cosine
+  final_lr_frac: 0.0
+ema:      {enabled: true, half_life_samples: 10e6}
+eval:
+  frozen_dir: data/processed/val_frozen_90m_v1
+  frozen_strata: data/processed/val_frozen_90m_v1/strata_val_v1.npy
+  quick_every_samples: 2048000     # 2,000 steps at 1,024
+  quick_size: 32768
+  quick_seed: 20260924
+  full_every_samples: 0            # stable checkpoints and run end
+  batch: 1024
+  best_metric: total
+  mirror_n: 10000
+ckpt:
+  every_samples: 10240000          # 10,000 steps at 1,024
+  keep_last: 3
+  stable_every_samples: 0
+  export_weights: ema
+system:
+  device: cuda
+  precision: bf16
+  compile: true
+  compile_mode: default
+  tf32: true
+  allow_dirty: false
+  log_every: 50

@@ -43,7 +43,32 @@ Deviations from *GuoFish v6 Training Stack — Design* (`docs/capacity/training_
 - **The module keeps a `seq_length` attribute**, which the v5 engine reads off a loaded
   module.
 
-## M3 — data (reader)
+## M2 — config system (`training/v6/config/`)
+
+- **Config files live in `training/v6/config/configs/`**, following the doc's §3 table
+  ("`training/v6/config/` | … `configs/*.yaml`").
+- **Paths are checked at run start, not at config load.** `base.yaml` points at the corpus v2
+  paths the doc gives, and those don't exist yet. Checking at load would stop any config from
+  resolving or hashing on a machine without the data.
+- **Resume whitelist** is the doc's (output root, log cadence, `total_samples` for branching),
+  plus `data.workers` and `data.prefetch_factor`. The sample stream is a function of
+  (seed, sample index) only, so worker count cannot change it.
+- **Cadences are multiples of the effective batch** (`ckpt.*_samples`, `eval.*_samples`).
+  `onecycle` also requires `total_samples` to be one, because torch's OneCycle is defined
+  over whole steps. WSD does not: the doc's own `360e6` is not a multiple of 1,024. The LR
+  is a function of the sample index, and the run ends at the first step boundary at or
+  past `total_samples`.
+- **`policy_soft.source` and `temperature` are both kept** (the doc's example has both) and
+  cross-checked: `pv_score` requires a temperature, `stored` forbids one.
+- **`optim.decay_embedding`** (default false, per §8.1): v5 decayed `embedding.weight`, so
+  `v5_compat.yaml` sets it true.
+- **`v5_compat.yaml` `total_samples` = 360,302,592** (4 × 90,075,648, v5's drop_last epoch),
+  i.e. 351,858 optimizer steps. v5 itself ran 351,860 steps, because each epoch ended on a
+  half window of one micro-batch. v6 has only full windows. The 2-step difference is at the
+  end of the schedule, where LR is ~1.4e-9.
+- **bf16 requires `system.device: cuda`**: a hard error rather than a silent CPU autocast.
+
+## M3 — data layer (`training/v6/data/`)
 
 - **v1 upcast sentinels.** v1 records carry neither `value_depth` nor `src_line`. The reader
   reports `value_depth = 0` (a real depth is ≥ 20) and `src_line = 0xFFFFFFFF`, alongside the

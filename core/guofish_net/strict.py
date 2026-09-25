@@ -20,14 +20,16 @@ def from_dict_strict(cls, d, path: str):
         raise TypeError(f"{path}: expected a mapping, got {type(d).__name__}")
     hints = typing.get_type_hints(cls)
     known = {f.name for f in fields(cls)}
+    join = (lambda k: f"{path}.{k}") if path else (lambda k: k)
     unknown = sorted(set(d) - known)
     if unknown:
-        raise KeyError(f"unknown key(s): {', '.join(f'{path}.{k}' for k in unknown)}")
-    kw = {k: coerce(hints[k], v, f"{path}.{k}") for k, v in d.items()}
+        raise KeyError(f"unknown key(s): {', '.join(join(k) for k in unknown)}")
+    kw = {k: coerce(hints[k], v, join(k)) for k, v in d.items()}
     try:
         return cls(**kw)
-    except (ValueError, TypeError) as e:
-        raise type(e)(f"{path}: {e}") from e
+    except (ValueError, TypeError, KeyError) as e:
+        msg = e.args[0] if e.args else str(e)
+        raise type(e)(f"{path}: {msg}" if path else msg) from e
 
 
 def coerce(tp, v, path: str):
