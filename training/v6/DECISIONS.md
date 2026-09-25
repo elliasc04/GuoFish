@@ -111,3 +111,34 @@ Deviations from *GuoFish v6 Training Stack — Design* (`docs/capacity/training_
   and that file has not been built (see GPU_TODO).
 - **The value stratum for λ weights is computed per batch from `value_cp`.** It is the same rule as the
   sidecar, so the training path needs no strata lookup.
+
+## M4 — losses, optimization, schedule, EMA
+
+- **Per-term normalizers are expected counts, computed once from config + strata.** §7 says
+  each term divides by "its own row count in the optimizer window", and §4 says the
+  normalizer is "computed from the config, logged at start, and stored". The two agree when
+  mixture groups align with label kinds, where counts are constant per window. v6 uses
+  N_term = effective batch × Σ_g share_g × (fraction of group g eligible for the term). That is exact for
+  label-aligned groups. Under `natural` it is v5's constant C = window × coverage, but with
+  the corpus coverage measured exactly from the strata (H15). A constant denominator
+  keeps gradient accumulation exact.
+- **Hard target ε is spread over the unique legal indices** (the dense bool mask). §7 says
+  "spread over legal moves". v4 Phase 3, which §7 cites, used `CrossEntropyLoss(label_smoothing)`
+  over all 4,096 classes, and the doc's own wording is followed instead. The target is
+  (1 − ε) on `hard_move` plus ε/n over the n legal indices, which sums to 1. A `hard_move` outside
+  the stored legal set is unioned in, as with the soft target's truncation repair.
+- **The hard term applies to rows with `has_policy = 0` and `hard_move ≥ 0`** (hard-only and
+  derived rows, §7). Multi-PV rows get only the soft term. With `policy_hard.head: aux`, the
+  hard term trains the aux head and the soft term trains the main head.
+- **The masked log-softmax is re-implemented, not imported from v5.** v5's has a
+  `bool(empty.any())` host sync per call (H19). v6 unions the empty-row repair
+  unconditionally. `test_soft_kl_matches_v5` shows the KL is bit-identical to v5's function.
+- **WSD warmup is `peak × s / warmup_samples`**, where s is the sample index at the step's
+  start, so LR is 0 at step 0 (the common linear-warmup convention).
+- **Muon details.** Muon covers the 2-D weights inside blocks: fused QKV as one matrix,
+  attention output, both FFN matrices, and smolgen's compress/fc1/fc2. The shared smolgen
+  projection sits outside the blocks and gets AdamW. Update scale is
+  0.2·√max(rows, cols) (Liu et al. 2025), so the AdamW LR and weight decay (decoupled,
+  `p ← p(1 − lr·wd)`) carry over. Newton–Schulz runs in bf16 on CUDA and fp32 on CPU.
+- **`tools/branch_decay.py` landed with M5**, not M4. It is the trainer's resume path with a new
+  `total_samples` and output directory, so it needs the trainer.
