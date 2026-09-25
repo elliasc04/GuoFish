@@ -40,19 +40,28 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        """Honours `self.found_inf` (a 0/1 device tensor, the GradScaler
+        protocol fused AdamW uses): when 1, params and momentum are left
+        untouched, decided on device with no host sync."""
         if closure is not None:
             raise ValueError("Muon does not take a closure")
+        skip = getattr(self, "found_inf", None)
         for g in self.param_groups:
             mu, lr, wd = g["momentum"], g["lr"], g["weight_decay"]
             for p in g["params"]:
                 if p.grad is None:
                     continue
                 buf = self.state[p].setdefault("momentum_buffer", torch.zeros_like(p))
-                buf.mul_(mu).add_(p.grad)
-                u = p.grad.add(buf, alpha=mu) if g["nesterov"] else buf
+                new_buf = buf * mu + p.grad
+                u = p.grad + mu * new_buf if g["nesterov"] else new_buf
                 u = newton_schulz(u, g["ns_steps"]) * (0.2 * max(p.shape) ** 0.5)
-                p.mul_(1.0 - lr * wd)
-                p.add_(u, alpha=-lr)
+                new_p = p * (1.0 - lr * wd) - lr * u
+                if skip is None:
+                    buf.copy_(new_buf)
+                    p.copy_(new_p)
+                else:
+                    buf.copy_(torch.where(skip > 0, buf, new_buf))
+                    p.copy_(torch.where(skip > 0, p, new_p))
 
 
 class MuonAdamW:
@@ -64,6 +73,16 @@ class MuonAdamW:
     @property
     def param_groups(self):
         return self.muon.param_groups + self.adamw.param_groups
+
+    @property
+    def found_inf(self):
+        return self.adamw.found_inf
+
+    @found_inf.setter
+    def found_inf(self, flag):
+        self.muon.found_inf = flag
+        self.adamw.found_inf = flag
+        self.adamw.grad_scale = None
 
     def step(self):
         self.muon.step()

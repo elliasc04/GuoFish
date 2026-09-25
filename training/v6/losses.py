@@ -76,7 +76,7 @@ def loss_normalizers(cfg: Config, mixture, strata: np.ndarray) -> dict:
         lab = label if mem is None else label[np.asarray(mem)]
         soft += mixture.shares[g] * float((lab == 0).mean())
         hard += mixture.shares[g] * float((lab == 1).mean())
-    out = {"soft": eff * soft, "hard": eff * hard, "value": float(eff)}
+    out = {"soft": float(eff * soft), "hard": float(eff * hard), "value": float(eff)}
     t = cfg.targets
     for term, w in (("soft", t.policy_soft.weight), ("hard", t.policy_hard.weight)):
         if w > 0 and out[term] <= 0:

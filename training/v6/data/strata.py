@@ -66,8 +66,9 @@ def compute_strata(rec: np.ndarray) -> np.ndarray:
 
 
 def field_of(codes: np.ndarray, name: str) -> np.ndarray:
+    """uint16 in, uint16 out: no upcast of a 150M-record sidecar."""
     shift, width = LAYOUT[name]
-    return (codes.astype(np.int64) >> shift) & ((1 << width) - 1)
+    return (np.asarray(codes, dtype=np.uint16) >> np.uint16(shift)) & np.uint16((1 << width) - 1)
 
 
 def match(codes: np.ndarray, where: dict) -> np.ndarray:

@@ -56,6 +56,7 @@ eval:
   quick_seed: 20260924
   full_every_samples: 0            # stable checkpoints and run end
   batch: 1024
+  workers: 4
   best_metric: total
   mirror_n: 10000
 ckpt:

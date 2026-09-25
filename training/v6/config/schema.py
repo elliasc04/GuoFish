@@ -266,10 +266,12 @@ class EvalConfig:
     quick_seed: int = 20260924
     full_every_samples: int = 0          # 0: stable checkpoints and run end only
     batch: int = 1024
+    workers: int = 4
     best_metric: str = "total"           # total | policy_kl | value_mse
     mirror_n: int = 10_000
 
     def __post_init__(self):
+        _nonneg("eval.workers", self.workers)
         _nonneg("eval.quick_every_samples", self.quick_every_samples)
         _pos("eval.quick_size", self.quick_size)
         _nonneg("eval.full_every_samples", self.full_every_samples)

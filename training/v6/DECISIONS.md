@@ -142,3 +142,58 @@ Deviations from *GuoFish v6 Training Stack — Design* (`docs/capacity/training_
   `p ← p(1 − lr·wd)`) carry over. Newton–Schulz runs in bf16 on CUDA and fp32 on CPU.
 - **`tools/branch_decay.py` landed with M5**, not M4. It is the trainer's resume path with a new
   `total_samples` and output directory, so it needs the trainer.
+
+## M5 — trainer, eval, checkpoints, export
+
+- **Non-finite guard without a per-step sync.** Each window's finite flag is computed on
+  device and handed to the optimizer as `found_inf`. That is the GradScaler protocol fused AdamW
+  already honours; v6's Muon honours it too. A bad step is skipped on device. The next log
+  sync (every `log_every` steps) sees the count, writes `ckpt/emergency_s<N>.pt` with the last
+  good weights and exits non-zero. Up to `log_every − 1` further windows can be skipped before
+  exit.
+- **The checkpoint stores the global torch RNG (and CUDA's on a CUDA run).** The doc says no
+  *worker* RNG is needed, and that holds because augmentation is hash-based. But dropout
+  draws from the main-process RNG, so it is saved. Every DataLoader gets its own
+  `torch.Generator()`. Without one, creating an iterator draws a seed from the global RNG,
+  and a resume creates its iterator at a different point in the stream, which would shift
+  dropout masks. S3 runs with dropout 0.1 to prove both.
+- **`--crash-after-steps N` (hidden)** simulates a kill with `os._exit`: no cleanup and no
+  checkpoint. S3 uses it so the kill point is deterministic.
+- **The step log carries a per-interval stream digest**: sha256 of the window's record indices
+  and mirror flags. That is how S3 shows "same sample indices and augmentation decisions".
+- **`torch.compile` wraps `model.forward_train`**, the training path. The engine compiles
+  `forward` itself. Eval runs the uncompiled module, and EMA eval uses a separate uncompiled
+  instance.
+- **Resume.** A config diff outside the whitelist is refused. `schedule.total_samples` is
+  accepted only in branch mode (`tools/branch_decay.py`), per §10.2. A finished run refuses
+  to resume ("nothing to do"), which covers H10. Each resume writes its own
+  `provenance_resume_<utc>.json` and `code_resume_<utc>.patch`, alongside the originals.
+- **`code.patch` is `git diff HEAD --binary`.** Untracked files are listed in
+  `dirty_files` but their contents are not captured. `system.allow_dirty: false` refuses a
+  dirty tree anyway.
+- **Export names add `_s<samples>_<weights>`** to the doc's `<run>_<shape>_<cfghash8>`. Two
+  exports of one run (EMA and raw, or two checkpoints) would otherwise collide, which is D-7 again.
+  An existing file is never overwritten. `best.pt` stores whichever weight set (raw or EMA)
+  scored best, and `--weights best` exports it.
+- **Eval cadence.** Quick-val evaluates raw weights on the stratified seeded subset
+  (`eval.quick_size`, default 32,768) every `quick_every_samples`. Full eval covers raw and
+  EMA at stable checkpoints, at `full_every_samples` if set, and at run end. Mirror
+  consistency uses a seeded random `mirror_n` subset rather than a prefix (H3).
+- **Not built:** the `v2val_roots` / `v2val_derived` eval sets, because corpus v2 doesn't
+  exist (only `frozen90` is wired), and `tools/lr_range.py` (in the doc's layout, not in the
+  brief).
+- **INCIDENT: GPU hiding was ineffective in this session.** In PowerShell 5.1,
+  `$env:CUDA_VISIBLE_DEVICES = ""` *deletes* the variable (measured), so every process
+  launched from PowerShell, directly or through the low-priority launcher, had the GPU
+  visible. Test subprocesses given `env={..., "": ""}` did see an empty value, so they had it
+  hidden. Only one code path initialises CUDA: the checkpoint writer called
+  `torch.cuda.get_rng_state_all()` whenever CUDA was available. It ran with the GPU
+  visible once, in the manual tiny run at 23:49. That was after the capacity trainer had
+  already crashed, at 23:14:49. Fixes:
+  1. CUDA RNG is saved only when `system.device == "cuda"`, with a regression test that
+     simulates a visible GPU.
+  2. `training/v6/tests/conftest.py` sets `CUDA_VISIBLE_DEVICES=-1` for every test and its
+     subprocesses, and fails the session if CUDA was initialised.
+  3. The launcher uses `-1`.
+
+  See HARNESS_REPORT.md for the crash timeline.
