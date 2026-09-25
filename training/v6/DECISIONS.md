@@ -74,3 +74,40 @@ Deviations from *GuoFish v6 Training Stack — Design* (`docs/capacity/training_
   reports `value_depth = 0` (a real depth is ≥ 20) and `src_line = 0xFFFFFFFF`, alongside the
   doc's `hard_move = −1`, `origin = 0`. v1 `pv_score` (float16 of an int) converts to
   int16 exactly, and the reader checks this on every read.
+- **The ε spread accumulates in float64, per add, as v5 does.** Found by S1: v5's
+  `np.add.at(policy, li, eps / n_legal)` passes a Python float, so NumPy adds in float64 and
+  rounds to float32 after every add. A float32 share was 1 ulp off on 30 of 2,000 records
+  wherever entries accumulate (promotion squares, PV moves). v6 passes a float64 share.
+  PV mass is added as float32, as in v5.
+- **Mirroring happens on the record, before dense targets are built.** Tokens, `pv_idx`,
+  `legal_idx`, `hard_move`, `value` and `value_cp` are permuted and negated in the record.
+  The same float32 values then accumulate in the same order at permuted positions, so the
+  result equals v5's dense-then-gather mirror bit for bit (S1, mirror on).
+- **Per-micro-batch counts use cumulative largest remainder.** The count for micro-batch k is
+  A(B·(k+1)) − A(B·k), where A(N) apportions N samples by largest remainder, ties broken by
+  group order. Every micro-batch gets the floor or the ceiling of share × B, summing to B.
+  The cumulative count stays within one sample of share × N forever, and the whole thing is
+  closed-form in k. This is how "remainders rotated deterministically" is implemented. Each
+  group needs share × micro_batch ≥ 1, validated at config load.
+- **Within-group order is a seeded Feistel permutation, not a stored array.** It is a
+  6-round balanced Feistel network with cycle walking, keyed by (seed, group, pass). Each
+  pass gets a fresh key. That keeps O(1) memory per worker at 150M records, and makes the
+  position at any sample index closed-form.
+- **Mixture groups must be disjoint**, and an overlap is a hard error naming the counts. The
+  doc's §6.7 example overlaps: derived rows have label `hard_only` *and* origin `derived`.
+  As written it would be refused. It needs `where: {label: hard_only, origin: root}` on the
+  `hard` group. A group with a share and no records is also an error.
+- **Grouped mixtures write member lists** as uint32 `.npy` files in the run directory. Workers
+  memmap them, so they share page cache rather than each holding a pickled copy.
+- **canonical_65 ep legality is read from the stored legal moves.** There is no board in the worker. A
+  capture onto the target from an adjacent rank-5 pawn must be in `legal_idx`. Caveat: a
+  position with more than 128 legal moves stores a truncated list (200 records in 90M) and
+  could lose its ep capture. None was seen in S5. The illegal-ep branches (no capturer, a
+  pinned capturer) never occur in real data, where 144 of 144 ep squares were legal, so
+  they are pinned with hand positions against python-chess.
+- **Strata sidecars.** The frozen-val sidecar lives next to the frozen shards (the M0
+  directory). For the 90M train split, `v5_compat.yaml` points at
+  `data/processed/strata/multipv_90m_train_v1.npy`, outside the live corpus directory,
+  and that file has not been built (see GPU_TODO).
+- **The value stratum for λ weights is computed per batch from `value_cp`.** It is the same rule as the
+  sidecar, so the training path needs no strata lookup.

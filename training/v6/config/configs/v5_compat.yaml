@@ -7,7 +7,8 @@ model: {dropout: 0.1, init: v5_deepcopy}
 data:
   corpus: data/processed/multipv_90m
   manifest: data/multiPV/manifests/dataset_manifest_90m.json
-  strata: data/processed/multipv_90m/strata_train_v1.npy
+  # kept out of the live corpus directory; not built yet (needs the full 90M pass)
+  strata: data/processed/strata/multipv_90m_train_v1.npy
 mixture: {groups: natural}          # uniform over records
 targets:
   policy_soft: {source: stored, temperature: null, epsilon: 0.05}
