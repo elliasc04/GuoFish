@@ -197,3 +197,39 @@ Deviations from *GuoFish v6 Training Stack — Design* (`docs/capacity/training_
   3. The launcher uses `-1`.
 
   See HARNESS_REPORT.md for the crash timeline.
+
+## M6 — corpus v2 builder (`data/multiPV/pass_b_v2.py`), frozen-val extractor
+
+- **v1 code is imported, not copied:** `labels.py` (every label rule), `pass_b_convert`
+  (`build_selection`, routing hash, `file_hash`), `feasibility_scan` (rates), and
+  `pass_a_index.iter_lines`. The v1 CLI is never run by tests, because its defaults point at the live
+  corpus (H1). The synthetic "90M" build calls v1's `build_selection` and `convert_one`
+  in-process.
+- **Position key for dedup:** blake2b-64 of the first four FEN fields (placement, side,
+  castling, *legal* ep), computed from the parsed board for roots and derived alike.
+- **Derived sampling is independent per ply.** Every k = 1..`max_ply` candidate that passes
+  the §6.3 conditions is kept with probability `--derived-rate`, using a hash of
+  (line, k, seed). A k = 2 candidate can be kept when k = 1 was not. Unrolling stops at the
+  first failed condition, and each stop reason is counted.
+- **Mate shortening:** |mate| drops by the number of the mating side's moves among the k
+  plies. A saturated distance (≥ 1,000) is kept as stored. A mate used up without a terminal
+  position stops the unroll (`derived_stop_mate_used_up`).
+- **Derived train records are appended after all roots** in the train shards, routed by a
+  hash of (line, k). Roots keep v1's order and routing, so shard contents are deterministic.
+- **No resume.** A failed build is re-run into a new, empty `--out-dir`, as the H1 fix requires.
+- **`--limit N` selects over the first N index rows only.** The u stream is positional, so
+  that equals the full build's selection of those rows, without holding ~120M line
+  numbers in RAM. `selection_scope` in the manifest says so.
+- **Defaults are starting points for the operator:** `--target 121,100,000` (about 120M roots at
+  the 90M yield), 90M shares and `policy_share` 0.65, `--derived-rate 0.125`, 256/16/4
+  train/val/valderived shards. The smoke measured 213k derived candidates per 108k roots
+  and 32% of sampled ones dropped as root duplicates. Size the rate from those numbers.
+- **S9 exit codes:** 1 for an invariant rate above 0.1% (v1's gate) or broken nesting; 3 for
+  `hard_move` on fewer than 99% of roots. The manifest is still written, per "investigate
+  before training".
+- **`extract_frozen_v2.py` reproduces v1's val order** (routing hash, then source order) so the
+  comparison is positional. It requires the full index to replay the 90M selection
+  (730 MB of line numbers).
+- **`v2_index_check.py` is a new file**, not the recon's `headroom_scan.py` (which is untracked,
+  in the gitignored `recon/`). It keeps that script's method, including self-checking the
+  reproduced 90M selection against the manifest before reporting anything.
