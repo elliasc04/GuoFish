@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch._inductor.config as inductor_config
 
 from core.guofish_net import build_model
 from training.v6.ckpt import (
@@ -42,6 +43,13 @@ from training.v6.data.strata import DEFINITION_HASH, load_strata
 from training.v6.eval import EvalSet, evaluate, quick_subset
 from training.v6.losses import LossFn, loss_normalizers
 from training.v6.optim import EMA, Schedule, build_optimizer
+
+# Plain Triton kernel names. A descriptive fused name here runs to 135 chars; with
+# the cache's 52-char hash and 50-char temp dir no cache root keeps the path under
+# MAX_PATH (LongPathsEnabled is 0) and Triton fails with FileNotFoundError. Names
+# only: the generated code is otherwise unchanged. bench.py and s3_check.py import
+# this module, so every compile path gets it.
+inductor_config.triton.descriptive_names = False
 
 METRICS = ("loss", "soft_kl", "n_soft", "hard_ce", "hard_nll", "n_hard", "value_loss", "value_se")
 CRASH_EXIT = 17
