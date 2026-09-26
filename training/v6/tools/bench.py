@@ -40,7 +40,7 @@ def main(argv=None) -> int:
     torch.backends.cuda.matmul.allow_tf32 = cfg.system.tf32
     ss = ShardSet(resolve(cfg.data.corpus), cfg.data.split, resolve(cfg.data.manifest))
     t = cfg.targets
-    builder = BatchBuilder(cfg.model.token_scheme, t.mirror_prob, cfg.run.seed,
+    builder = BatchBuilder(cfg.model.token_scheme, t.mirror_prob, cfg.run.data_seed,
                            t.policy_soft.epsilon, t.policy_soft.temperature)
     amp = ((lambda: torch.autocast("cuda", dtype=torch.bfloat16))
            if cfg.system.precision == "bf16" else contextlib.nullcontext)
@@ -49,8 +49,8 @@ def main(argv=None) -> int:
     for mb in args.micro:
         idx = np.random.default_rng(0).choice(len(ss), mb, replace=False)
         b = {k: v.to(dev) for k, v in builder(ss.read(idx), idx).items()}
-        torch.manual_seed(cfg.run.seed)
-        model = build_model(cfg.model).to(dev)
+        torch.manual_seed(cfg.run.init_seed)
+        model = build_model(cfg.model, cfg.run.init_seed).to(dev)
         fn = (torch.compile(model.forward_train, mode=cfg.system.compile_mode)
               if cfg.system.compile else model.forward_train)
         opt = build_optimizer(model, cfg.optim, cfg.optim.lr)

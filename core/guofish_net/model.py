@@ -10,6 +10,7 @@ A new variant is a new config value plus a branch here, never a new file.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import asdict, dataclass, field, fields
 
@@ -198,7 +199,7 @@ class Block(nn.Module):
 
 
 class GuoFishNet(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, init_seed: int = 0):
         super().__init__()
         self.cfg = cfg
         d, T = cfg.d_model, cfg.seq_len
@@ -229,7 +230,7 @@ class GuoFishNet(nn.Module):
             self.value_fc1 = nn.Linear(64 * 32, 128)
             self.value_fc2 = nn.Linear(128, v_out)
         self.register_buffer("hl_centers", hlgauss_centers(), persistent=False)
-        _init_weights(self, cfg)
+        _init_weights(self, cfg, init_seed)
 
     def _policy(self, sq, from_proj, to_proj):
         logits = torch.bmm(from_proj(sq), to_proj(sq).transpose(1, 2)) * self.logit_scale
@@ -277,7 +278,15 @@ class GuoFishNet(nn.Module):
         return out["policy_logits"], out["value"]
 
 
-def _init_weights(model: GuoFishNet, cfg: ModelConfig) -> None:
+def _keyed_normal_(p: torch.Tensor, init_seed: int, name: str, std: float = 0.02) -> None:
+    """N(0, std) from a generator keyed on (init_seed, parameter name) alone."""
+    key = int.from_bytes(hashlib.sha256(f"{init_seed}:{name}".encode()).digest()[:8], "little")
+    g = torch.Generator().manual_seed(key >> 1)
+    with torch.no_grad():
+        p.copy_(torch.randn(p.shape, generator=g) * std)
+
+
+def _init_weights(model: GuoFishNet, cfg: ModelConfig, init_seed: int) -> None:
     if model.static_bias is not None:
         nn.init.zeros_(model.static_bias)
     if model.smolgen_shared is not None:
@@ -295,18 +304,20 @@ def _init_weights(model: GuoFishNet, cfg: ModelConfig) -> None:
             blk.load_state_dict(b0.state_dict())
         return
 
-    # independent: every tensor drawn separately.
+    # independent: every tensor drawn separately, each from its own generator
+    # keyed on (init_seed, parameter name), so adding a module never changes
+    # another parameter's starting weights (paired screening arms).
     for name, mod in model.named_modules():
         if name == "smolgen_shared":
             continue
         if isinstance(mod, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(mod.weight, std=0.02)
+            _keyed_normal_(mod.weight, init_seed, f"{name}.weight")
             if getattr(mod, "bias", None) is not None:
                 nn.init.zeros_(mod.bias)
         elif isinstance(mod, nn.LayerNorm):
             nn.init.ones_(mod.weight)
             nn.init.zeros_(mod.bias)
-    nn.init.normal_(model.pos_embedding, std=0.02)
+    _keyed_normal_(model.pos_embedding, init_seed, "pos_embedding")
     scale = 1.0 / math.sqrt(2 * cfg.n_layers)
     with torch.no_grad():
         for blk in model.blocks:
@@ -314,11 +325,16 @@ def _init_weights(model: GuoFishNet, cfg: ModelConfig) -> None:
             blk.ff2.weight.mul_(scale)
 
 
-def build_model(cfg: ModelConfig) -> GuoFishNet:
-    """The only constructor."""
+def build_model(cfg: ModelConfig, init_seed: int = 0) -> GuoFishNet:
+    """The only constructor. `init: independent` is keyed on (init_seed, name)
+    and leaves the global RNG where it was; `v5_deepcopy` draws from the global
+    RNG, as v5 did, and ignores init_seed."""
     if not isinstance(cfg, ModelConfig):
         raise TypeError(f"build_model takes a ModelConfig, got {type(cfg).__name__}")
-    return GuoFishNet(cfg)
+    if cfg.init == "v5_deepcopy":
+        return GuoFishNet(cfg)
+    with torch.random.fork_rng(devices=[]):     # module constructors draw default inits
+        return GuoFishNet(cfg, init_seed)
 
 
 def load_for_inference(path, map_location="cpu"):

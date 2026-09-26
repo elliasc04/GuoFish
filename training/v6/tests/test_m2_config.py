@@ -28,7 +28,7 @@ def test_inheritance_leaf_by_leaf():
     c = load_config(CFG / "shapes/d448x6_smolgen.yaml")
     assert (c.model.d_model, c.model.n_heads, c.model.d_ff, c.model.attn_bias) == (448, 7, 1792, "smolgen")
     assert c.model.n_layers == 6 and c.model.smolgen.gen == 128   # from the parent
-    assert c.run.name == "v6-d448x6-sg" and c.run.seed == 20260924
+    assert c.run.name == "v6-d448x6-sg" and c.run.data_seed == c.run.init_seed == 20260924
 
 
 def test_lists_replace_and_extends_chain(tmp_path):
@@ -135,7 +135,7 @@ def test_v5_compat_matches_v5_config():
         v5["policy_weight"], v5["value_weight"])
     assert c.targets.policy_hard.weight == 0.0 and c.mixture.groups == "natural"
     assert c.ema.enabled is False
-    assert c.run.seed == v5["seed"]
+    assert c.run.data_seed == c.run.init_seed == v5["seed"]
     assert (c.data.corpus, c.data.manifest) == (v5["shards"], v5["manifest"])
 
     eff = v5["micro_batch"] * v5["accum_steps"]

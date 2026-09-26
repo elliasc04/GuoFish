@@ -1,4 +1,4 @@
-"""v6 config schema (§4): one frozen dataclass per section, validated on build.
+"""v6 config schema (Â§4): one frozen dataclass per section, validated on build.
 
 Every field has a default. Errors name the full key path (the loader builds
 through core.guofish_net.strict.from_dict_strict). Cross-section rules live in
@@ -47,7 +47,8 @@ def _unit(path, v, lo_open=False):
 @dataclass(frozen=True)
 class RunConfig:
     name: str = "v6-base"
-    seed: int = 20260924
+    data_seed: int = 20260924     # sampler order and mirror flags
+    init_seed: int = 20260924     # weights (keyed per parameter name) and the dropout stream
     out_root: str = "models/v6"
 
     def __post_init__(self):

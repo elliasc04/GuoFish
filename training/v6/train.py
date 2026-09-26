@@ -1,4 +1,4 @@
-"""v6 trainer (§8-§10).
+"""v6 trainer (Â§8-Â§10).
 
     python -m training.v6.train --config training/v6/config/configs/base.yaml \
         [--set a.b=c ...] [--resume latest|<ckpt>]
@@ -108,7 +108,7 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     shards = ShardSet(resolve(cfg.data.corpus), cfg.data.split, manifest_path)
     strata = np.asarray(load_strata(strata_path, len(shards), hashes["corpus_manifest_sha256"]))
     grouped = cfg.mixture.groups != "natural"
-    mixture = Mixture(cfg.mixture, len(shards), cfg.optim.micro_batch, cfg.run.seed,
+    mixture = Mixture(cfg.mixture, len(shards), cfg.optim.micro_batch, cfg.run.data_seed,
                       strata=strata if grouped else None,
                       members_dir=run_dir / "mixture" if grouped else None)
     t = cfg.targets
@@ -116,7 +116,7 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     if t.policy_soft.source == "stored" and "epsilon" in man and man["epsilon"] != t.policy_soft.epsilon:
         raise SystemExit(f"stored targets were built with epsilon {man['epsilon']}, "
                          f"config says {t.policy_soft.epsilon}")
-    builder = BatchBuilder(cfg.model.token_scheme, t.mirror_prob, cfg.run.seed,
+    builder = BatchBuilder(cfg.model.token_scheme, t.mirror_prob, cfg.run.data_seed,
                            t.policy_soft.epsilon, t.policy_soft.temperature)
     eff, accum = cfg.optim.effective_batch, cfg.optim.accum
     sched = Schedule(cfg.schedule, cfg.optim.lr, eff)
@@ -128,8 +128,8 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     quick_idx = quick_subset(frozen.codes, cfg.eval.quick_size, cfg.eval.quick_seed)
 
     # ---- model / optimizer / resume -----------------------------------
-    torch.manual_seed(cfg.run.seed)
-    model = build_model(cfg.model).to(dev)
+    torch.manual_seed(cfg.run.init_seed)            # dropout (and v5_deepcopy's init draws)
+    model = build_model(cfg.model, cfg.run.init_seed).to(dev)
     opt = build_optimizer(model, cfg.optim, sched.lr(0))
     ema = EMA(model, cfg.ema.half_life_samples, eff) if cfg.ema.enabled else None
     loss_fn = LossFn(cfg, norms, dev)

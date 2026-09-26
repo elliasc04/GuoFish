@@ -2,7 +2,7 @@
 # Source of every value: training/v5_multiPV/configs/corpus90m.yaml plus the
 # recon report (OneCycleLR's default cycle_momentum=True, 0.85/0.95, H4).
 extends: base.yaml
-run:   {name: v6-v5compat, seed: 20260802}
+run:   {name: v6-v5compat, data_seed: 20260802, init_seed: 20260802}
 model: {dropout: 0.1, init: v5_deepcopy}
 data:
   corpus: data/processed/multipv_90m

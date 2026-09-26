@@ -1,0 +1,5 @@
+# Production and screening shape (capacity campaign, brief of 2026-09-26).
+extends: ../base.yaml
+run:   {name: v6-d384x10}
+model: {d_model: 384, n_layers: 10, n_heads: 6, d_ff: 1536}
+optim: {micro_batch: 512, accum: 2}

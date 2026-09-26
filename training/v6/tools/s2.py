@@ -47,8 +47,8 @@ RUNS = {
     "ref": PY + ["training/v5_multiPV/train_v5.py", "--config", "training/v5_multiPV/configs/corpus90m.yaml",
                  "--epochs", "1", "--max-steps", str(STEPS), "--no-h2h-gate", "--gap-probe", "0",
                  "--seed", "20260802", "--out-dir", "models/v6/s2/ref", "--run-name", "ref"],
-    "c1": V6 + ["run.name=c1", "run.seed=20260802"],
-    "c2": V6 + ["run.name=c2", "run.seed=20260925"],
+    "c1": V6 + ["run.name=c1", "run.data_seed=20260802", "run.init_seed=20260802"],
+    "c2": V6 + ["run.name=c2", "run.data_seed=20260925", "run.init_seed=20260925"],
 }
 assert SAMPLES == STEPS * 1024
 # Training-loss window: the last 21 v6 log rows (log_every 50; 58,594 = 1,171 x 50 + 44),

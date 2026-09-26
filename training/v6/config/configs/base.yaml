@@ -1,6 +1,6 @@
 # v6 base config (§4). Values are starting points; §13 says which ones screening sets.
 # Paths are checked at run start, not at load, so any config resolves and hashes anywhere.
-run:      {name: v6-base, seed: 20260924, out_root: models/v6}
+run:      {name: v6-base, data_seed: 20260924, init_seed: 20260924, out_root: models/v6}
 model:
   d_model: 384
   n_layers: 6

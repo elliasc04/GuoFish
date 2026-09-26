@@ -59,7 +59,7 @@ def main(argv=None) -> int:
         return 0
 
     args.out.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(cfg.run.seed)
+    torch.manual_seed(cfg.run.init_seed)
     run()                                                      # compile + warm-up
     torch.save({"model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                 "rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all()}},

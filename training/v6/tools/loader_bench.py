@@ -38,10 +38,10 @@ def main(argv=None) -> int:
     cfg = load_config(args.config, args.set)
     shards = ShardSet(resolve(cfg.data.corpus), cfg.data.split, resolve(cfg.data.manifest))
     strata = np.asarray(load_strata(resolve(cfg.data.strata), len(shards)))
-    mixture = Mixture(cfg.mixture, len(shards), cfg.optim.micro_batch, cfg.run.seed,
+    mixture = Mixture(cfg.mixture, len(shards), cfg.optim.micro_batch, cfg.run.data_seed,
                       strata=strata, members_dir=args.members_dir)
     t = cfg.targets
-    builder = BatchBuilder(cfg.model.token_scheme, t.mirror_prob, cfg.run.seed,
+    builder = BatchBuilder(cfg.model.token_scheme, t.mirror_prob, cfg.run.data_seed,
                            t.policy_soft.epsilon, t.policy_soft.temperature)
     n_micro = 10 ** 7
     loader = torch.utils.data.DataLoader(
