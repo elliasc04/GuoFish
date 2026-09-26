@@ -29,12 +29,6 @@ from training.v6.data.reader import ShardSet
 from training.v6.train import resolve  # also sets the Triton kernel-name fix
 
 
-def forward(cfg, model, tokens):
-    fn = torch.compile(model.forward_train, mode=cfg.system.compile_mode)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        return fn, lambda: fn(tokens)
-
-
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -53,7 +47,8 @@ def main(argv=None) -> int:
     def run():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = fn(tokens)
-        return torch.cat([out["policy_logits"].float().flatten(), out["value"].float().flatten()]).cpu()
+        return torch.cat([out["policy_logits"].float().flatten(),
+                          out["value"].float().flatten()]).detach().cpu()
 
     if args.child:
         st = torch.load(args.out / "state.pt", weights_only=True)
