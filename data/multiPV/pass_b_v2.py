@@ -318,6 +318,14 @@ def _unroll(root: chess.Board, line: list, first: chess.Move, raw_cp: int, vdept
     return out
 
 
+def splitmix64_np(x: np.ndarray) -> np.ndarray:
+    """pass_b_convert._splitmix64 over a uint64 array (numpy wraps mod 2**64)."""
+    x = x.astype(np.uint64) + np.uint64(0x9E3779B97F4A7C15)
+    z = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return z ^ (z >> np.uint64(31))
+
+
 def convert_batch(task):
     lines, cfg = task
     stats: Counter = Counter()
@@ -493,17 +501,25 @@ def main(argv=None) -> int:
         staging.close()
 
     # ---- derived dedup post-pass ---------------------------------------
+    # Lean on RAM, because it runs beside a trainer: drop the selection, look
+    # roots up by searchsorted in the sorted unique keys (np.isin would sort
+    # roots + derived together) and route with a vectorised splitmix64.
+    n_selected = int(len(selected))
+    del selected
     rk = np.unique(np.frombuffer(root_keys, dtype=np.uint64))
+    del root_keys
     dk = np.frombuffer(d_keys, dtype=np.uint64)
-    dup_root = np.isin(dk, rk)
+    dup_root = rk[np.minimum(np.searchsorted(rk, dk), len(rk) - 1)] == dk if len(rk) else np.zeros(len(dk), bool)
+    del rk
     first = np.zeros(len(dk), dtype=bool)
     first[np.unique(dk, return_index=True)[1]] = True
     keep = ~dup_root & first
     stats["derived_dropped_root_duplicate"] = int(dup_root.sum())
     stats["derived_dropped_derived_duplicate"] = int((~dup_root & ~first).sum())
     d_val_a = np.frombuffer(d_val, dtype=np.uint8).astype(bool)
-    d_route = np.array([_splitmix64(((ln << 3) | k) ^ cfg["derived_seed"])
-                        for ln, k in zip(d_line, d_k)], dtype=np.uint64)
+    d_route = splitmix64_np(((np.frombuffer(d_line, dtype=np.int64).astype(np.uint64) << np.uint64(3))
+                             | np.frombuffer(d_k, dtype=np.uint8).astype(np.uint64))
+                            ^ np.uint64(cfg["derived_seed"]))
     shard_of = np.where(d_val_a, d_route % np.uint64(nvd), d_route % np.uint64(nt)).astype(np.int64)
     vd_paths = [args.out_dir / shard_name("valderived", i) for i in range(nvd)]
     vd_handles = [open(p, "wb") for p in vd_paths]
@@ -551,7 +567,7 @@ def main(argv=None) -> int:
         "rate_plan": plan, "tier_min_depth": {"old": floor["value_min_depth"],
                                               "new": args.value_min_depth},
         "floor_manifest": str(args.floor_manifest), "nesting": nesting,
-        "selection_scope": nesting["scope"], "selected_lines": int(len(selected)),
+        "selection_scope": nesting["scope"], "selected_lines": n_selected,
         "selected_counts": sel_counts,
         "derived": {"max_ply": args.max_ply, "rate": args.derived_rate,
                     "min_remaining_depth": args.derived_min_depth},

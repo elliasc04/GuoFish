@@ -302,3 +302,14 @@ def test_frozen_rematerialisation_s6(synth):
     parts[0]["value_cp"][0] += 1
     bad = verify(parts, synth["tmp"] / "frozen_v1")
     assert not bad["passed"] and bad["field_mismatches"]["value_cp"] == 1
+
+
+def test_vectorised_derived_routing_matches_scalar():
+    from pass_b_v2 import DERIVED_STREAM, splitmix64_np
+    rng = np.random.default_rng(3)
+    lines = rng.integers(0, 394_669_566, 20_000)
+    ks = rng.integers(1, 3, 20_000)
+    seed = SEED ^ DERIVED_STREAM
+    want = [_splitmix64(((int(ln) << 3) | int(k)) ^ seed) for ln, k in zip(lines, ks)]
+    got = splitmix64_np(((lines.astype(np.uint64) << np.uint64(3)) | ks.astype(np.uint64)) ^ np.uint64(seed))
+    assert got.tolist() == want
