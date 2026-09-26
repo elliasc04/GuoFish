@@ -361,3 +361,172 @@ This brief changes the doc in two places, recorded here rather than edited into 
   frozen90 KL and 2.31% on MSE, from one seed pair.
 - **G2's criterion needs replacing** (proposal in the S2 report). On GPU, uninterrupted runs
   are not reproducible at 1e-3 per step. `rng_check` shows the resume path itself is exact.
+
+## Brief of 2026-09-26 — screening pass (Phases 2–3) at d384×10
+
+The brief (`docs/capacity/screening_pass.md`) supersedes the doc on six points. They are
+recorded here and not edited into the doc:
+1. **Shape d384×10**, with 6 heads, d_ff 1536 and micro-batch 512 × 2 (`configs/shapes/d384x10.yaml`).
+2. **A2 (learning rate) dropped.** Peak LR stays 3.5e-4.
+3. **G2 amended and PASS.** `GPU_TODO.md` G2 carries the new criterion and its evidence.
+4. **Phase 2 on corpus v2, `in_90m` roots only** (the `base90` group). That group is exactly
+   90,076,117 records, measured against the train strata.
+5. **Paired-seed decision rules** (§4 of the brief), implemented in `tools/screen.py`.
+6. **Proxy EMA half-life 2M samples.**
+
+### H1 — data and init seeds; name-keyed init
+
+- **`run.seed` is gone.** `run.data_seed` drives the sampler and mirror flags;
+  `run.init_seed` drives the weights. An old `run.seed` key is a hard error (unknown key).
+  - **`v5_compat.yaml`** sets both seeds to 20260802, so S2's `c1` resolves as before.
+  - **`s2.py`** passes both seeds.
+- **Independent init is keyed per parameter.** Each Linear/Embedding weight and
+  `pos_embedding` draws N(0, 0.02) from its own `torch.Generator`. The generator is seeded
+  from sha256(`"<init_seed>:<parameter name>"`), keeping 63 bits. The residual 1/√(2L)
+  scaling, the zero biases, and the LayerNorm ones/zeros are unchanged.
+  - **What the old stream did:** consecutive draws from the global RNG, so adding a module
+    shifted every later tensor.
+  - **What it gives now:** a paired arm starts from its reference's exact weights under
+    every shared name and shape. Tested for plain, static, smolgen and flatten-head d384×10.
+- **`build_model` leaves the global RNG where it was** for independent init. It builds
+  under `torch.random.fork_rng`, because the module constructors still draw PyTorch's
+  default inits before they are overwritten.
+  - **Consequence:** the dropout stream starts at `torch.manual_seed(init_seed)` whatever
+    the architecture.
+  - **Also fixed:** building the EMA eval model at a full eval no longer moves the dropout
+    stream. Before, a resume across a stable checkpoint could shift later dropout masks.
+- **Dropout draws from the global RNG seeded with `init_seed`.** The brief assigns dropout
+  to neither seed, and init was the closer fit. With one seed pair on every arm, the choice
+  does not matter for pairing.
+- **`init: v5_deepcopy` is untouched.** It still draws from the global RNG and ignores `init_seed`.
+- **`build_model(cfg, init_seed=0)`:** callers that load weights afterwards (EMA model,
+  `score.py`, export, `load_for_inference`) keep the default.
+
+### H2 — one OpenBLAS thread in the trainer
+
+- **`train.py` sets `OPENBLAS_NUM_THREADS=1` (setdefault) before importing numpy.** It covers
+  the trainer process, every DataLoader worker (they inherit the environment), and
+  `bench.py` / `s3_check.py`, which import `train.py`. Nothing on these paths calls BLAS.
+- **Measured** (`test_trainer_workers_run_one_blas_thread`): a spawned worker holds
+  **1,280 → 881 MiB** private, a **399 MiB** drop. That is ≈ 3.2 GB at 8 workers,
+  against the corpus report's ~4 GB estimate. The batches are byte-identical.
+
+### H3 — named eval sets
+
+- **`data/processed/evalsets/<name>.json`, built by `tools/build_evalsets.py`.** The records
+  stay in their corpus. Each sidecar pins:
+  - every shard's sha256 (the v2 manifest has no per-shard hashes);
+  - the manifest's sha256;
+  - the strata sidecar, checked against that manifest.
+
+  `eval.load_evalset` refuses a changed shard. An existing sidecar is never overwritten.
+- **Three sets:**
+  - `frozen90` → `val_frozen_90m_v2` (452,405);
+  - `v2val_roots` → corpus v2 `val` (571,232: 458,771 old tier + 112,461 new tier);
+  - `v2val_derived` → `valderived` (161,340; 126,615 old + 34,725 new tier).
+
+  The counts match the corpus report.
+- **`frozen90` means the v2 copy from now on.** Every field it shares with v1 is
+  byte-identical (S6), and it adds `hard_move` for the hard-label metrics. `score.py`'s
+  `--v5-crosscheck` still hands v5's `score_baseline` the v1 copy, which v5's dataset can read.
+- **New eval slice `tier/{old,new,v1}/{n,policy_kl,value_mse}`.** It serves B0: new-tier
+  positions are 20% of `v2val_roots`, and the aggregate would dilute them.
+- **Trainer wiring: `eval.extra_sets`** (default `[]`).
+  - Each named set is evaluated for raw and EMA at every full eval.
+  - Results are logged as `full_eval` events with `set=<name>`; frozen90 events now carry
+    `set=frozen90`.
+  - Extra sets never decide `best.pt`.
+  - The proxy keeps the list empty: `screen.py` scores all three sets with `score.py`, and
+    running them in the trainer too would repeat ~3 min of GPU per run.
+- **`score.py` rewrite:**
+  - `--weights raw|ema` and `--sets`;
+  - it uses the model's own token scheme (it used to hard-code `v5_68`, which would have
+    mis-scored A9);
+  - it builds the model from the checkpoint's `model` section only, so checkpoints written
+    before H1 still load;
+  - its output nests every metric under `sets`, and keeps the first set's headline keys at
+    the top level for `s2.py`;
+  - NaN is written as null.
+
+### H4 — queue driver (`tools/screen.py`, `training/v6/screen_queue.yaml`)
+
+- **Arms compose.** An entry's `set` is applied on top of its `base` arm's full override
+  list (default: the current best), and the arm is judged against `ref` (default: its base).
+  The whole chain is stored in each ledger row, so a later arm reproduces any adoption.
+- **The key is `base`, not the first draft's `on`.** YAML 1.1 reads `on:` as the boolean
+  `True`, and the queue test caught it. `load_queue` now refuses any unknown key.
+- **The driver process imports no torch** (measured: 1.28 GB private with the config and
+  torch loaded). It sits idle for days, so config resolution runs in a
+  `screen.py resolve` subprocess, like training, scoring and fwd_cost.
+- **§4 as implemented:**
+  - Δ is relative to the reference, positive is better.
+  - Calibration r = |A0r − A0| / A0 on frozen90, per metric and weight set.
+  - Primary weights are whichever of raw and EMA gives A0 the lower frozen90 total.
+  - Floors: f_KL = max(r_KL, 0.25%) and f_MSE = max(r_MSE, 1.7%). PV-restricted KL gets
+    its own floor, max(r_PVKL, 0.25%).
+  - Adoption uses the brief's two-branch rule. An architecture arm's 100·ΔKL must also
+    exceed its required gain.
+  - Anything else keeps the reference. For every arm in this queue, the reference is also
+    the cheaper option on a tie.
+- **Hard-label arms use PV metrics.** Any arm training hard labels (`policy_hard.weight > 0`,
+  which covers B1–B3 and a confirmation of a recipe with hard labels) is judged on
+  PV-restricted KL and MSE. Top-1 vs SF's best move (`sf_top1_hard`) is reported as Δ but
+  not gated, because the brief sets no floor for it.
+- **Confirmation (§3.4).** The rule is applied per primary metric on which the recipe gained
+  at seed s: its seed-t Δ against A0t must be positive and at least half the seed-s Δ.
+  Metrics the recipe did not gain on at s are reported but not gated.
+- **B0 keeps the adopted mixture and widens its pool** from the 90M roots to all v2 roots.
+  If A8 is not adopted, that is the brief's natural mixture over roots. If A8 is adopted,
+  its 0.75 / 0.25 policy / value-only split is kept over all roots. Dropping A8 there would
+  change two things at once. The queue has both variants, selected by `only_if`.
+- **A8's groups:**
+  - `policy90` = `{in_90m: 1, origin: root, label: multipv}`;
+  - `vonly90` = `{…, label: [hard_only, value_only]}`.
+
+  "Value-only" means no policy; with 100% `hard_move` coverage those rows are all `hard_only`.
+- **The queue pauses after B1b** (`phase3_review`), which creates HOLD. The pre-registered rules
+  do not settle three things on their own:
+  - B2 runs only if B1's best lost PV-restricted KL;
+  - B3 needs B1's best `w_hard`, which may belong to an arm that was not adopted;
+  - B4's shares depend on the mixture current at the time.
+
+  Writing those as queue logic was more machinery than a review costs. The confirmation
+  entries (A0t, Ct) are already queued after the pause.
+- **After scoring**, the driver deletes the rolling checkpoints and `best.pt` (a duplicate
+  of one weight set) and keeps the final `ckpt/s60000256.pt`, which holds raw, EMA and
+  optimizer state. Mixture member lists (`mixture/*.npy`, 360 MB per run) are left in place;
+  the brief's disk rule covers checkpoints only.
+- **Stop conditions** each write `runs/screening/STOP`, and the driver will not relaunch
+  while that file exists:
+  - an anomaly event or non-finite step (checked after every attempt, and never restarted);
+  - an arm failing its restarts;
+  - a failed score or fwd_cost;
+  - C: below 25 GB;
+  - calibration r_KL > 0.5%;
+  - an arm reached before calibration exists.
+- **`system.allow_dirty: true` in `proxy.yaml`.** The tree carries untracked files that are
+  not this work's (`benchmarking/…`, `after_s2.py`). Provenance lists them and `code.patch`
+  holds the tracked diff, as in S2.
+
+### H5 — `tools/fwd_cost.py`
+
+- **Method = the campaign's A1:**
+  - the forward is compiled with Inductor in default mode and captured as one CUDA graph
+    per batch size;
+  - bf16 autocast, with 20 warm-up and 200 timed replays;
+  - batch sizes 24 and 128, on real frozen-val positions in each model's token scheme;
+  - random keyed weights.
+
+  The two engine Inductor settings (static launcher off, pointwise autotune off) are
+  restated from `playing/v6/graphs.configure_inductor`, not imported, because that module
+  imports the C++ core at the top.
+- **Interleaved timing.** Plain d384×10, the arm and its reference are timed in one process,
+  interleaved over 5 rounds, and the median is kept.
+- **Conversion = the campaign's A4 exchange, not a bare log₂:**
+  - required gain = log₂(1 + f(r − 1)) × 6.50% KL, with f = 0.908 (the GPU-bound share)
+    and r the batch-24 ratio;
+  - it reproduces A4's +4.21% for d384×10 (r = 1.624);
+  - a bare log₂ would overstate small costs by about 10%.
+- **Marginal cost is what gates.** The verdict uses the arm against its reference; the ratio
+  against plain d384×10 is reported alongside. If an earlier architecture change was
+  adopted, the reference already carries its cost.

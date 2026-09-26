@@ -46,7 +46,20 @@ python -m training.v6.train --config training/v6/config/configs/v5_compat.yaml -
 python -c "import json,statistics as s; r=[json.loads(l) for l in open('models/v6/g1_d384x6_500/logs/train.jsonl')]; st=[x for x in r if x['event']=='step' and x['step']>100]; print('samples/s', s.median(x['samples_per_s'] for x in st), 'wait', max(x['loader_wait_frac'] for x in st), 'vram', max(x['peak_vram_mib'] for x in st))"
 ```
 
-## G2 — S3 on GPU (bf16 + compile)
+## G2 — S3 on GPU (bf16 + compile): **PASS** under the amended criterion (brief of 2026-09-26)
+
+**Amended criterion.** The per-step 1e-3 bar below cannot hold on bf16 + compile, because
+two *uninterrupted* runs already diverge (backward atomics). G2 now passes when both of these hold:
+1. the resumed run's divergence from the uninterrupted run is no larger than the divergence
+   between two uninterrupted runs;
+2. `tools/rng_check.py`, which restores the CUDA RNG under compiled dropout, is bit-identical.
+
+**Evidence** (S2_REPORT.md, G2 section), with stream digests identical on all 307 compared steps:
+1. The resumed segment peaks at 1.1% relative per-step loss difference. The same run's
+   uninterrupted first 157 steps had already diverged from run A by 5.4%.
+2. `rng_check` was bit-identical: max |Δ| 0.0 over 2,097,664 outputs.
+
+The original command and bar are kept below for reference.
 
 ```powershell
 python -m training.v6.tools.s3_check --config training/v6/config/configs/v5_compat.yaml `
