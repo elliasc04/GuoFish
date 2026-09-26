@@ -202,6 +202,14 @@ SHIP_AFFINITY = "none"
 # move to buy margin over a ceiling that three uncensored arms put near 50.
 ARENA_NODES_PER_SIM = 75
 
+# cutechess's engine timeouts, scaled. tuning/DEFECTS.md D-5: the first `isready`
+# (model load + Inductor compile + graph capture) takes ~14.5 s, AT cutechess's
+# ping timeout; an engine that misses it is killed and cutechess then hangs
+# forever (T-3). A3 lost a block to exactly that on 2026-09-23, twice, during
+# PCIe error storms that slowed startup. 100x makes loading effectively
+# unbounded; `run_match`'s stall watchdog is what catches a dead engine.
+ENGINE_TSCALE = 100
+
 
 def arena_for(budget: int) -> int:
     """The arena a fixed-node arm at `budget` sims is given.
@@ -1227,7 +1235,7 @@ def build_match_command(arms: tuple[EngineArm, EngineArm], out_dir: Path, *,
                         rounds: int, concurrency: int, event: str,
                         adjudicate: bool, sprt: Optional[str],
                         maxmoves: int, opening_plies: int,
-                        timemargin: int) -> list[str]:
+                        timemargin: int, opening_start: int = 1) -> list[str]:
     """The cutechess-cli invocation, as a list — no shell quoting to get wrong.
 
     THE HOUSE SYNTAX, from tools/smoke_c11.py and the v5 A/B command line:
@@ -1258,10 +1266,15 @@ def build_match_command(arms: tuple[EngineArm, EngineArm], out_dir: Path, *,
             command += ["tc=inf", f"nodes={arm.nodes}", f"timemargin={timemargin}"]
         else:
             command += [f"tc={arm.tc}"]
-        command += [f"stderr={out_dir / (arm.name + '.stderr.log')}"]
+        command += [f"stderr={out_dir / (arm.name + '.stderr.log')}",
+                    f"tscale={ENGINE_TSCALE}"]
 
     command += ["-openings", f"file={OPENINGS}", "format=pgn",
                 "order=sequential", f"plies={opening_plies}"]
+    # A block-wise match (tools/capacity_campaign.py) plays openings N..N+k in a
+    # later invocation; without this every block would replay openings 1..k.
+    if opening_start > 1:
+        command.append(f"start={opening_start}")
     if adjudicate:
         command += ["-resign", "movecount=3", "score=600",
                     "-draw", "movenumber=40", "movecount=8", "score=10"]
@@ -1309,7 +1322,15 @@ def supersede_previous(out_dir: Path, event: str) -> Optional[Path]:
     return attic
 
 
-def run_match(command: list[str], out_dir: Path, event: str) -> tuple[int, Path]:
+STALLED = -9   # run_match's return code when the stall watchdog killed the match
+
+
+def run_match(command: list[str], out_dir: Path, event: str,
+              stall_seconds: Optional[float] = None) -> tuple[int, Path]:
+    """`stall_seconds`: kill the match tree after that long with no cutechess
+    output. cutechess 1.4 waits forever on an engine that dies during startup
+    (the PCIe fault did this on 2026-09-23 and cost 12 h); None keeps the old
+    behaviour."""
     out_dir.mkdir(parents=True, exist_ok=True)
     supersede_previous(out_dir, event)
     log_path = out_dir / f"{event}.cutechess.log"
@@ -1322,19 +1343,38 @@ def run_match(command: list[str], out_dir: Path, event: str) -> tuple[int, Path]
     # the case where cutechess is stuck starting an engine and emits nothing at
     # all. `games` counts the score lines so the heartbeat can say how far in.
     games = 0
+    last_output = [time.monotonic()]
+    stalled = threading.Event()
+
+    def watchdog(proc) -> None:
+        while proc.poll() is None:
+            time.sleep(min(30.0, stall_seconds / 4))
+            if time.monotonic() - last_output[0] > stall_seconds and proc.poll() is None:
+                stalled.set()
+                log(f"    !! {event}: no cutechess output for {_hms(stall_seconds)}; "
+                    f"killing the match tree")
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               capture_output=True)
+                return
+
     with log_path.open("w", encoding="utf-8", errors="replace", newline="\n") as sink:
         with Heartbeat(event):
             proc = subprocess.Popen([str(c) for c in command], stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True,
                                     encoding="utf-8", errors="replace",
                                     cwd=str(REPO_ROOT), bufsize=1)
+            if stall_seconds:
+                threading.Thread(target=watchdog, args=(proc,), daemon=True).start()
             for line in proc.stdout:
+                last_output[0] = time.monotonic()
                 sink.write(line)
                 if line.startswith("Score of") or "SPRT" in line:
                     if line.startswith("Score of"):
                         games += 1
                     log(f"      [{games}] {line.rstrip()}")
             code = proc.wait()
+    if stalled.is_set():
+        code = STALLED
     log(f"    {event} exited {code} after {_hms(time.perf_counter() - started)} "
         f"({games} score lines)")
     return code, log_path
@@ -1504,13 +1544,15 @@ def arm_fallback_moves(out_dir: Path, arms: tuple[EngineArm, EngineArm]) -> dict
 
 def play(arms: tuple[EngineArm, EngineArm], out_dir: Path, *, event: str,
          rounds: int, concurrency: int, adjudicate: bool, sprt: Optional[str],
-         args) -> dict:
+         args, opening_start: int = 1,
+         stall_seconds: Optional[float] = None) -> dict:
     command = build_match_command(
         arms, out_dir, rounds=rounds, concurrency=concurrency, event=event,
         adjudicate=adjudicate, sprt=sprt, maxmoves=args.maxmoves,
-        opening_plies=args.opening_plies, timemargin=args.timemargin)
+        opening_plies=args.opening_plies, timemargin=args.timemargin,
+        opening_start=opening_start)
     clock_before = sm_clock_mhz()
-    code, log_path = run_match(command, out_dir, event)
+    code, log_path = run_match(command, out_dir, event, stall_seconds=stall_seconds)
     result = parse_result(log_path, sprt_requested=bool(sprt))
     telemetry = {arm.name: parse_delivered(out_dir / f"{arm.name}.stderr.log")
                  for arm in arms}
@@ -1525,7 +1567,10 @@ def play(arms: tuple[EngineArm, EngineArm], out_dir: Path, *, event: str,
         # "corrupted" is deliberately NOT one of SuiteState.done()'s terminal
         # statuses, so the cell is written for diagnosis but re-runs rather than
         # being treated as a measurement.
+        # A stalled match is never "ok", even with some games in its PGN: a
+        # block that stopped part-way is not the block it claims to be.
         "status": ("corrupted" if fallback["total"]
+                   else "stalled" if code == STALLED
                    else "ok" if result.get("games") else "failed"),
         "event": event,
         "arena_capacity": {arm.name: arm.arena_capacity for arm in arms},
