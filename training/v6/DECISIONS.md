@@ -348,3 +348,16 @@ This brief changes the doc in two places, recorded here rather than edited into 
 - **The builder records `git_state` at the end, when it writes the manifest**, not at
   start. No commits were made while the build ran, so the manifest's SHA is the code that
   ran.
+
+### S2 results and analysis
+
+- **S2's training-loss window is the last 1,044 steps** (1,069,056 samples), not 1,000.
+  58,594 = 1,171 × 50 + 44, so only a multiple of v6's 50-step log rows plus the last
+  44-step row aligns exactly; that is 21 rows. The window is applied identically to v5's
+  per-micro-batch rows, which carry 0-based step numbers.
+  The first `analyze` crashed on both points. It was run by `training/v6/tools/after_s2.py`,
+  a watcher started outside this session and left uncommitted.
+- **S2 verdict and d** are in `training/v6/S2_REPORT.md`. S2 passes. d is 0.97% relative on
+  frozen90 KL and 2.31% on MSE, from one seed pair.
+- **G2's criterion needs replacing** (proposal in the S2 report). On GPU, uninterrupted runs
+  are not reproducible at 1e-3 per step. `rng_check` shows the resume path itself is exact.

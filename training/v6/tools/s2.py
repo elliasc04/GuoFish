@@ -20,7 +20,7 @@ output; a missing one is produced first by scoring the run's final checkpoint
 on the GPU, ref with --v5-crosscheck) and prints the S2 table: frozen90 policy KL / value MSE / top-1,
 d = |c1 - c2| per metric (also relative to their mean), the pass rule (ref
 within [min(c1, c2) - d, max(c1, c2) + d] on KL and MSE), training KL + MSE
-over the final 1,024,000 samples (last 1,000 steps; count-weighted),
+over the final 1,069,056 samples (last 1,044 steps = 21 v6 log rows; count-weighted),
 median samples/s split by overlap with the --busy windows (Track C running),
 and the LR / beta1 traces: every logged value of all three runs against one
 torch OneCycleLR replay (v5 logs LR only).
@@ -51,6 +51,9 @@ RUNS = {
     "c2": V6 + ["run.name=c2", "run.seed=20260925"],
 }
 assert SAMPLES == STEPS * 1024
+# Training-loss window: the last 21 v6 log rows (log_every 50; 58,594 = 1,171 x 50 + 44),
+# i.e. the last 1,044 steps = 1,069,056 samples, the same steps for v5.
+WINDOW_STEPS = 1_044
 
 
 def has_checkpoint(name: str) -> bool:
@@ -95,8 +98,8 @@ def _utc(x) -> float:
 def _v5(run_dir: Path) -> dict:
     rows = [json.loads(ln) for ln in (run_dir / "logs" / "ref.jsonl").read_text().splitlines()]
     micro = [r for r in rows if r["event"] == "micro"]
-    last = micro[-2 * 1000:]
-    assert last[-1]["step"] == STEPS and last[0]["step"] == STEPS - 999
+    last = micro[-2 * WINDOW_STEPS:]          # 2 micro rows per step, logged 0-based
+    assert last[-1]["step"] == STEPS - 1 and last[0]["step"] == STEPS - WINDOW_STEPS
     kl = sum(r["policy_kl"] * r["has_policy"] for r in last) / sum(r["has_policy"] for r in last)
     mse = sum(r["value_mse"] * r["n"] for r in last) / sum(r["n"] for r in last)
     steps = [r for r in rows if r["event"] == "step" and not r.get("warmup_window")]
@@ -108,16 +111,16 @@ def _v5(run_dir: Path) -> dict:
 def _v6(run_dir: Path) -> dict:
     rows = [json.loads(ln) for ln in (run_dir / "logs" / "train.jsonl").read_text().splitlines()]
     steps = [r for r in rows if r["event"] == "step"]
-    last = [r for r in steps if r["step"] > STEPS - 1000]
-    assert last[-1]["step"] == STEPS and sum(len(r["step_losses"]) for r in last) == 1000
-    n_rows = 1000 * 1024
+    last = [r for r in steps if r["step"] > STEPS - WINDOW_STEPS]
+    assert last[-1]["step"] == STEPS and sum(len(r["step_losses"]) for r in last) == WINDOW_STEPS
+    n_rows = WINDOW_STEPS * 1024
     kl = sum(r["soft_kl"] * r["n_soft"] for r in last) / sum(r["n_soft"] for r in last)
     mse = sum(r["value_mse"] * len(r["step_losses"]) * 1024 for r in last) / n_rows
     first = {r["step"] for r in rows if r["event"] == "run_start"}
     rate = [(_utc(r["utc"]), r["samples_per_s"]) for r in steps
             if r["step"] - 50 not in {s for s in first} and r["step"] > 100]
     return {"train_kl": kl, "train_mse": mse, "train_objective": sum(
-        sum(r["step_losses"]) for r in last) / 1000, "window_samples": n_rows, "rate": rate,
+        sum(r["step_losses"]) for r in last) / WINDOW_STEPS, "window_samples": n_rows, "rate": rate,
         "lr": {r["step"]: r["lr"] for r in steps}, "beta1": {r["step"]: r["beta1"] for r in steps}}
 
 
@@ -158,8 +161,8 @@ def analyze(busy: list) -> dict:
         off = [v for t, v in r["rate"] if not any(a <= t <= b for a, b in windows)]
         out["runs"][name] = {
             "frozen90": {k: sc[k] for k in ("policy_kl", "value_mse", "policy_top1", "n", "policy_n")},
-            "step": sc["step"], "train_kl_final_1024000": r["train_kl"],
-            "train_mse_final_1024000": r["train_mse"],
+            "step": sc["step"], "train_window_samples": r["window_samples"],
+            "train_kl_final_window": r["train_kl"], "train_mse_final_window": r["train_mse"],
             "train_kl_plus_mse": r["train_kl"] + r["train_mse"],
             "samples_per_s_median_trackC_running": statistics.median(on) if on else None,
             "samples_per_s_median_trackC_idle": statistics.median(off) if off else None,
