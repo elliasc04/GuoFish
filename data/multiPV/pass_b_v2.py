@@ -40,6 +40,11 @@ import json
 import os
 import sys
 import time
+
+# One BLAS thread: numpy's OpenBLAS otherwise pre-allocates a buffer per core,
+# ~490 MB private in every process, and this module is re-imported by each
+# spawned pool worker. Nothing here uses BLAS. Must precede `import numpy`.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 from array import array
 from collections import Counter
 from pathlib import Path

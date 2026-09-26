@@ -8,6 +8,7 @@ the live corpus, H1).
 from __future__ import annotations
 
 import json
+import os
 import random
 import subprocess
 import sys
@@ -320,3 +321,7 @@ def test_builder_workers_do_not_import_torch():
     code = ("import sys; sys.path[:0] = ['data/multiPV', '.']; import pass_b_v2; "
             "assert 'torch' not in sys.modules, 'pass_b_v2 imports torch'")
     subprocess.run([sys.executable, "-c", code], cwd=REPO, check=True)
+    code = ("import os, sys; sys.path[:0] = ['data/multiPV', '.']; import pass_b_v2; "
+            "assert os.environ['OPENBLAS_NUM_THREADS'] == '1'")
+    subprocess.run([sys.executable, "-c", code], cwd=REPO, check=True,
+                   env={k: v for k, v in os.environ.items() if k != "OPENBLAS_NUM_THREADS"})
