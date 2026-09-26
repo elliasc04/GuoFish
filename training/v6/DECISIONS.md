@@ -233,3 +233,73 @@ Deviations from *GuoFish v6 Training Stack — Design* (`docs/capacity/training_
 - **`v2_index_check.py` is a new file**, not the recon's `headroom_scan.py` (which is untracked,
   in the gitignored `recon/`). It keeps that script's method, including self-checking the
   reproduced 90M selection against the manifest before reporting anything.
+
+## Brief of 2026-09-25 — corpus v2 build and S2
+
+This brief changes the doc in two places, recorded here rather than edited into it:
+**§6.4's single `policy_share` rule is superseded** by a per-tier rate plan (C1), and
+**§6.6's strata fields are extended** (C3).
+
+### C1 — per-tier selection plan (`pass_b_v2.py --rate-plan`)
+
+- **Rates are per (tier, has_policy, bucket)**, read from `data/multiPV/rate_plan_v2.json`
+  (`{tier: {label: {bucket: rate}}}`). `--target`, `--shares`, `--policy-share` and
+  `--no-spill` are gone, with the v1 rate derivation they fed. The manifest records the plan,
+  its file, its sha256, and the selected counts per tier × label × bucket.
+- **Tiers come from the Pass A index's `max_depth`.** `old` is `max_depth` ≥ the floor
+  manifest's `value_min_depth` (26). `new` is [`--value-min-depth` (24), 26). The same `u`
+  stream as v1 (`default_rng(seed)`, one draw per index row), so each cell's selection only
+  grows with its rate.
+- **Nesting is checked twice.** Before any scan, an `old` rate below the 90M manifest's rate
+  for its cell is refused. The scan then replays the 90M selection on the same draws,
+  self-checks the replay against the manifest's `selected_lines` (full index only), and
+  refuses the build if any replayed line is not selected.
+- **The plan uses the 90M manifest's full-precision rates**, not the brief's 8-decimal
+  display. Three displayed values are *below* the 90M floats: old ≤5 policy 0.11433605 <
+  0.114336054…, old ≤5 value-only 0.05731881 < 0.057318811…, old 15–27 value-only 0.29495813 <
+  0.294958134…. The nesting check would refuse those, as it should: the brief's intent is
+  "the 90M rate" in those cells. New ≤5 policy uses the same float for consistency. Against
+  the rounded value that changes the expected count by ~0.001 rows.
+- **`--dry-run`** runs the selection only and prints the counts; it writes nothing.
+  **`--manifest-copy`** also writes the manifest to `dataset_manifest_v2.json`, and refuses
+  an existing file before the build starts. **`--limit`** no longer writes an index-head file
+  into the output directory; the selection simply stops after N rows.
+- **`source_order_quantiles` is dropped** from the v2 manifest. It was v1's §7 diagnostic and
+  nothing reads it.
+
+### C2 — derived rate and provenance
+
+- **`--derived-rate 0.19`** is passed on the command line; the default stays 0.125.
+- **Provenance was already in the manifest** (`git_sha`, `dirty_files`, `diff_sha256` via
+  `ckpt.git_state`). Nothing was added.
+
+### C3 — strata definition v2
+
+- **Layout, 13 bits of the uint16:** bucket 0–1, label 2–3, value 4–5, material 6–7,
+  **origin 8–9** (root, ply1, ply2), **depth_tier 10–11** (old, new, v1), **in_90m 12**.
+  `DEFINITION.version` is 2, so `load_strata` refuses every v1 sidecar.
+- **`origin` is widened, not duplicated.** v1's `root`/`derived` became `root`/`ply1`/`ply2`.
+  "Derived" is now `origin: [ply1, ply2]`. An origin above 2 is an error: `max_ply` 2 is the
+  build.
+- **`depth_tier` is the index's `max_depth` at `src_line`**, the brief's definition. It is
+  not the record's `value_depth` (+ `origin`). The value block is the deepest block *with
+  PVs*, so a row whose deepest block is empty would be tiered differently. Derived records
+  inherit their root's tier and `in_90m`, through `src_line`. v1 records (the reader's
+  `value_depth = 0` sentinel) are tier `v1` with `in_90m = 1`.
+- **`in_90m` values are the ints 0 and 1**, because YAML 1.1 reads `yes`/`no` as booleans.
+- **`build_strata`** takes several splits per call, sharing one index context between
+  them: the 90M replay plus the `max_depth` column, about 1.5 GB. Output is named
+  `data/processed/strata/<corpus dir>_<split>.strata2.npy`, with a `.strata2.json` sidecar.
+  The old `val_frozen_90m_v1/strata_val_v1.npy` stays where it is (that directory is
+  read-only) but is now refused as stale.
+- **Mixture example.** `configs/mix_v2.yaml` is the doc's §6.7 mixture made disjoint:
+  `hard: {label: hard_only, origin: root}` and `derived: {origin: [ply1, ply2]}`. Overlap
+  stays a hard error. There were no grouped examples in `configs/` to change.
+
+### Track G — GPU smoke checks and S2
+
+- **Triton kernel names are plain** (`inductor_config.triton.descriptive_names = False` in
+  `train.py`). G1's first compile failed with `FileNotFoundError` in Triton's cache. One
+  fused kernel name was 135 characters, and the cache path came to 283 even under
+  `%USERPROFILE%\ti`. That is v5's MAX_PATH fix, tried first and not enough on its own, so
+  it was not kept. Only kernel names change.
