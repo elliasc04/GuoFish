@@ -25,13 +25,36 @@ from training.v6.data.reader import ShardSet
 sys.path.insert(0, str(REPO / "data/multiPV"))
 from extract_frozen_v2 import verify  # noqa: E402
 from pass_a_index import INDEX_DTYPE, iter_lines, scan_line  # noqa: E402
-from pass_b_convert import _splitmix64, build_selection, convert_one  # noqa: E402
+from pass_b_convert import _splitmix64, build_selection, convert_one  # noqa: E402  (the v1 "90M" build)
 from pass_b_v2 import position_key  # noqa: E402
 
 SEED = 20260802
 VAL_PERMILLE = 150
 RATES90 = ({"<=5": 0.8, "6-14": 0.7, "15-27": 0.7, ">=28": 0.7},
            {"<=5": 0.5, "6-14": 0.4, "15-27": 0.4, ">=28": 0.5})
+PLAN = {"old": {"policy": {"<=5": 0.8, "6-14": 1.0, "15-27": 0.9, ">=28": 0.7},
+                "value_only": dict(RATES90[1])},
+        "new": {"policy": {"<=5": 0.3, "6-14": 0.6, "15-27": 0.6, ">=28": 0.6},
+                "value_only": {"<=5": 0.0, "6-14": 0.2, "15-27": 0.0, ">=28": 0.0}}}
+BUCKETS = (("<=5", 0, 5), ("6-14", 6, 14), ("15-27", 15, 27), (">=28", 28, 32))
+
+
+def expected_selection(index_path, plan, seed):
+    """The tiered selection written out directly (not the builder's code):
+    one u per row from default_rng(seed); old = max_depth >= 26, new = 24-25."""
+    ix = np.fromfile(index_path, dtype=INDEX_DTYPE)
+    u = np.random.default_rng(seed).random(len(ix))
+    keep = np.zeros(len(ix), dtype=bool)
+    counts = {t: {lab: {} for lab in ("policy", "value_only")} for t in plan}
+    pol = ix["policy_depth"] >= 20
+    for t, (lo_d, hi_d) in {"old": (26, 10**6), "new": (24, 25)}.items():
+        in_t = (ix["max_depth"] >= lo_d) & (ix["max_depth"] <= hi_d) & (ix["piece_count"] <= 32)
+        for b, lo, hi in BUCKETS:
+            for lab, m in (("policy", pol), ("value_only", ~pol)):
+                k = in_t & m & (ix["piece_count"] >= lo) & (ix["piece_count"] <= hi) & (u < plan[t][lab][b])
+                counts[t][lab][b] = int(k.sum())
+                keep |= k
+    return np.flatnonzero(keep), counts
 
 
 def _random_board(rng):
@@ -148,10 +171,12 @@ def synth(tmp_path_factory):
            "selected_lines": int(len(sel90)), "n_val_shards": n_val}
     (tmp / "m90.json").write_text(json.dumps(m90))
 
+    (tmp / "plan.json").write_text(json.dumps(PLAN))
     v2 = tmp / "v2"
     cmd = [sys.executable, str(REPO / "data/multiPV/pass_b_v2.py"), "--out-dir", str(v2),
            "--source", str(dump), "--index", str(tmp / "index.bin"), "--floor-manifest",
-           str(tmp / "m90.json"), "--target", "1500", "--val-permille", str(VAL_PERMILLE),
+           str(tmp / "m90.json"), "--rate-plan", str(tmp / "plan.json"),
+           "--manifest-copy", str(tmp / "manifest_v2.json"), "--val-permille", str(VAL_PERMILLE),
            "--n-train-shards", "3", "--n-val-shards", "2", "--n-valderived-shards", "2",
            "--workers", "1", "--derived-rate", "1.0", "--max-ply", "2"]
     r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
@@ -165,17 +190,17 @@ def test_builder_s9(synth):
     cov = man["hard_move_coverage"]
     assert r.returncode == (0 if cov >= 0.99 else 3), r.stderr[-3000:]
     assert man["record_format"] == "v2" and man["value_min_depth"] == 24
-    assert man["nesting"]["prior_rows_dropped"] == 0                        # every 90M line again
+    assert man["nesting"]["floor_rows_dropped"] == 0                        # every 90M line again
+    assert man["nesting"]["floor_rows_replayed"] == len(synth["sel90"])
+    assert (synth["tmp"] / "manifest_v2.json").read_bytes() == (synth["v2"] / "manifest.json").read_bytes()
     for k in ("json_error", "no_evals"):
         assert man["rejection_histogram"].get(f"reject_{k}", 0) == 0
-    for b in RATES90[0]:                                                    # floored rates
-        assert man["bucket_sampling_rates_policy"][b] >= RATES90[0][b]
-        assert man["bucket_sampling_rates_value_only"][b] >= RATES90[1][b]
+    assert man["rate_plan"] == PLAN and man["tier_min_depth"] == {"old": 26, "new": 24}
 
-    selected = set(build_selection(synth["tmp"] / "index.bin", {
-        "value_min_depth": 24, "policy_min_depth": 20,
-        "bucket_rates_policy": man["bucket_sampling_rates_policy"],
-        "bucket_rates_value_only": man["bucket_sampling_rates_value_only"]}, SEED).tolist())
+    sel, counts = expected_selection(synth["tmp"] / "index.bin", PLAN, SEED)
+    assert man["selected_counts"] == counts and man["selected_lines"] == len(sel)
+    assert sum(counts["new"]["policy"].values()) > 0 and sum(counts["old"]["policy"].values()) > 0
+    selected = set(sel.tolist())
     assert set(synth["sel90"].tolist()) <= selected
     tr, va = ShardSet(synth["v2"], "train"), ShardSet(synth["v2"], "val")
     vd = ShardSet(synth["v2"], "valderived", synth["v2"] / "manifest.json")
@@ -184,6 +209,8 @@ def test_builder_s9(synth):
     derived = np.concatenate([rt[rt["origin"] > 0], rd])
     assert (rv["origin"] == 0).all() and (rd["origin"] > 0).all()           # derived never in val_*
     assert man["roots"] == len(roots) and len(derived) > 100
+    assert {int(x) for x in roots["src_line"]} <= selected                  # roots come from the plan
+    assert man["roots"] + sum(man["rejection_histogram"].values()) == len(sel)
 
     # planted hard-move failures are counted by reason, on the selected lines only
     fails = man["hard_move_failures"]
@@ -220,7 +247,39 @@ def test_builder_s9(synth):
 
 def test_builder_refuses_existing_out_dir(synth):
     r = subprocess.run(synth["cmd"], cwd=REPO, capture_output=True, text=True)
+    assert r.returncode != 0 and "refusing" in r.stderr
+    cmd = list(synth["cmd"])
+    cmd[cmd.index("--manifest-copy") + 1] = str(synth["tmp"] / "unused_copy.json")
+    r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     assert r.returncode != 0 and "refusing (H1)" in r.stderr
+
+
+def _dry(synth, plan):
+    (synth["tmp"] / "dry_plan.json").write_text(json.dumps(plan))
+    cmd = [sys.executable, str(REPO / "data/multiPV/pass_b_v2.py"), "--dry-run",
+           "--source", str(synth["tmp"] / "dump.jsonl.zst"), "--index", str(synth["tmp"] / "index.bin"),
+           "--floor-manifest", str(synth["tmp"] / "m90.json"), "--rate-plan",
+           str(synth["tmp"] / "dry_plan.json")]
+    return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+
+
+def test_dry_run_counts_and_nesting_refusal(synth):
+    r = _dry(synth, PLAN)
+    assert r.returncode == 0, r.stderr[-2000:]
+    out = json.loads(r.stdout)
+    assert out["selected_counts"] == expected_selection(synth["tmp"] / "index.bin", PLAN, SEED)[1]
+    assert out["nesting"]["floor_rows_dropped"] == 0
+    # an old-tier rate a hair below its 90M cell (the 8-decimal rounding case) is refused
+    low = json.loads(json.dumps(PLAN))
+    low["old"]["value_only"]["15-27"] = RATES90[1]["15-27"] - 1e-9
+    r = _dry(synth, low)
+    assert r.returncode != 0 and "break nesting" in r.stderr
+    assert "('value_only', '15-27'" in r.stderr
+    # a new-tier rate may be anything in [0, 1]; a missing cell is a shape error
+    bad = json.loads(json.dumps(PLAN))
+    del bad["new"]["value_only"][">=28"]
+    r = _dry(synth, bad)
+    assert r.returncode != 0 and "rate plan must be" in r.stderr
 
 
 def test_frozen_rematerialisation_s6(synth):

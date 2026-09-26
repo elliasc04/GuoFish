@@ -1,16 +1,20 @@
 """Corpus v2 builder (v6 design doc §6.1-6.4). pass_b_convert.py (v1) is left as is.
 
-    python data/multiPV/pass_b_v2.py --out-dir data/processed/multipv_v2 [--limit 200000]
+    python data/multiPV/pass_b_v2.py --rate-plan data/multiPV/rate_plan_v2.json         --out-dir data/processed/multipv_v2 [--limit 200000 | --dry-run]
 
 What changes from v1 (everything else - parsing, filters, labels, dedup of
 repeated PVs, val split, shard routing - is v1's code, imported, not copied):
 
   record    v2, 387 B (training/v6/data/formats.py): + value_depth, hard_move,
             origin, src_line; pv_score stored exactly as int16.
-  roots     value_min_depth 24. Per-(bucket, policy|value-only) rates are
-            derived for --target as in v1, then FLOORED at the --floor-manifest
-            (90M) rates, so every 90M line is selected again. The nesting check
-            runs before any conversion and a dropped 90M line is a hard fail.
+  roots     value_min_depth 24. Rates per (tier, policy|value-only, bucket)
+            come from --rate-plan (JSON {tier: {label: {bucket: rate}}}). Tiers
+            are the Pass A index's max_depth: old >= the --floor-manifest's
+            value_min_depth (26), new = [value_min_depth, 26). One u per index
+            row, v1's stream, so a cell's selection grows with its rate. An
+            old-tier rate below the 90M rate of its cell is refused before any
+            scan; the scan then replays the 90M selection (self-checked against
+            its selected_lines) and a dropped 90M line is a hard fail.
   hard_move first move of the value block's pvs[0].line (the block the value
             label comes from), from*64+to; -1 when missing / unparseable /
             illegal, counted by reason. Kept on policy-bearing rows too.
@@ -50,21 +54,87 @@ for p in (_ROOT, _HERE):
         sys.path.insert(0, str(p))
 
 from data.pgn_parallel import _board_to_tokens  # noqa: E402
-from feasibility_scan import (  # noqa: E402
-    BUCKETS, bucket_availability, bucket_name, coverage_ceiling, derive_rates, plan_totals,
-)
+from feasibility_scan import BUCKETS, MAX_PIECES, bucket_name  # noqa: E402
 from labels import (  # noqa: E402
     CP_CLAMP, DEFAULT_EPSILON, DEFAULT_TEMPERATURE, MAX_LEGAL, MAX_PV, VALUE_MATE_BASE,
     VALUE_MATE_MAX_DISTANCE, VALUE_SCALE, build_policy_target, move_index, select_policy_block,
     select_value_block, value_cp_is_mate, value_from_raw_cp, value_raw_cp,
 )
 from pass_a_index import INDEX_DTYPE, iter_lines  # noqa: E402
-from pass_b_convert import _splitmix64, build_selection, file_hash  # noqa: E402
+from pass_b_convert import _splitmix64, file_hash  # noqa: E402
 from record_format import shard_name  # noqa: E402
 from training.v6.ckpt import git_state  # noqa: E402
 from training.v6.data.formats import V2_DTYPE, dtype_descr  # noqa: E402
 
 DERIVED_STREAM = 0x5D1E_7E0D
+TIERS = ("old", "new")
+LABELS = ("policy", "value_only")
+
+
+def load_rate_plan(path: Path, floor: dict) -> dict:
+    """{tier: {label: {bucket: rate}}}, complete and in [0, 1]; refuses any old-tier
+    rate below the floor (90M) manifest's rate for the same cell (nesting)."""
+    plan = json.loads(path.read_text())
+    buckets = sorted(b for b, _, _ in BUCKETS)
+    shape_ok = (sorted(plan) == sorted(TIERS)
+                and all(sorted(plan[t]) == sorted(LABELS) for t in TIERS)
+                and all(sorted(plan[t][lab]) == buckets for t in TIERS for lab in LABELS))
+    if not shape_ok:
+        raise SystemExit(f"{path}: rate plan must be {{tier: {{label: {{bucket: rate}}}}}} "
+                         f"over exactly {TIERS} x {LABELS} x {buckets}")
+    bad = [(t, lab, b, r) for t in TIERS for lab in LABELS for b, r in plan[t][lab].items()
+           if not (isinstance(r, (int, float)) and 0.0 <= r <= 1.0)]
+    if bad:
+        raise SystemExit(f"{path}: rates outside [0, 1]: {bad}")
+    low = [(lab, b, plan["old"][lab][b], floor[f"bucket_sampling_rates_{lab}"][b])
+           for lab in LABELS for b in buckets
+           if plan["old"][lab][b] < floor[f"bucket_sampling_rates_{lab}"][b]]
+    if low:
+        raise SystemExit(f"{path}: old-tier rates below the floor manifest's break nesting "
+                         f"(label, bucket, plan, floor): {low}")
+    return plan
+
+
+def select_tiered(index_path: Path, plan: dict, seed: int, value_min_depth: int,
+                  policy_min_depth: int, floor: dict, limit: int = 0):
+    """-> (sorted line numbers, selected counts {tier: {label: {bucket: n}}},
+    90M rows dropped, 90M rows replayed). The u stream is build_selection's
+    (default_rng(seed), one draw per index row), so the floor manifest's
+    selection is replayed on the same draws; `limit` selects over the first N
+    rows only, which is exactly the full build's selection of those rows."""
+    ix = np.memmap(index_path, dtype=INDEX_DTYPE, mode="r")
+    n = min(len(ix), limit) if limit else len(ix)
+    old_min = floor["value_min_depth"]
+    rng = np.random.default_rng(seed)
+    counts = {t: {lab: {b: 0 for b, _, _ in BUCKETS} for lab in LABELS} for t in TIERS}
+    chunks, lost, n90 = [], 0, 0
+    for start in range(0, n, 20_000_000):
+        stop = min(start + 20_000_000, n)
+        pc = np.asarray(ix["piece_count"][start:stop])
+        md = np.asarray(ix["max_depth"][start:stop])
+        pdp = np.asarray(ix["policy_depth"][start:stop])
+        u = rng.random(stop - start)
+        legal = pc <= MAX_PIECES
+        tier = {"old": legal & (md >= old_min),
+                "new": legal & (md >= value_min_depth) & (md < old_min)}
+        has_pol = pdp >= policy_min_depth
+        keep = np.zeros(stop - start, dtype=bool)
+        keep90 = np.zeros(stop - start, dtype=bool)
+        for b, lo, hi in BUCKETS:
+            in_b = (pc >= lo) & (pc <= hi)
+            for lab, lm in (("policy", has_pol), ("value_only", ~has_pol)):
+                cell = in_b & lm
+                for t in TIERS:
+                    k = tier[t] & cell & (u < plan[t][lab][b])
+                    counts[t][lab][b] += int(k.sum())
+                    keep |= k
+                keep90 |= tier["old"] & cell & (u < floor[f"bucket_sampling_rates_{lab}"][b])
+        lost += int((keep90 & ~keep).sum())
+        n90 += int(keep90.sum())
+        chunks.append(np.flatnonzero(keep).astype(np.int64) + start)
+        del pc, md, pdp, u, legal, tier, has_pol, keep, keep90
+    del ix
+    return np.concatenate(chunks), counts, lost, n90
 
 
 def position_key(board: chess.Board) -> int:
@@ -270,7 +340,13 @@ def _require_new_dir(out_dir: Path) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--out-dir", type=Path, default=None, help="required unless --dry-run")
+    ap.add_argument("--rate-plan", type=Path, required=True,
+                    help="JSON {tier: {label: {bucket: rate}}}, tiers old/new, labels policy/value_only")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="index only: print the selection counts per tier x label x bucket, write nothing")
+    ap.add_argument("--manifest-copy", type=Path, default=None,
+                    help="also write the manifest here (must not exist; checked before the build)")
     ap.add_argument("--source", type=Path, default=_HERE / "lichess_db_eval.jsonl.zst")
     ap.add_argument("--index", type=Path, default=_HERE / "index" / "pass_a_index.bin")
     ap.add_argument("--floor-manifest", type=Path, default=_HERE / "manifests" / "dataset_manifest_90m.json",
@@ -282,11 +358,6 @@ def main(argv=None) -> int:
     ap.add_argument("--epsilon", type=float, default=DEFAULT_EPSILON)
     ap.add_argument("--cp-clamp", type=int, default=CP_CLAMP)
     ap.add_argument("--val-permille", type=int, default=5)
-    ap.add_argument("--target", type=int, default=121_100_000,
-                    help="pre-rejection root selection target (~120M roots at the 90M yield)")
-    ap.add_argument("--shares", type=str, default='{"<=5":0.01,"6-14":0.35,"15-27":0.40,">=28":0.24}')
-    ap.add_argument("--policy-share", type=float, default=0.65)
-    ap.add_argument("--no-spill", dest="spill", action="store_false")
     ap.add_argument("--max-ply", type=int, default=2, choices=range(0, 5))
     ap.add_argument("--derived-rate", type=float, default=0.125)
     ap.add_argument("--derived-min-depth", type=int, default=20)
@@ -302,43 +373,39 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if not 0.0 <= args.derived_rate <= 1.0:
         raise SystemExit("--derived-rate must be in [0, 1]")
-    for p in (args.source, args.index, args.floor_manifest):
+    for p in (args.source, args.index, args.floor_manifest, args.rate_plan):
         if not p.exists():
             raise SystemExit(f"missing {p}")
-    _require_new_dir(args.out_dir)
+    if not args.dry_run:
+        if args.out_dir is None:
+            raise SystemExit("--out-dir is required (unless --dry-run)")
+        if args.manifest_copy is not None and args.manifest_copy.exists():
+            raise SystemExit(f"{args.manifest_copy} exists; refusing to overwrite it")
+        _require_new_dir(args.out_dir)
     t_start = time.time()
 
-    # ---- selection: derive, floor, nest --------------------------------
-    shares = json.loads(args.shares)
+    # ---- selection: per-tier plan, nested in the 90M build ---------------
     floor = json.loads(args.floor_manifest.read_text())
-    avail = bucket_availability(args.index, args.value_min_depth, args.policy_min_depth)
-    r_pol_d, r_val_d, plan = derive_rates(avail, args.target, shares, args.policy_share, spill=args.spill)
-    r_pol = {b: max(r_pol_d[b], floor["bucket_sampling_rates_policy"][b]) for b, _, _ in BUCKETS}
-    r_val = {b: max(r_val_d[b], floor["bucket_sampling_rates_value_only"][b]) for b, _, _ in BUCKETS}
-    if floor["seed"] != args.seed or floor["value_min_depth"] < args.value_min_depth \
+    if floor["seed"] != args.seed or floor["value_min_depth"] <= args.value_min_depth \
             or floor["policy_min_depth"] != args.policy_min_depth:
-        raise SystemExit("floor manifest seed/depths are incompatible with nesting")
-    prior = {"manifest": str(args.floor_manifest), "value_min_depth": floor["value_min_depth"],
-             "policy_min_depth": floor["policy_min_depth"],
-             "bucket_rates_policy": floor["bucket_sampling_rates_policy"],
-             "bucket_rates_value_only": floor["bucket_sampling_rates_value_only"]}
-    sel_cfg = {"value_min_depth": args.value_min_depth, "policy_min_depth": args.policy_min_depth,
-               "bucket_rates_policy": r_pol, "bucket_rates_value_only": r_val, "prior": prior}
-    diag: dict = {}
-    sel_index = args.index
-    if args.limit:
-        # Smoke runs select over the first N index rows only: the u stream is
-        # positional (seeded from row 0), so this is exactly the full build's
-        # selection of those rows, without holding ~120M line numbers in RAM.
-        sel_index = args.out_dir / "_index_head.bin"
-        np.asarray(np.memmap(args.index, dtype=INDEX_DTYPE, mode="r")[:args.limit]).tofile(sel_index)
-    selected = build_selection(sel_index, sel_cfg, args.seed, diag=diag)
-    if args.limit:
-        sel_index.unlink()
-    print(f"selected {len(selected):,} lines; nesting vs {args.floor_manifest.name}: "
-          f"{diag['nesting']['prior_rows_dropped']:,} prior rows dropped", file=sys.stderr, flush=True)
-    if diag["nesting"]["prior_rows_dropped"]:
-        raise SystemExit("nesting broken: the floored rates drop 90M lines")
+        raise SystemExit("floor manifest seed/depths are incompatible with the tiers and nesting")
+    plan = load_rate_plan(args.rate_plan, floor)
+    selected, sel_counts, lost, n90 = select_tiered(
+        args.index, plan, args.seed, args.value_min_depth, args.policy_min_depth, floor, args.limit)
+    nesting = {"floor_manifest": str(args.floor_manifest), "scope": (
+        f"first {args.limit:,} index rows" if args.limit else "whole index"),
+        "floor_rows_replayed": n90, "floor_rows_dropped": lost}
+    print(f"selected {len(selected):,} lines in {time.time() - t_start:.0f}s; 90M replay "
+          f"{n90:,} rows, {lost:,} dropped", file=sys.stderr, flush=True)
+    if not args.limit and n90 != floor["selected_lines"]:
+        raise SystemExit(f"90M replay selected {n90:,} rows, its manifest says "
+                         f"{floor['selected_lines']:,}: the u stream is not reproduced")
+    if lost:
+        raise SystemExit(f"nesting broken: the plan drops {lost:,} 90M lines")
+    if args.dry_run:
+        print(json.dumps({"selected_lines": int(len(selected)), "selected_counts": sel_counts,
+                          "nesting": nesting, "seconds": round(time.time() - t_start, 1)}, indent=1))
+        return 0
 
     cfg = dict(value_min_depth=args.value_min_depth, policy_min_depth=args.policy_min_depth,
                temperature=args.temperature, epsilon=args.epsilon, cp_clamp=args.cp_clamp,
@@ -479,17 +546,13 @@ def main(argv=None) -> int:
         "policy_min_depth": args.policy_min_depth, "temperature": args.temperature,
         "epsilon": args.epsilon, "cp_clamp": args.cp_clamp,
         "val_split": f"sha1(fen) % 1000 < {args.val_permille}", "seed": args.seed,
-        "target": args.target, "target_shares": shares, "policy_share": args.policy_share,
-        "policy_share_spill": bool(args.spill), "bucket_available_split": avail,
-        "selection_plan": plan, "selection_plan_totals": plan_totals(plan),
-        "policy_coverage_ceiling": coverage_ceiling(avail, args.target, shares),
-        "bucket_rates_policy_derived": r_pol_d, "bucket_rates_value_only_derived": r_val_d,
-        "floor_manifest": str(args.floor_manifest),
-        "bucket_sampling_rates_policy": r_pol, "bucket_sampling_rates_value_only": r_val,
-        "nesting": diag["nesting"], "source_order_quantiles": diag["source_order_quantiles"],
-        "selection_scope": (f"first {args.limit:,} index rows (smoke)" if args.limit
-                            else "whole index"),
-        "selected_lines": int(len(selected)),
+        "rate_plan_file": str(args.rate_plan),
+        "rate_plan_sha256": hashlib.sha256(args.rate_plan.read_bytes()).hexdigest(),
+        "rate_plan": plan, "tier_min_depth": {"old": floor["value_min_depth"],
+                                              "new": args.value_min_depth},
+        "floor_manifest": str(args.floor_manifest), "nesting": nesting,
+        "selection_scope": nesting["scope"], "selected_lines": int(len(selected)),
+        "selected_counts": sel_counts,
         "derived": {"max_ply": args.max_ply, "rate": args.derived_rate,
                     "min_remaining_depth": args.derived_min_depth},
         "n_train_shards": nt, "n_val_shards": nv, "n_valderived_shards": nvd,
@@ -504,7 +567,10 @@ def main(argv=None) -> int:
         "counters": {k: v for k, v in sorted(stats.items()) if not k.startswith("reject_")},
         "seconds": round(time.time() - t_start, 1),
     }
-    (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    text = json.dumps(manifest, indent=2) + "\n"
+    (args.out_dir / "manifest.json").write_text(text)
+    if args.manifest_copy is not None:
+        args.manifest_copy.write_text(text)
     print(json.dumps({k: manifest[k] for k in ("selected_lines", "roots", "records_train",
                       "records_val", "records_valderived", "hard_move_coverage",
                       "hard_move_failures", "invariant_violation_rate", "seconds")}, indent=1))
