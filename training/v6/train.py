@@ -23,6 +23,11 @@ import os
 import time
 from pathlib import Path
 
+# One BLAS thread (H2): numpy's OpenBLAS pre-allocates a buffer per core, ~490 MB
+# private in every process that loads it. DataLoader workers inherit this
+# environment and never call BLAS; nor does this process. Must precede `import numpy`
+# to cover this process too; workers get it either way.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import numpy as np
 import torch
 import torch._inductor.config as inductor_config

@@ -65,3 +65,62 @@ def test_seed_split_reaches_sampler_and_init():
     assert (c.run.data_seed, c.run.init_seed) == (1, 2)
     with pytest.raises(Exception, match="seed"):
         load_config(CFG / "base.yaml", ["run.seed=1"])
+
+
+# ---------------------------------------------------------------- H2
+
+_WORKER_PROBE = r'''
+import hashlib, json, os, sys
+os.environ.pop("OPENBLAS_NUM_THREADS", None)
+if sys.argv[1] == "trainer":
+    import training.v6.train  # noqa: F401  (the trainer's import sets the worker environment)
+import psutil, torch
+from training.v6.config import load_config
+from training.v6.data.batch import BatchBuilder, StreamDataset
+from training.v6.data.formats import REPO
+from training.v6.data.mixture import Mixture
+from training.v6.data.reader import ShardSet
+
+
+class Probe(torch.utils.data.Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, k):
+        return self.ds[k], psutil.Process().memory_info().private
+
+
+if __name__ == "__main__":
+    cfg = load_config(REPO / "training/v6/config/configs/tiny_cpu.yaml")
+    ss = ShardSet(REPO / cfg.data.corpus, cfg.data.split, REPO / cfg.data.manifest)
+    mix = Mixture(cfg.mixture, len(ss), cfg.optim.micro_batch, cfg.run.data_seed)
+    bb = BatchBuilder(cfg.model.token_scheme, 0.5, cfg.run.data_seed, 0.05, None)
+    dl = torch.utils.data.DataLoader(Probe(StreamDataset(ss, mix, bb, 3)), batch_size=None,
+                                     num_workers=1, sampler=range(3))
+    h, private = hashlib.sha256(), 0
+    for b, private in dl:
+        for k in sorted(b):
+            h.update(k.encode() + b[k].numpy().tobytes())
+    print(json.dumps({"private": private, "digest": h.hexdigest()}))
+'''
+
+
+def test_trainer_workers_run_one_blas_thread(tmp_path):
+    """H2: a spawned loader worker under the trainer's environment holds less
+    private memory (OpenBLAS's per-core buffers) and builds identical batches."""
+    script = tmp_path / "probe.py"
+    script.write_text(_WORKER_PROBE)
+    out = {}
+    for mode in ("default", "trainer"):
+        r = subprocess.run([sys.executable, str(script), mode], cwd=REPO, capture_output=True,
+                           text=True, env={**os.environ, "PYTHONPATH": str(REPO)})
+        assert r.returncode == 0, r.stderr[-3000:]
+        out[mode] = json.loads(r.stdout.strip().splitlines()[-1])
+    drop = out["default"]["private"] - out["trainer"]["private"]
+    print(f"worker private: default {out['default']['private'] / 2**20:.0f} MiB, "
+          f"trainer {out['trainer']['private'] / 2**20:.0f} MiB, drop {drop / 2**20:.0f} MiB")
+    assert drop > 100 * 2**20
+    assert out["default"]["digest"] == out["trainer"]["digest"]
