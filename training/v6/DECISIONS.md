@@ -303,3 +303,48 @@ This brief changes the doc in two places, recorded here rather than edited into 
   fused kernel name was 135 characters, and the cache path came to 283 even under
   `%USERPROFILE%\ti`. That is v5's MAX_PATH fix, tried first and not enough on its own, so
   it was not kept. Only kernel names change.
+- **The S2 driver (`tools/s2.py`) corrects GPU_TODO's S2 commands against the brief's protocol.**
+  1. `ref` gets `--gap-probe 0`. `corpus90m.yaml` sets 200k, so the probe would have run.
+  2. `ref` gets an explicit `--seed 20260802` and `--out-dir models/v6/s2/ref`, inside the
+     allowed write area.
+  3. `c2`'s seed is 20260925, not 20260803.
+  4. `run.out_root=models/v6/s2`, and `ema.enabled=false` is explicit.
+
+  Confirmed unchanged: `--max-steps` caps OneCycleLR's `total_steps` in `train_v5.py`, so the
+  schedule is compressed, not truncated. `total_samples` 60,000,256 is 58,594 × 1,024.
+- **Known compat difference in S2: v5's policy denominator.** v5 measures coverage on
+  200,000 records (0.603120 this run); v6 uses the exact corpus coverage from strata
+  (0.602146), H15. That is a 0.16% difference in the soft-KL normalizer.
+- **G2 (S3 on GPU) fails its 1e-3 criterion through run-to-run nondeterminism, not resume.**
+  Stream digests (record indices and mirror flags) match on all 307 compared steps. But
+  run B's own first 157 steps, *before* the kill, already differ from run A. Steps 1–3 are
+  identical, step 4 differs by 2e-6 relative, and the gap grows to 5.4% near peak LR. The
+  resumed segment's maximum is 1.1%. On bf16 + compile, two uninterrupted runs do not
+  reproduce each other (atomics in backward), so a per-step 1e-3 bar cannot hold.
+  `tools/rng_check.py` checks the one GPU-specific resume state (CUDA RNG under compiled
+  dropout) directly.
+
+### Memory on the shared box (found while starting the build beside `ref`)
+
+- **Commit charge reached 59.4 of 60.5 GB** with the v5 `ref` trainer and the first build
+  attempt running. The pagefile is system-managed, so the limit can grow, but allocations
+  can fail while it grows. v5's footprint is ~26 GB private: the main process at 9.1 GB,
+  8 loader workers at 1.48 GB each, and 4 persistent val-loader workers at 1.34 GB each.
+  `training/v5_multiPV/` is read-only.
+- **The builder's footprint went from ~12.5 GB to ~1.2 GB**, in three committed fixes:
+  1. **Every spawned worker imported torch** (+770 MB each). It came in through
+     `data/pgn_parallel.py`'s module-level `import torch`, used only by `parse_game_block`,
+     and through `training.v6.ckpt`. Both imports are now lazy, and a test pins that
+     `import pass_b_v2` loads no torch.
+  2. **numpy's OpenBLAS pre-allocates a buffer per core** (+492 MB per process on 16
+     threads). The builder sets `OPENBLAS_NUM_THREADS=1` (setdefault) before importing
+     numpy; it uses no BLAS.
+  3. **The dedup post-pass is lean.** It frees the selection first, finds root duplicates
+     with `searchsorted` on the sorted unique root keys instead of `np.isin`, and routes with
+     a vectorised splitmix64 (equivalence-tested against the scalar hash).
+- **Build restarts caused by this:** attempts 1–3 were stopped after 1–6 minutes of
+  conversion. Their partial outputs (train/val shards and staging only) were deleted
+  before each relaunch. Attempt 4 runs `6bac6ef`.
+- **The builder records `git_state` at the end, when it writes the manifest**, not at
+  start. No commits were made while the build ran, so the manifest's SHA is the code that
+  ran.
