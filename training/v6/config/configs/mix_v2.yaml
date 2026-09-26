@@ -1,0 +1,10 @@
+# Corpus v2 with the §6.7 mixture, made disjoint: derived rows are hard_only
+# too, so the hard group is restricted to roots (overlap is a hard error).
+# Value-only roots (no hard move) match no group and are excluded.
+extends: base.yaml
+run: {name: v6-mix-v2}
+mixture:
+  groups:
+    - {name: policy,  where: {label: multipv},                 share: 0.65}
+    - {name: hard,    where: {label: hard_only, origin: root}, share: 0.25}
+    - {name: derived, where: {origin: [ply1, ply2]},           share: 0.10}

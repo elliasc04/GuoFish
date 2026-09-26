@@ -7,7 +7,7 @@ data:
   corpus: data/processed/val_frozen_90m_v1
   manifest: data/processed/val_frozen_90m_v1/manifest.json
   split: val
-  strata: data/processed/val_frozen_90m_v1/strata_val_v1.npy
+  strata: data/processed/strata/val_frozen_90m_v1_val.strata2.npy
   workers: 0
 optim: {micro_batch: 64, accum: 2, lr: 1.0e-3}
 schedule: {kind: wsd, total_samples: 38400, warmup_samples: 3840, decay_frac: 0.2}   # 300 steps x 128

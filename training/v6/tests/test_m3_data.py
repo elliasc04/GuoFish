@@ -29,7 +29,7 @@ from training.v6.data.reader import ShardSet
 from training.v6.data.strata import field_of, load_strata, match
 
 FROZEN = REPO / "data/processed/val_frozen_90m_v1"
-FROZEN_STRATA = FROZEN / "strata_val_v1.npy"
+FROZEN_STRATA = REPO / "data/processed/strata/val_frozen_90m_v1_val.strata2.npy"
 C90 = REPO / "data/processed/multipv_90m"
 M90 = REPO / "data/multiPV/manifests/dataset_manifest_90m.json"
 sys.path.insert(0, str(REPO / "data/multiPV"))
@@ -316,35 +316,66 @@ def test_canonical_ep_worker_path_hand_positions(fen, ep_token):
 
 def test_v2_reader_and_strata_on_synthetic_shards(tmp_path):
     """Synthetic v2 shards built from real v1 records plus hard_move/origin/
-    src_line, then build_strata over them."""
+    src_line, then build_strata over them against a synthetic Pass A index and
+    90M manifest: depth_tier from max_depth at src_line, in_90m from the replay."""
+    from pass_a_index import INDEX_DTYPE
+    from pass_b_convert import build_selection
+    from training.v6.data.strata import compute_strata
     src = ShardSet(FROZEN, "val").read(np.arange(20_000))
     rec = _with_hard_moves(src)
-    rec["origin"] = np.where(np.arange(20_000) % 5 == 0, 1, 0)
+    rec["origin"] = np.array([1, 2, 0, 0, 0])[np.arange(20_000) % 5]
     rec["has_policy"] = np.where(rec["origin"] > 0, 0, rec["has_policy"])
     rec["value_depth"] = 26
     rec["src_line"] = np.arange(20_000, dtype=np.uint32) * 3
+    shards = tmp_path / "c2"
+    shards.mkdir()
     for i, part in enumerate(np.array_split(rec, 3)):
-        part.tofile(tmp_path / f"train_{i:04d}.bin")
-    (tmp_path / "manifest.json").write_text(json.dumps(
+        part.tofile(shards / f"train_{i:04d}.bin")
+    (shards / "manifest.json").write_text(json.dumps(
         {"record_dtype": dtype_descr(V2_DTYPE), "record_size_bytes": V2_DTYPE.itemsize}))
-    ss = ShardSet(tmp_path, "train")
+    ss = ShardSet(shards, "train")
     assert ss.format == "v2" and len(ss) == 20_000
     assert ss.read(np.arange(20_000)).tobytes() == rec.tobytes()
+    with pytest.raises(ValueError, match="need the index"):
+        compute_strata(rec[:10])
 
-    out = tmp_path / "strata_train_v1.npy"
-    subprocess.run([sys.executable, "-m", "training.v6.tools.build_strata", "--shards",
-                    str(tmp_path), "--split", "train", "--out", str(out)],
-                   cwd=REPO, check=True, capture_output=True)
+    rng = np.random.default_rng(0)
+    ix = np.zeros(60_000, dtype=INDEX_DTYPE)
+    ix["piece_count"] = rng.integers(3, 33, len(ix))
+    ix["max_depth"] = rng.integers(24, 31, len(ix))
+    ix["policy_depth"] = rng.integers(18, 23, len(ix))
+    ix.tofile(tmp_path / "index.bin")
+    rates = ({"<=5": 0.9, "6-14": 0.5, "15-27": 0.4, ">=28": 0.6},
+             {"<=5": 0.3, "6-14": 0.2, "15-27": 0.3, ">=28": 0.1})
+    sel90 = build_selection(tmp_path / "index.bin", {
+        "value_min_depth": 26, "policy_min_depth": 20,
+        "bucket_rates_policy": rates[0], "bucket_rates_value_only": rates[1]}, 5)
+    (tmp_path / "m90.json").write_text(json.dumps({
+        "seed": 5, "value_min_depth": 26, "policy_min_depth": 20,
+        "bucket_sampling_rates_policy": rates[0], "bucket_sampling_rates_value_only": rates[1],
+        "selected_lines": len(sel90)}))
+    cmd = [sys.executable, "-m", "training.v6.tools.build_strata", "--shards", str(shards),
+           "--split", "train", "--out-dir", str(tmp_path / "strata"), "--index",
+           str(tmp_path / "index.bin"), "--m90", str(tmp_path / "m90.json")]
+    subprocess.run(cmd, cwd=REPO, check=True, capture_output=True)
+    out = tmp_path / "strata" / "c2_train.strata2.npy"
     codes = np.asarray(load_strata(out, 20_000))
     label = field_of(codes, "label")
     has_pol = rec["has_policy"] > 0
     assert np.array_equal(label == 0, has_pol)
     assert np.array_equal(label == 1, ~has_pol & (rec["hard_move"] >= 0))
-    assert np.array_equal(field_of(codes, "origin"), (rec["origin"] > 0).astype(int))
-    assert (label == 1).sum() > 0 and (field_of(codes, "origin") == 1).sum() == 4_000
-    again = subprocess.run([sys.executable, "-m", "training.v6.tools.build_strata", "--shards",
-                            str(tmp_path), "--split", "train", "--out", str(out)],
-                           cwd=REPO, capture_output=True, text=True)
+    assert np.array_equal(field_of(codes, "origin"), rec["origin"])
+    assert (label == 1).sum() > 0 and (field_of(codes, "origin") == 2).sum() == 4_000
+    ln = rec["src_line"].astype(np.int64)
+    tier = field_of(codes, "depth_tier")
+    assert np.array_equal(tier, np.where(ix["max_depth"][ln] >= 26, 0, 1))
+    in90 = field_of(codes, "in_90m")
+    assert np.array_equal(in90 == 1, np.isin(ln, sel90))
+    assert set(tier.tolist()) == {0, 1} and 0 < in90.sum() < 20_000
+    assert match(codes, {"depth_tier": "new"}).sum() == (tier == 1).sum()
+    assert match(codes, {"in_90m": 1, "origin": ["ply1", "ply2"]}).sum() == (
+        (in90 == 1) & (rec["origin"] > 0)).sum()
+    again = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     assert again.returncode != 0 and "refusing to overwrite" in again.stderr
 
 
@@ -356,6 +387,9 @@ def test_strata_mirror_invariant_and_frozen_counts(frozen_strata):
                           compute_strata(mirror_records(rec, np.ones(len(rec), dtype=bool))))
     assert np.array_equal(compute_strata(rec), frozen_strata[::11])
     assert int((field_of(frozen_strata, "label") == 0).sum()) == 271_876
+    assert (field_of(frozen_strata, "depth_tier") == 2).all()             # v1 records
+    assert (field_of(frozen_strata, "in_90m") == 1).all()
+    assert (field_of(frozen_strata, "origin") == 0).all()
     ss.close()
 
 

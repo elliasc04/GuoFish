@@ -20,7 +20,7 @@ data:
   corpus: data/processed/multipv_v2
   manifest: data/processed/multipv_v2/manifest.json
   split: train
-  strata: data/processed/multipv_v2/strata_train_v1.npy
+  strata: data/processed/strata/multipv_v2_train.strata2.npy
   workers: 8
   prefetch_factor: 2
 mixture:  {groups: natural}
@@ -50,7 +50,7 @@ schedule:
 ema:      {enabled: true, half_life_samples: 10e6}
 eval:
   frozen_dir: data/processed/val_frozen_90m_v1
-  frozen_strata: data/processed/val_frozen_90m_v1/strata_val_v1.npy
+  frozen_strata: data/processed/strata/val_frozen_90m_v1_val.strata2.npy
   quick_every_samples: 2048000     # 2,000 steps at 1,024
   quick_size: 32768
   quick_seed: 20260924

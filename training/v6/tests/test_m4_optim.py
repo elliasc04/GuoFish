@@ -180,7 +180,7 @@ def test_value_losses():
 
 def test_normalizers_and_accumulation_exact(val_batch):
     c = load_config(CFG / "base.yaml", ["system.device=cpu", "system.precision=fp32"])
-    strata = np.asarray(load_strata(FROZEN / "strata_val_v1.npy", 452_405))
+    strata = np.asarray(load_strata(REPO / "data/processed/strata/val_frozen_90m_v1_val.strata2.npy", 452_405))
     mix = Mixture(c.mixture, 452_405, c.optim.micro_batch, 0, strata=strata)
     norms = loss_normalizers(c, mix, strata)
     assert norms["soft"] == pytest.approx(1024 * 271_876 / 452_405, rel=1e-12)

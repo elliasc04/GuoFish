@@ -18,7 +18,9 @@ STRATA_FIELDS = {
     "label": ("multipv", "hard_only", "value_only"),
     "value": ("exact_zero", "mate", "middle"),
     "material": ("level", "ahead", "compensated"),
-    "origin": ("root", "derived"),
+    "origin": ("root", "ply1", "ply2"),
+    "depth_tier": ("old", "new", "v1"),
+    "in_90m": (0, 1),                   # ints: YAML 1.1 reads yes/no as booleans
 }
 
 
@@ -58,7 +60,7 @@ class DataConfig:
     corpus: str = "data/processed/multipv_90m"
     manifest: str = "data/multiPV/manifests/dataset_manifest_90m.json"
     split: str = "train"
-    strata: str = "data/processed/multipv_90m/strata_train_v1.npy"
+    strata: str = "data/processed/strata/multipv_v2_train.strata2.npy"
     workers: int = 8
     prefetch_factor: int = 2
 
@@ -260,7 +262,7 @@ class EmaConfig:
 @dataclass(frozen=True)
 class EvalConfig:
     frozen_dir: str = "data/processed/val_frozen_90m_v1"
-    frozen_strata: str = "data/processed/val_frozen_90m_v1/strata_val_v1.npy"
+    frozen_strata: str = "data/processed/strata/val_frozen_90m_v1_val.strata2.npy"
     quick_every_samples: int = 2_048_000
     quick_size: int = 32_768
     quick_seed: int = 20260924

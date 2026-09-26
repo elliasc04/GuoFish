@@ -77,7 +77,7 @@ def test_quick_subset_is_stratified_and_seeded():
     import numpy as np
     from training.v6.data.strata import field_of, load_strata
     from training.v6.eval import quick_subset
-    codes = np.asarray(load_strata(REPO / "data/processed/val_frozen_90m_v1/strata_val_v1.npy", 452_405))
+    codes = np.asarray(load_strata(REPO / "data/processed/strata/val_frozen_90m_v1_val.strata2.npy", 452_405))
     a = quick_subset(codes, 32_768, 20260924)
     assert np.array_equal(a, quick_subset(codes, 32_768, 20260924))
     assert not np.array_equal(a, quick_subset(codes, 32_768, 1))
