@@ -124,3 +124,42 @@ def test_trainer_workers_run_one_blas_thread(tmp_path):
           f"trainer {out['trainer']['private'] / 2**20:.0f} MiB, drop {drop / 2**20:.0f} MiB")
     assert drop > 100 * 2**20
     assert out["default"]["digest"] == out["trainer"]["digest"]
+
+
+# ---------------------------------------------------------------- H3
+
+def test_evalset_sidecars_pin_their_shards(tmp_path, monkeypatch):
+    """v2val_derived loads through its sidecar (all PV-unrolled, every tier
+    reported); a sidecar whose sha256 no longer matches a shard is refused."""
+    import numpy as np
+    from training.v6 import eval as ev
+    from training.v6.data.strata import field_of
+    es = ev.load_evalset("v2val_derived", "v5_68", 1024, 0)
+    assert len(es.shards) == 161_340
+    assert set(np.unique(field_of(es.codes, "origin")).tolist()) == {1, 2}      # ply1, ply2
+    m = ev.evaluate(build_model(ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128)), es,
+                    torch.device("cpu"), indices=es.indices[::400])
+    assert m["policy_n"] == 0 and m["hard_n"] == m["n"] and m["tier/new/n"] > 0
+    assert m["tier/old/n"] + m["tier/new/n"] == m["n"] and m["tier/v1/n"] == 0
+
+    spec = json.loads((ev.EVALSETS / "v2val_derived.json").read_text())
+    spec["shards"][1]["sha256"] = "0" * 64
+    (tmp_path / "v2val_derived.json").write_text(json.dumps(spec))
+    monkeypatch.setattr(ev, "EVALSETS", tmp_path)
+    with pytest.raises(SystemExit, match="no longer matches"):
+        ev.load_evalset("v2val_derived", "v5_68", 1024, 0)
+
+def test_trainer_full_eval_reports_extra_sets(tmp_path):
+    """H3 wiring: a tiny CPU run with eval.extra_sets logs each set for raw and
+    EMA at its full eval; frozen90 alone decides best.pt."""
+    from training.v6.tests.test_m5_trainer import events, train
+    train(tmp_path, "x", "schedule.total_samples=6400", "schedule.warmup_samples=640",
+          "ckpt.every_samples=6400", "ckpt.stable_every_samples=0", "eval.quick_every_samples=6400",
+          "eval.extra_sets=[v2val_derived]")
+    full = events(tmp_path / "x", "full_eval")
+    assert sorted((e["set"], e["weights"]) for e in full) == [
+        ("frozen90", "ema"), ("frozen90", "raw"), ("v2val_derived", "ema"), ("v2val_derived", "raw")]
+    d = [e for e in full if e["set"] == "v2val_derived"][0]
+    assert d["n"] == 161_340 and d["policy_n"] == 0 and d["hard_n"] == 161_340
+    best = torch.load(tmp_path / "x/best.pt", weights_only=True)
+    assert best["value"] == min(e["total"] for e in full if e["set"] == "frozen90")

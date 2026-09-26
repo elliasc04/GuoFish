@@ -1,4 +1,4 @@
-"""v6 config schema (Â§4): one frozen dataclass per section, validated on build.
+"""v6 config schema (§4): one frozen dataclass per section, validated on build.
 
 Every field has a default. Errors name the full key path (the loader builds
 through core.guofish_net.strict.from_dict_strict). Cross-section rules live in
@@ -272,6 +272,7 @@ class EvalConfig:
     workers: int = 4
     best_metric: str = "total"           # total | policy_kl | value_mse
     mirror_n: int = 10_000
+    extra_sets: tuple[str, ...] = ()     # data/processed/evalsets/<name>.json, full evals only
 
     def __post_init__(self):
         _nonneg("eval.workers", self.workers)
@@ -281,6 +282,9 @@ class EvalConfig:
         _pos("eval.batch", self.batch)
         _enum("eval.best_metric", self.best_metric, {"total", "policy_kl", "value_mse"})
         _nonneg("eval.mirror_n", self.mirror_n)
+        for n in self.extra_sets:
+            if not n or n == "frozen90" or any(c in n for c in "/\\:. "):
+                raise ValueError(f"eval.extra_sets: {n!r} must be a plain eval-set name other than frozen90")
 
 
 @dataclass(frozen=True)

@@ -12,18 +12,21 @@ pass, then reduced on the CPU. Metric groups:
                    renormalised over the record's PV moves); hard-move NLL;
                    mean policy entropy.
 3. slices          piece bucket x value stratum; material class with MSE and
-                   mean signed error (pred - label).
+                   mean signed error (pred - label); depth tier (old | new | v1).
 4. hlgauss         mean predicted spread per stratum; corr(spread, |error|).
 """
 from __future__ import annotations
 
 import contextlib
+import json
 
 import numpy as np
 import torch
 
 from training.v6.config.schema import STRATA_FIELDS
+from training.v6.ckpt import sha256_file
 from training.v6.data.batch import BatchBuilder, EvalDataset, mirror_records
+from training.v6.data.formats import REPO
 from training.v6.data.mixture import apportion
 from training.v6.data.reader import ShardSet
 from training.v6.data.strata import field_of, load_strata
@@ -33,6 +36,7 @@ from training.v6.data.formats import _MPV  # noqa: F401
 from mirror import POLICY_PERM  # noqa: E402
 
 _PERM_T = torch.from_numpy(POLICY_PERM)
+EVALSETS = REPO / "data/processed/evalsets"
 
 
 def quick_subset(codes: np.ndarray, size: int, seed: int) -> np.ndarray:
@@ -71,6 +75,21 @@ class EvalSet:
         # which would shift dropout masks and break exact resume
         return torch.utils.data.DataLoader(ds, batch_size=None, num_workers=self.workers,
                                            persistent_workers=False, generator=torch.Generator())
+
+
+def load_evalset(name: str, token_scheme: str, batch: int, workers: int) -> EvalSet:
+    """A named eval set (H3): data/processed/evalsets/<name>.json pins a split's
+    shards by sha256 and names its strata sidecar. A changed shard is refused."""
+    spec = json.loads((EVALSETS / f"{name}.json").read_text())
+    shard_dir = REPO / spec["shard_dir"]
+    for s in spec["shards"]:
+        if sha256_file(shard_dir / s["name"]) != s["sha256"]:
+            raise SystemExit(f"eval set {name}: {s['name']} no longer matches its sidecar")
+    es = EvalSet(name, shard_dir, spec["split"], REPO / spec["strata"], token_scheme, batch, workers,
+                 manifest=REPO / spec["manifest"])
+    if [p.name for p in es.shards.paths] != [s["name"] for s in spec["shards"]]:
+        raise SystemExit(f"eval set {name}: shard list differs from its sidecar")
+    return es
 
 
 def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -175,6 +194,12 @@ def evaluate(model, es: EvalSet, device, amp=contextlib.nullcontext, indices=Non
         m[f"material/{c}/n"] = int(sel.sum())
         m[f"material/{c}/value_mse"] = _mean(err.pow(2), sel)
         m[f"material/{c}/value_bias"] = _mean(err, sel)
+    tier = torch.from_numpy(field_of(codes, "depth_tier").astype(np.int64))
+    for i, t in enumerate(STRATA_FIELDS["depth_tier"]):
+        sel = tier == i
+        m[f"tier/{t}/n"] = int(sel.sum())
+        m[f"tier/{t}/value_mse"] = _mean(err.pow(2), sel)
+        m[f"tier/{t}/policy_kl"] = _mean(r["kl"], sel & has)
 
     if mirror_n and es.builder.token_scheme == "v5_68":
         m.update(mirror_consistency(model, es, device, amp, mirror_n, mirror_seed))

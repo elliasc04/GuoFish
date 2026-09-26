@@ -1,4 +1,4 @@
-"""v6 trainer (Â§8-Â§10).
+"""v6 trainer (§8-§10).
 
     python -m training.v6.train --config training/v6/config/configs/base.yaml \
         [--set a.b=c ...] [--resume latest|<ckpt>]
@@ -45,7 +45,7 @@ from training.v6.data.formats import REPO
 from training.v6.data.mixture import Mixture
 from training.v6.data.reader import ShardSet
 from training.v6.data.strata import DEFINITION_HASH, load_strata
-from training.v6.eval import EvalSet, evaluate, quick_subset
+from training.v6.eval import EVALSETS, EvalSet, evaluate, load_evalset, quick_subset
 from training.v6.losses import LossFn, loss_normalizers
 from training.v6.optim import EMA, Schedule, build_optimizer
 
@@ -88,7 +88,8 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     torch.backends.cudnn.allow_tf32 = cfg.system.tf32
     for name, p in [("data.corpus", cfg.data.corpus), ("data.manifest", cfg.data.manifest),
                     ("data.strata", cfg.data.strata), ("eval.frozen_dir", cfg.eval.frozen_dir),
-                    ("eval.frozen_strata", cfg.eval.frozen_strata)]:
+                    ("eval.frozen_strata", cfg.eval.frozen_strata),
+                    *(("eval.extra_sets", EVALSETS / f"{n}.json") for n in cfg.eval.extra_sets)]:
         if not resolve(p).exists():
             raise SystemExit(f"{name}: {p} does not exist")
 
@@ -131,6 +132,8 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     frozen = EvalSet("frozen90", resolve(cfg.eval.frozen_dir), "val", resolve(cfg.eval.frozen_strata),
                      cfg.model.token_scheme, cfg.eval.batch, cfg.eval.workers)
     quick_idx = quick_subset(frozen.codes, cfg.eval.quick_size, cfg.eval.quick_seed)
+    extra = [load_evalset(n, cfg.model.token_scheme, cfg.eval.batch, cfg.eval.workers)
+             for n in cfg.eval.extra_sets]
 
     # ---- model / optimizer / resume -----------------------------------
     torch.manual_seed(cfg.run.init_seed)            # dropout (and v5_deepcopy's init draws)
@@ -188,16 +191,16 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
 
     def full_eval(done: int, reason: str):
         nonlocal ema_model
-        results = {"raw": evaluate(model, frozen, dev, amp, mirror_n=cfg.eval.mirror_n,
-                                   mirror_seed=cfg.eval.quick_seed)}
+        nets = {"raw": model}
         if ema is not None:
             if ema_model is None:
                 ema_model = build_model(cfg.model).to(dev)
             ema_model.load_state_dict(ema.weights_for(model))
-            results["ema"] = evaluate(ema_model, frozen, dev, amp, mirror_n=cfg.eval.mirror_n,
-                                      mirror_seed=cfg.eval.quick_seed)
+            nets["ema"] = ema_model
+        results = {which: evaluate(net, frozen, dev, amp, mirror_n=cfg.eval.mirror_n,
+                                   mirror_seed=cfg.eval.quick_seed) for which, net in nets.items()}
         for which, m in results.items():
-            log.event("full_eval", samples=done, weights=which, reason=reason, **m)
+            log.event("full_eval", samples=done, weights=which, reason=reason, set="frozen90", **m)
             v = m[cfg.eval.best_metric]
             if v < state["best"]:
                 state["best"] = v
@@ -207,10 +210,15 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
                              "value": v, "metrics": m, "model_config": cfg.model.to_dict(),
                              "config_hash": chash}, run_dir / "best.pt")
                 log.event("best", samples=done, weights=which, value=v)
-        state["metrics"] = results
         log.say(f"  full eval @ {done:,} ({reason}): " + " | ".join(
             f"{w} KL {m['policy_kl']:.5f} MSE {m['value_mse']:.5f} total {m['total']:.5f}"
             for w, m in results.items()))
+        for es in extra:                    # H3: reported, never used for best.pt
+            for which, net in nets.items():
+                m = evaluate(net, es, dev, amp)
+                log.event("full_eval", samples=done, weights=which, reason=reason, set=es.name, **m)
+                results[f"{which}/{es.name}"] = m
+        state["metrics"] = results
 
     def events(done: int):
         at = lambda every: every > 0 and done % every == 0  # noqa: E731
