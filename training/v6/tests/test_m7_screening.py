@@ -149,6 +149,15 @@ def test_evalset_sidecars_pin_their_shards(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="no longer matches"):
         ev.load_evalset("v2val_derived", "v5_68", 1024, 0)
 
+
+# ---------------------------------------------------------------- H5
+
+def test_required_gain_is_the_campaign_exchange():
+    from training.v6.tools.fwd_cost import required_gain
+    assert required_gain(1.0) == 0.0
+    assert required_gain(1.624) == pytest.approx(4.21, abs=0.01)   # CAMPAIGN_RECORD A4, d384x10
+    assert required_gain(0.93) < 0 < required_gain(1.03)
+
 def test_trainer_full_eval_reports_extra_sets(tmp_path):
     """H3 wiring: a tiny CPU run with eval.extra_sets logs each set for raw and
     EMA at its full eval; frozen90 alone decides best.pt."""
