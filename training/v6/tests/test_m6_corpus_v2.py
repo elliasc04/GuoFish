@@ -313,3 +313,10 @@ def test_vectorised_derived_routing_matches_scalar():
     want = [_splitmix64(((int(ln) << 3) | int(k)) ^ seed) for ln, k in zip(lines, ks)]
     got = splitmix64_np(((lines.astype(np.uint64) << np.uint64(3)) | ks.astype(np.uint64)) ^ np.uint64(seed))
     assert got.tolist() == want
+
+
+def test_builder_workers_do_not_import_torch():
+    """Spawned pool workers re-import pass_b_v2; torch there costs ~770 MB each."""
+    code = ("import sys; sys.path[:0] = ['data/multiPV', '.']; import pass_b_v2; "
+            "assert 'torch' not in sys.modules, 'pass_b_v2 imports torch'")
+    subprocess.run([sys.executable, "-c", code], cwd=REPO, check=True)

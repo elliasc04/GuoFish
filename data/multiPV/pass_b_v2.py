@@ -63,7 +63,6 @@ from labels import (  # noqa: E402
 from pass_a_index import INDEX_DTYPE, iter_lines  # noqa: E402
 from pass_b_convert import _splitmix64, file_hash  # noqa: E402
 from record_format import shard_name  # noqa: E402
-from training.v6.ckpt import git_state  # noqa: E402
 from training.v6.data.formats import V2_DTYPE, dtype_descr  # noqa: E402
 
 DERIVED_STREAM = 0x5D1E_7E0D
@@ -549,6 +548,7 @@ def main(argv=None) -> int:
     hard_ok = stats["hard_move_ok"]
     considered = roots + sum(v for k, v in stats.items() if k.startswith("reject_"))
     viol = stats["reject_invariant_violation"] / considered if considered else 0.0
+    from training.v6.ckpt import git_state   # torch; kept out of the spawned workers
     git = git_state()
     git.pop("_patch")
     manifest = {
