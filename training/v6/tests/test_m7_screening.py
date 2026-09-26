@@ -158,6 +158,116 @@ def test_required_gain_is_the_campaign_exchange():
     assert required_gain(1.624) == pytest.approx(4.21, abs=0.01)   # CAMPAIGN_RECORD A4, d384x10
     assert required_gain(0.93) < 0 < required_gain(1.03)
 
+
+# ---------------------------------------------------------------- H4
+
+def _row(arm, kl, mse, *, pv=None, top1=0.40, ema_total=None, **kw):
+    f90 = {"policy_kl": kl, "value_mse": mse, "total": kl + mse, "pv_kl": pv if pv else kl / 2,
+           "policy_top1": top1, "sf_top1_hard": top1}
+    ema = dict(f90, total=ema_total if ema_total is not None else f90["total"] + 1)
+    return {"arm": arm, "scores": {"raw": {"frozen90": f90}, "ema": {"frozen90": ema}},
+            "adopted": False, "overrides": [], "best_after": arm, **kw}
+
+
+def test_calibration_picks_weights_floors_and_stop():
+    from training.v6.tools import screen
+    a0 = _row("A0", 0.80, 0.060, ema_total=0.80)          # EMA better on total
+    cal = screen.calibrate(a0, _row("A0r", 0.80 * 1.001, 0.060 * 1.02, ema_total=0.80))
+    assert cal["weights"] == "ema" and not cal["stop"]
+    assert cal["floors"]["policy_kl"] == 0.0025                          # r 0.1% < 0.25%
+    assert cal["floors"]["value_mse"] == pytest.approx(0.02)             # r 2% > 1.7%
+    assert screen.calibrate(a0, _row("A0r", 0.80 * 1.006, 0.060))["stop"]   # r_KL 0.6% > 0.5%
+
+
+def test_decision_rules():
+    from training.v6.tools import screen
+    cal = {"weights": "raw", "floors": {"policy_kl": 0.0025, "pv_kl": 0.003, "value_mse": 0.017}}
+    ref = _row("A0", 0.800, 0.0600)
+
+    def j(kl, mse, required=None):
+        return screen.judge(_row("X", kl, mse), ref, cal, "policy", required)["adopt"]
+    assert j(0.800 * (1 - 0.0051), 0.0600 * 1.016)           # KL >= 2f, MSE within -f
+    assert not j(0.800 * (1 - 0.0049), 0.0600)               # KL short of 2f
+    assert not j(0.800 * (1 - 0.0060), 0.0600 * 1.018)       # MSE regresses past f
+    assert j(0.800 * 1.0024, 0.0600 * (1 - 0.0341))          # MSE >= 2f, KL within -f
+    assert not j(0.800 * 1.0026, 0.0600 * (1 - 0.0341))
+    assert not j(0.800 * (1 - 0.006), 0.06, required=0.7)    # inference cost: 0.6% < 0.7% needed
+    assert j(0.800 * (1 - 0.006), 0.06, required=-1.0)       # a cheaper arm
+    pv = screen.judge(_row("B", 0.9, 0.06, pv=0.4 * (1 - 0.0061)), _row("A", 0.8, 0.06, pv=0.4),
+                      cal, "pv", None)
+    assert pv["adopt"] and pv["keys"][0] == "pv_kl"          # KL got worse; PV-KL is what is judged
+    c = screen.confirm({"kl": 0.010, "mse": -0.002}, {"kl": 0.006, "mse": -0.03})
+    assert c["confirmed"] and list(c["per_metric"]) == ["kl"]
+    assert not screen.confirm({"kl": 0.010, "mse": 0.0}, {"kl": 0.004, "mse": 0.0})["confirmed"]
+    assert not screen.confirm({"kl": 0.010, "mse": 0.0}, {"kl": -0.02, "mse": 0.0})["confirmed"]
+
+
+def test_queue_walk_and_composition():
+    """The real queue: calibration first, B0 picks its variant from A8's verdict,
+    the pause holds until released, and arms build on the best's overrides."""
+    from training.v6.tools import screen
+    q = screen.load_queue(screen.QUEUE)
+    led = []
+    for name in ("A0", "A0r", "A1", "A4", "A5", "A6", "A7", "A9", "A8", "A3"):
+        e = screen.next_entry(q, led, set())
+        assert e["name"] == name
+        base, ref, ov = screen.compose(e, led)
+        adopted = name in ("A1", "A6", "A8")
+        best = name if adopted or name == "A0" else screen.best(led)
+        led.append({"arm": name, "overrides": ov, "adopted": adopted, "best_after": best})
+    assert screen.best(led) == "A8"
+    a8 = screen.row_of(led, "A8")["overrides"]
+    assert a8[:2] == ["model.dropout=0.0", "model.attn_bias=static"] and a8[2].startswith("mixture.groups=")
+    e = screen.next_entry(q, led, set())
+    assert e["name"] == "B0" and e["only_if"] == {"adopted": "A8"}
+    base, ref, ov = screen.compose(e, led)
+    assert (base, ref) == ("A8", "A8") and ov[-1].startswith("mixture.groups=[{name: policy, where: {origin: root")
+    for name in ("B0", "B1a", "B1b"):
+        led.append({"arm": name, "overrides": [], "adopted": False, "best_after": "A8"})
+    assert screen.next_entry(q, led, set())["id"] == "phase3_review"
+    e = screen.next_entry(q, led, {"phase3_review"})
+    assert e["name"] == "A0t" and screen.compose(e, led) == ("A0", None, e["set"])
+    led.append({"arm": "A0t", "overrides": e["set"], "adopted": False, "best_after": "A8"})
+    e = screen.next_entry(q, led, {"phase3_review"})
+    assert e["name"] == "Ct" and screen.compose(e, led)[:2] == ("A8", "A0t")
+
+
+def test_every_queue_arm_resolves_even_with_everything_adopted():
+    from training.v6.tools import screen
+    q = screen.load_queue(screen.QUEUE)
+    acc = []
+    for e in q["arms"]:
+        if "name" in e:
+            acc += e.get("set", [])
+            load_config(REPO / q["config"], [f"run.name={e['name']}", *e.get("set", [])])
+            load_config(REPO / q["config"], [f"run.name={e['name']}", *acc])
+
+
+def test_report_renders(tmp_path, monkeypatch):
+    from training.v6.tools import screen
+    monkeypatch.setattr(screen, "OUT", tmp_path)
+    monkeypatch.setattr(screen, "REPORT", tmp_path / "REPORT.md")
+    cfg = tmp_path / "A1.yaml"
+    cfg.write_text("run: {name: A1}\n")
+    rows = []
+    for name, verdict, best in (("A0", "reference", "A0"), ("A0r", "replicate", "A0"), ("A1", "ADOPT", "A1")):
+        r = _row(name, 0.8, 0.06, ref="A0" if name != "A0" else None, change=["model.dropout=0.0"],
+                 metrics="policy", verdict=verdict, best_after=best, config=cfg.as_posix(),
+                 config_hash="ab" * 32, samples_per_s_median=4100.0, peak_vram_mib=6000.0, attempts=1,
+                 starts=1, utc_start="t0", utc_end="t1", fwd_cost=None, also={})
+        for w in ("raw", "ema"):
+            f90 = {k: 0.1 for k in screen.HEAD} | r["scores"][w]["frozen90"]
+            r["scores"][w] = {s: f90 for s in screen.SETS}
+        rows.append(r)
+    rows[2]["judgement"] = {"keys": ["policy_kl", "value_mse", "policy_top1"], "why": "passes",
+                            "delta": {"kl": 0.006, "mse": 0.0, "top1": 0.001}}
+    (tmp_path / "ledger.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    screen.report()
+    text = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "| A1 | `model.dropout=0.0` | A0 |" in text and "**ADOPT**" in text
+    assert "Best arm **A1**" in text and "run: {name: A1}" in text
+
+
 def test_trainer_full_eval_reports_extra_sets(tmp_path):
     """H3 wiring: a tiny CPU run with eval.extra_sets logs each set for raw and
     EMA at its full eval; frozen90 alone decides best.pt."""

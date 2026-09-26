@@ -1,0 +1,28 @@
+# Screening proxy, arm A0 (brief of 2026-09-26): d384x10 on corpus v2 restricted to
+# the 90M roots (in_90m, origin root: 90,076,117 records, the 90M corpus's set and
+# labels), 60M samples, WSD 2% warmup / 20% 1-sqrt decay, EMA half-life 2M samples,
+# independent init, constant beta1 0.9, dropout 0.1. Paired seeds: every arm uses
+# the same data and init seed (s = 20260802) unless the queue says otherwise.
+extends: shapes/d384x10.yaml
+run:   {name: proxy, data_seed: 20260802, init_seed: 20260802, out_root: models/v6/screen}
+model: {dropout: 0.1}
+mixture:
+  groups:
+    - {name: base90, where: {in_90m: 1, origin: root}, share: 1.0}
+optim: {lr: 3.5e-4, betas: [0.9, 0.999], micro_batch: 512, accum: 2}
+schedule:
+  kind: wsd
+  total_samples: 60000256          # 58,594 steps x 1,024, S2's proxy budget
+  warmup_samples: 1200005          # 2%
+  decay_frac: 0.2
+  decay_shape: one_minus_sqrt
+  final_lr_frac: 0.0
+ema: {enabled: true, half_life_samples: 2e6}
+eval:
+  frozen_dir: data/processed/val_frozen_90m_v2
+  frozen_strata: data/processed/strata/val_frozen_90m_v2_val.strata2.npy
+  extra_sets: []                   # tools/screen.py scores v2val_* with tools/score.py
+ckpt: {every_samples: 10240000, keep_last: 3, stable_every_samples: 0, export_weights: ema}
+# The tree carries untracked files outside this work; provenance lists them and
+# code.patch holds the tracked diff (the S2 precedent).
+system: {allow_dirty: true}
