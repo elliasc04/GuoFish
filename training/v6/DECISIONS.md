@@ -530,3 +530,14 @@ recorded here and not edited into the doc:
 - **Marginal cost is what gates.** The verdict uses the arm against its reference; the ratio
   against plain d384×10 is reported alongside. If an earlier architecture change was
   adopted, the reference already carries its cost.
+
+## S7 (2026-09-27) — exports carry `value_scale`
+
+- **`tools/export.py` records the training corpus manifest's `value_scale`** in the export
+  (290.6806 for corpus v2). `load_for_inference` attaches it to the module as
+  `value_scale`. The engine needs it for `cp = value_scale * atanh(value)`, which every
+  resign and adjudication threshold reads, and refuses an export without one.
+- **A manifest without one exports null**, with a warning. The frozen val set, which
+  `tiny_cpu.yaml` trains on, has no `value_scale`. `test_export_round_trip` caught the
+  first draft raising `KeyError` there.
+- **The engine side** is recorded in the root `DECISIONS.md`, "S7".

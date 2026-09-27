@@ -7811,3 +7811,93 @@ what established it was needed.
   simulations was not measured.
 * **Anything on Linux.** No CUDA there, so every C12b test skips and the arm certifies
   nothing in this chunk.
+
+# S7 — the engine loads v6 exports (2026-09-27)
+
+Design doc `docs/capacity/training_stack.md` §11.1 and §12 S7. Contract A only: `v5_68`
+tokens and a White-POV value, so no C++ change. The first net through it is the screening
+arm A7: d384×10 with smolgen, 20,891,905 parameters.
+
+## Dispatch on the file, and the v5 nets keep their loader
+
+`load_default_model` peeks at the file memory-mapped. A file carrying `arch_version` (a
+`training/v6/tools/export.py` export) goes through `load_v6_export`, which calls
+`core.guofish_net.load_for_inference`. Everything else goes through
+`chess_transformer_v2.load_model`, unchanged. Checked: both v5 checkpoints and the
+guofish2/guofish4 nets are recognised as non-exports.
+
+**Deviation from §11.1:**
+- **What §11.1 says:** the evaluator "drops its private model copy".
+- **What it would cost:** converting the v5 nets through `core.guofish_net` would re-run
+  them on different modules, a measured 1.7e-4 relative shift in bf16 value MSE
+  (`training/v6/S2_REPORT.md`). Gate 2, Gate 2b, Gate 2', the C10b graph tests and every
+  file in `golden/` and `baseline/` are anchored to those nets' current numerics, and
+  Global Rules 1–2 forbid regenerating them.
+- **So:** retiring the private copy is its own chunk, one that re-bases those gates.
+  S7 needs only the new path.
+
+## The boundary: `ExportedNet` and bf16 Linear storage
+
+- **Policy dtype.** `GuoFishNet.forward` returns fp32 (its documented contract), but the
+  policy buffer is bf16. `ExportedNet` narrows the policy inside the module.
+  - **Exactness:** the logits are bf16 until the net's `.float()`.
+  - **Why in the module:** the cast then lives inside the captured graph. The callback's
+    cross-device `copy_` would instead allocate a converted temporary and move twice the
+    bytes on every batch.
+  - The value stays fp32, and the float32 buffer takes it as is.
+- **Weight storage (`cast_linears`).** On CUDA, every `nn.Linear`'s weight and bias is
+  stored in bf16.
+  - **Why it is free:** that is the cast autocast applies on every call anyway, so no output
+    bit moves. `tests/test_s7_v6_loader.py` checks it under CPU autocast for plain, static
+    and smolgen nets; `tools/s7_check.py` checks it on the GPU over the c10 corpus.
+  - **Why not all of it:** embeddings, LayerNorms and the residual stream stay fp32, as in
+    training and in every frozen90 score. The v5 path instead casts the whole model to
+    bf16, which gives a bf16 residual stream. Copying that here would run the new net on
+    numerics it was never evaluated under.
+- **Refused files:**
+  - contract B (`canonical_65`), until the §11.2 tokenizer, remap and value sign exist;
+  - exports without a `value_scale`. `score cp = value_scale * atanh(q)` drives every
+    resign and adjudication threshold, and falling back to `LEGACY_VALUE_SCALE` would
+    misreport a v6 net as a legacy one.
+
+  `export.py` now records the training corpus manifest's `value_scale`: 290.6806 for
+  corpus v2, the same as the shipping net.
+
+## S7 is certified by `tools/s7_check.py`, on the GPU
+
+The three S7 parts and their criteria:
+
+| part | what runs | criterion |
+|---|---|---|
+| UCI | `uci_wrapper_v6.py --model <export> --no-book --no-syzygy --max-batch 128`; `go nodes 800` on the 20 Gate 1 positions | capture succeeds; every bestmove is legal |
+| Forward | engine-held export vs the training-side forward under the same autocast | reported only; expected 0 differing words |
+| Contract-A numerics | eager-captured vs Inductor-captured, the same export | ≥ 98.75% move agreement |
+
+- **Numerics protocol:** Gate 2''s own — W=1 K=1, 1,600 sims, Gate 2b's recorded search
+  config, C12b's cache size — on the 500 positions of `golden/c10_corpus.json`.
+- **Why 98.75% and not 98%:** 98.75% is §11.1's figure for new architectures. The 98% floor
+  is the owner's Gate 2' ruling for the v5 net. S7 is held to the doc's number and the
+  report prints the measured rate either way.
+- **Where the output goes:** `runs/s7/`. It is torch output about a new net, so it is
+  neither golden nor baseline data. The tool reads `golden/` and writes nothing there or
+  in `baseline/`.
+- **When it runs:** in a HOLD gap of the v6 screening queue, which owns the GPU.
+
+## Tests and the mutation drill
+
+`tests/test_s7_v6_loader.py` holds 11 CPU tests; `tests/` gained only additions. Two
+mutations were each caught with 3 failures:
+- removing the bf16 narrowing in `ExportedNet.forward`;
+- storing the Linear layers in fp16.
+
+## Not done
+
+* **Contract B** (§11.2–11.3: the C++ `canonical_65` tokenizer, policy remap, value
+  sign, and B1–B3). It is needed only if screening arm A9 is adopted.
+* **§11.1's cost figure:** fresh-root delivered sims/s against the 90M net, in doublings.
+  The screening pass's `fwd_cost.py` measured the forward (A7 at 1.163× plain d384×10);
+  the delivered-sims measurement is a replay-bench run.
+* **§11.4's Q-knob recompute.** Before any fixed-config comparison, the middle-stratum
+  prediction-std ratio against the 90M net, and FPU / C_PUCT corrected from it.
+* **Switching `playv6.DEFAULT_MODEL`.** The shipping engine still loads the 90M v5 net.
+  A v6 net is selected with `--model` / `ModelPath`.

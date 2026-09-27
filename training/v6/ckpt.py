@@ -140,8 +140,8 @@ def weights_sha256(sd: dict) -> str:
 
 
 def export_blob(state_dict, model_cfg, *, weights: str, source_run: str, source_ckpt: str,
-                cfg_hash: str, samples: int) -> dict:
-    return {"arch_version": ARCH_VERSION, "model_config": model_cfg.to_dict(),
+                cfg_hash: str, samples: int, value_scale: float) -> dict:
+    return {"arch_version": ARCH_VERSION, "model_config": model_cfg.to_dict(), "value_scale": value_scale,
             "token_scheme": model_cfg.token_scheme, "value_repr": model_cfg.value_repr.kind,
             "contract": model_cfg.contract, "state_dict": state_dict,
             "weights_sha256": weights_sha256(state_dict), "weights": weights,

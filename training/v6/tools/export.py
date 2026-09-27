@@ -3,14 +3,16 @@
     python -m training.v6.tools.export models/v6/<run>/ckpt/s<N>.pt [--weights ema|raw|best]
 
 Writes <run_dir>/export/<run>_d<D>x<L>_<cfghash8>_s<samples>_<weights>.pt with
-ModelConfig, arch_version, token_scheme, value_repr, contract, the weights'
-sha256 and the source run/config hash, then smoke-tests it: loaded through
+ModelConfig, arch_version, token_scheme, value_repr, contract, value_scale (from
+the training corpus manifest), the weights' sha256 and the source run/config
+hash, then smoke-tests it: loaded through
 load_for_inference, a fixed 64-position frozen-val batch must give outputs
 identical to the training-side module holding the same weights.
 """
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -59,13 +61,21 @@ def export(ckpt_path: Path, weights: str | None = None) -> Path:
         raise SystemExit(f"--weights {weights!r}; expected ema | raw | best")
 
     sd = {k: v.float().contiguous() for k, v in sd.items()}
+    # cp = value_scale * atanh(value): the engine's score readout and every resign /
+    # adjudication threshold need the scale the value labels were built with. A
+    # manifest without one (frozen val used as train data, tiny_cpu) exports null,
+    # and the engine refuses that file (playing/v6/evaluator.load_v6_export).
+    value_scale = json.loads(resolve(cfg.data.manifest).read_text()).get("value_scale")
+    if value_scale is None:
+        print(f"WARNING: {cfg.data.manifest} records no value_scale; the engine will refuse this export")
     out = run_dir / "export" / export_name(cfg.run.name, cfg.model, ck["config_hash"], samples, weights)
     if out.exists():
         raise SystemExit(f"{out} exists; refusing to overwrite")
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_save(export_blob(sd, cfg.model, weights=weights, source_run=cfg.run.name,
                             source_ckpt=str(ckpt_path), cfg_hash=ck["config_hash"],
-                            samples=samples), out)
+                            samples=samples,
+                            value_scale=None if value_scale is None else float(value_scale)), out)
 
     train_side = build_model(cfg.model).eval()
     train_side.load_state_dict(sd)

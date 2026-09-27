@@ -90,9 +90,18 @@ python -m training.v6.tools.bench --config training/v6/config/configs/v5_compat.
 
 ## G4 — S7 engine smoke
 
-**Blocked.** The v6 engine's evaluator must first drop its private model copy and load
-through `core.guofish_net.load_for_inference`. That is a separate change in `playing/`,
-not part of this harness, and was not made. Once it lands, S7 is:
+**Unblocked (2026-09-27), contract A.** `playing/v6/evaluator.load_default_model` now loads
+v6 exports through `core.guofish_net.load_for_inference`. v5 and legacy checkpoints keep
+their loader; root `DECISIONS.md`, "S7", says why. The run is:
+
+```powershell
+python -m training.v6.tools.export <run>/ckpt/s<N>.pt --weights raw
+python tools/s7_check.py <run>/export/<file>.pt      # GPU; writes runs/s7/<file>.json
+```
+
+It covers steps 1–3 below. Step 4 (contract B) is still open.
+
+The original plan:
 
 1. `python -m training.v6.tools.export <ckpt> --weights ema`. This already smoke-tests the
    export through `load_for_inference` on 64 fixed positions.

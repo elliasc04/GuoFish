@@ -338,7 +338,8 @@ def build_model(cfg: ModelConfig, init_seed: int = 0) -> GuoFishNet:
 
 
 def load_for_inference(path, map_location="cpu"):
-    """Export file -> (eval-mode module, contract 'A' | 'B')."""
+    """Export file -> (eval-mode module, contract 'A' | 'B'). The module carries
+    `value_scale` (cp = value_scale * atanh(value)) when the export records it."""
     blob = torch.load(path, map_location=map_location, weights_only=True)
     for key in ("arch_version", "model_config", "state_dict", "contract", "token_scheme"):
         if key not in blob:
@@ -350,4 +351,6 @@ def load_for_inference(path, map_location="cpu"):
         raise ValueError(f"{path}: contract/token_scheme disagree with model_config")
     model = build_model(cfg)
     model.load_state_dict(blob["state_dict"], strict=True)
+    if blob.get("value_scale") is not None:
+        model.value_scale = float(blob["value_scale"])
     return model.eval(), cfg.contract
