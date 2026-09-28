@@ -7901,3 +7901,43 @@ mutations were each caught with 3 failures:
   prediction-std ratio against the 90M net, and FPU / C_PUCT corrected from it.
 * **Switching `playv6.DEFAULT_MODEL`.** The shipping engine still loads the 90M v5 net.
   A v6 net is selected with `--model` / `ModelPath`.
+
+## S7 result on A7, and the owner's ruling (2026-09-28)
+
+`tools/s7_check.py models/v6/screen/A7/export/A7_d384x10_5a63ca00_s60000256_raw.pt` ran in
+the screening queue's gap after A9, 01:17–01:36 UTC. Report:
+`runs/s7/A7_d384x10_5a63ca00_s60000256_raw.json`.
+
+| part | result |
+|---|---|
+| UCI | **pass**. Ready in 117 s. Inductor + CUDA-graph ladder `[1 … 128]` captured in 112.9 s, +908 MiB reserved (v5 d384×6: ~730). 20/20 bestmoves legal at `go nodes 800`. |
+| Forward vs training side | **0** of 500 × 4,096 policy words differ; value max \|Δ\| **0.0**. The bf16-Linear storage is bit-exact on the GPU as well. |
+| Contract-A numerics | **493/500 = 98.60%**, against the 98.75% criterion: **fails by one position** (494 needed). |
+
+- **Protocol:** eager vs Inductor, W=1 K=1, 1,600 sims, c10 corpus.
+- **Sweep times:** eager 571 s, Inductor 409 s.
+- **The 7 disagreements:**
+  - 4 are near-ties by the eager arm's top-two margin (0.00%, 0.25%, 0.31%, 1.06%).
+  - 3 are decisive:
+    - `rnbr2k1/pp2qppp/5n2/6B1/2p1p3/2N3P1/PP2PPBP/R2Q1RK1 w - - 2 15`: eager `d1c1` (51.7%)
+      vs Inductor `d1a4` (11.3%);
+    - `7k/p2qr2p/6pN/1pp2nP1/3p3P/2P1nP2/P4Q2/2BR2K1 w - - 2 32`: eager `d1e1` (38.8%) vs
+      Inductor `c1e3` (57.9%);
+    - `r2qrbk1/pb3pp1/1pnppn1p/2p5/P3P2P/2PP1NP1/1PN1QPB1/R1B1R1K1 b - - 2 13`: eager `a8c8`
+      (4.9%) vs Inductor `c6a5` (0.1%).
+- **Context:** the same measurement on the shipping v5 net was 98.65% (513/520). The owner's
+  Gate 2' floor for it is 98%.
+
+**Ruling, 2026-09-28, owner:** 98.60% is within an acceptable margin; S7 is accepted for
+contract A and the screening queue proceeds. It is recorded as a ruling, like C12b's:
+- **Unchanged:** `s7_check.py`'s `MIN_AGREEMENT` stays at §11.1's 98.75%, so the tool still
+  reports this run as a fail.
+- **Not adjudicated:** the three decisive disagreements have not been checked against
+  Stockfish, as C12b's were.
+
+**Consequence of screening arm A9, adopted 01:17 UTC** (`canonical_65` on top of smolgen:
+ΔKL +3.19%, ΔMSE +4.47% vs A7):
+- The screening recipe is now a **contract-B** net. This loader refuses those until §11.2's
+  C++ tokenizer, policy remap and value sign exist and pass B1–B3.
+- So the confirmation match and a production build of the final recipe are blocked on
+  contract B. S7 must also be re-run on that net.

@@ -101,6 +101,13 @@ python tools/s7_check.py <run>/export/<file>.pt      # GPU; writes runs/s7/<file
 
 It covers steps 1–3 below. Step 4 (contract B) is still open.
 
+**Result on A7 (2026-09-28):**
+- UCI and forward: pass. The forward is bit-exact.
+- Numerics: 98.60% (493/500), against the 98.75% criterion.
+- The owner accepted it; the ruling and the disagreements are in the root `DECISIONS.md`.
+- A9 (`canonical_65`) was adopted, so the final recipe is a contract-B net. Step 4 now blocks the
+  confirmation match.
+
 The original plan:
 
 1. `python -m training.v6.tools.export <ckpt> --weights ema`. This already smoke-tests the
