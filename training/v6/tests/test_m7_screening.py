@@ -225,6 +225,18 @@ def test_queue_walk_and_composition():
     for name in ("B0", "B1a", "B1b"):
         led.append({"arm": name, "overrides": [], "adopted": False, "best_after": "A8"})
     assert screen.next_entry(q, led, set())["id"] == "phase3_review"
+    # Phase 3 review (2026-09-29): B2, then B3 and B4 pick their variant from the verdicts.
+    e = screen.next_entry(q, led, {"phase3_review"})
+    assert e["name"] == "B2" and screen.compose(e, led)[:2] == ("A8", "A8")
+    led.append({"arm": "B2", "overrides": screen.compose(e, led)[2], "adopted": False, "best_after": "A8"})
+    e = screen.next_entry(q, led, {"phase3_review"})
+    assert e["name"] == "B3" and e["only_if"] == {"not_adopted": "B2"}
+    assert screen.compose(e, led)[:2] == ("B2", "A8") and e["also"] == ["B2"]
+    led.append({"arm": "B3", "overrides": [], "adopted": False, "best_after": "A8"})
+    e = screen.next_entry(q, led, {"phase3_review"})
+    assert e["name"] == "B4" and e["only_if"] == {"not_adopted": "B3"}
+    assert "targets.value.stratum_weights.exact_zero=2.0" in screen.compose(e, led)[2]
+    led.append({"arm": "B4", "overrides": [], "adopted": False, "best_after": "A8"})
     e = screen.next_entry(q, led, {"phase3_review"})
     assert e["name"] == "A0t" and screen.compose(e, led) == ("A0", None, e["set"])
     led.append({"arm": "A0t", "overrides": e["set"], "adopted": False, "best_after": "A8"})

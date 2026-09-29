@@ -46,6 +46,49 @@ arms:
       restratified shares depend on the mixture then current. Insert B2/B3/B4 above the
       confirmation entries in training/v6/screen_queue.yaml, then delete runs/screening/HOLD.
 
+  # --- Phase 3 review (2026-09-29; decisions: training/v6/DECISIONS.md, "Phase 3 review").
+  # B1's best is B1a (w_hard 0.25); it lost PV-restricted KL (-5.86% vs A3), so B2 runs.
+  - {name: B2, set: [model.aux_policy_head=true, targets.policy_hard.head=aux, targets.policy_hard.weight=0.25]}
+  # B3: derived records from the 90M roots at 10% of samples (the root groups scaled by 0.9), on
+  # top of B2's aux-head hard labels -- derived rows carry only hard labels. If B2 was not adopted
+  # the combination is judged against the best, and its delta against B2 is reported.
+  - name: B3
+    only_if: {adopted: B2}
+    set:
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.675},
+         {name: vonly90, where: {in_90m: 1, origin: root, label: [hard_only, value_only]}, share: 0.225},
+         {name: derived90, where: {in_90m: 1, origin: [ply1, ply2]}, share: 0.1}]"
+  - name: B3
+    only_if: {not_adopted: B2}
+    base: B2
+    ref: best
+    also: [B2]
+    set:
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.675},
+         {name: vonly90, where: {in_90m: 1, origin: root, label: [hard_only, value_only]}, share: 0.225},
+         {name: derived90, where: {in_90m: 1, origin: [ply1, ply2]}, share: 0.1}]"
+  # B4: exact-zero lambda 2; value-only 6-14 x1.5 and value-only mates x0.5 (6-14 mates x0.75),
+  # as rates WITHIN the value-only share, so the adopted policy / value-only / derived split holds.
+  - name: B4
+    only_if: {not_adopted: B3}
+    set:
+      - targets.value.stratum_weights.exact_zero=2.0
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.75},
+         {name: vo_614, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: [exact_zero, middle]}, share: 0.073256},
+         {name: vo_614_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: mate}, share: 0.019609},
+         {name: vo_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: mate}, share: 0.008101},
+         {name: vo_rest, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: [exact_zero, middle]}, share: 0.149034}]"
+  - name: B4
+    only_if: {adopted: B3}
+    set:
+      - targets.value.stratum_weights.exact_zero=2.0
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.675},
+         {name: vo_614, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: [exact_zero, middle]}, share: 0.06593},
+         {name: vo_614_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: mate}, share: 0.017648},
+         {name: vo_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: mate}, share: 0.007291},
+         {name: vo_rest, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: [exact_zero, middle]}, share: 0.134131},
+         {name: derived90, where: {in_90m: 1, origin: [ply1, ply2]}, share: 0.1}]"
+
   # --- 3.4 confirmation at seed t
   - {name: A0t, base: A0, ref: null, adopt: false, set: [run.data_seed=20260925, run.init_seed=20260925]}
   - {name: Ct, base: best, ref: A0t, adopt: false, confirms: best,

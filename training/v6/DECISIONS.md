@@ -541,3 +541,93 @@ recorded here and not edited into the doc:
   `tiny_cpu.yaml` trains on, has no `value_scale`. `test_export_round_trip` caught the
   first draft raising `KeyError` there.
 - **The engine side** is recorded in the root `DECISIONS.md`, "S7".
+
+## Phase 3 review (2026-09-29): B2, B3, B4
+
+The queue paused at `phase3_review` after B1b, 05:50 UTC. The owner handed these calls over
+("giving you the reins to make decisions here and log them"). They are written into
+`screen_queue.yaml` above the confirmation pair. The best at the pause was **A3**:
+dropout 0, smolgen, `canonical_65`, the A8 policy / value-only mixture and Muon.
+Phase 3 so far:
+- **B0** (all v2 roots): rejected. frozen90 was flat (+0.16% KL, −0.87% MSE), but new-tier
+  positions on `v2val_roots` improved (+1.6% KL, +3.6% MSE).
+- **B1a / B1b** (main-head hard labels): both rejected.
+
+**B1's best is B1a (`w_hard` 0.25).** Against A3:
+
+| arm | PV-restricted KL | MSE | top-1 vs SF | policy entropy |
+|---|---:|---:|---:|---:|
+| B1a (0.25) | −5.86% | +0.19% | +1.17% | 1.7490 → 1.7206 |
+| B1b (0.5) | −12.10% | −3.54% | +0.43% | 1.7490 → 1.7130 |
+
+B1a is better on every primary metric. The main-head hard labels sharpen the prior, which is
+the §14 risk the doc names: SF top-1 and hard NLL improve while the PV-move distribution
+drifts from the multi-PV target.
+
+**B2 runs, because its pre-registered trigger fired:** B1's best lost PV-restricted KL.
+- **Config:** `model.aux_policy_head=true`, `targets.policy_hard.head=aux`,
+  `targets.policy_hard.weight=0.25`, on A3, judged against A3.
+- **Metrics:** PV metrics, since hard labels are in the loss (the driver's default).
+- **Not gated on inference cost.** The engine never reads the aux head, so a production
+  export should drop it: `aux_policy_head=false` and no `aux_*` weights.
+  - This is not built yet: `load_for_inference` builds whatever the export's config says, and
+    the forward computes the aux logits when the head exists.
+  - It is only needed if B2 is adopted.
+
+**B3 decision: derived records at 10% of samples, on top of B2's aux-head hard labels.**
+- **The pool.** B0 was rejected, so the pool stays the 90M roots, and the derived group is
+  those roots' derived records: `{in_90m: 1, origin: [ply1, ply2]}`, 24,752,428 records.
+- **Shares.** The root groups are scaled by 0.9 (policy90 0.675, vonly90 0.225), plus
+  derived90 at 0.10.
+- **Hard labels are required.** Derived rows carry only a hard label and a value, so
+  without hard labels B3 would test them as value-only data. That misses the question §6.3
+  asks.
+- **The brief's "B1's best `w_hard`" is taken on B2's aux head, not the main head.** B1
+  showed that the main-head configuration hurts PV-KL for a reason unrelated to derived
+  data. B3 on it would be rejected for the known reason and teach nothing.
+- **Two variants, chosen by `only_if`:**
+  - *B2 adopted:* B3 builds on the best (B2) and is judged against it, which is one change.
+  - *B2 not adopted:* B3 builds on B2's overrides and is judged against the best (A3),
+    with its delta against B2 reported (`also: [B2]`). A B3 adoption then means
+    "aux-head hard labels plus derived beats A3". The B2 delta shows how much of that is
+    the derived data.
+
+**B4 decision: one combined arm, as §13.2 specifies.**
+- **Value loss:** exact-zero λ = 2 (`targets.value.stratum_weights.exact_zero`).
+- **Value-only sampling rates:** 6–14 ×1.5 and mates ×0.5. 6–14 mates get ×0.75, both
+  multipliers applied.
+- **The multipliers are rates within the value-only share,** and the adopted split is kept:
+  0.75 policy / 0.25 value-only, or 0.675 / 0.225 / 0.10 with derived.
+  - Applying them to the whole mixture and renormalising would also move A8's adopted
+    policy share, a second change in the same arm.
+- **Cell counts** (in_90m value-only roots, train strata):
+
+  | cell | records | rate | share of the 0.25 value-only budget |
+  |---|---:|---:|---:|
+  | 6–14, non-mate | 7,285,717 | ×1.5 | 0.073256 |
+  | 6–14, mate | 3,900,463 | ×0.75 | 0.019609 |
+  | other buckets, mate | 2,416,956 | ×0.5 | 0.008101 |
+  | rest | 22,233,458 | ×1 | 0.149034 |
+
+  Each budget's decimals sum to it exactly. The smallest group gets 3.7 samples per
+  micro-batch.
+- **Two variants:** with or without the derived group, chosen by whether B3 was adopted.
+- **B4 builds on whatever is best,** so it inherits the hard-label settings as adopted.
+
+**Validation before release.** Every branch was walked with the real ledger plus synthetic
+verdicts: B2, B3 and B4 each adopted or not, 8 paths. On each path:
+- the right variants are picked;
+- every composed config resolves;
+- the queue then reaches A0t and Ct, and ends.
+
+Every distinct mixture was built against the real train strata: disjoint groups and the
+expected sizes. `test_queue_walk_and_composition` now walks the Phase 3 entries.
+
+**Found by that validation: YAML 1.1 reads `6_14` as the integer 614** (and `15_27` as 1527),
+because underscores are allowed in YAML integers. It is the same class of trap as the `on:` key.
+- The schema refused it with a clear error. The driver would have stopped at B4's config
+  resolve, before any training.
+- Bucket names are quoted in the queue now. They had never been used in a `where` clause before.
+
+**Time left:** B2, B3 and B4 at Muon speed, then A0t and Ct. About 5.2 h each (A0t about
+4.2 h), roughly 25 h. The confirmation match itself remains blocked on contract B.
