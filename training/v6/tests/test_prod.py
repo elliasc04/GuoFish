@@ -303,7 +303,11 @@ def test_dryrun_sanity_pause_then_stop_now(dry):
     until(lambda: (sj(dry, name, "state.json") or {}).get("paused"), "the sanity pause")
     ctl, st = sj(dry, name, "control.json"), sj(dry, name, "state.json")
     assert ctl["action"] == "pause" and ctl["by"] == "prod.py" and "sanity" in ctl["reason"]
-    assert st["sanity"]["pass"] is False and st["main"]["samples"] == 5120      # halted on that checkpoint
+    # halted on the first checkpoint the driver saw after the check: 5,120 unless the toy
+    # trainer (a checkpoint every ~0.5 s) wrote the next within the same 1 s poll
+    assert st["sanity"]["pass"] is False and st["main"]["samples"] >= 5120
+    time.sleep(3)
+    assert sj(dry, name, "state.json")["main"]["samples"] == st["main"]["samples"]   # stopped
     assert any(a["kind"] == "sanity" for a in st["anomalies"])
     control(dry, name, "stop_now")
     finish(dry, proc, name)
