@@ -239,6 +239,10 @@ class Driver:
             while True:
                 try:
                     self._upload(item)
+                    if item[0] == "ckpt":   # counted once, after the whole item (retries re-run it)
+                        with self.lock:
+                            self.ckpts_queued -= 1
+                            self.lagging = self.lagging and self.ckpts_queued > self.p.max_upload_lag
                     break
                 except STORE_ERRORS as e:   # a store outage must not end the run: retried, loudly
                     print(f"[prod] upload {item[0]} {item[1] if len(item) > 1 else ''} failed "
@@ -276,9 +280,6 @@ class Driver:
                         self.state["branch_ckpt"] = entry
                 else:
                     self.state["finals"][meta["segment"]] = entry
-                self.ckpts_queued -= 1
-                if self.ckpts_queued <= self.p.max_upload_lag:
-                    self.lagging = False
             put_json(self.store, self.key + "state.json", self.snapshot())
             if meta["rolling"]:
                 self._prune(meta["rolling"])
@@ -385,8 +386,8 @@ class Driver:
             self.last_step = ev
         elif e == "quick_eval":
             self.put(f"evals/{self.seg}_quick_s{n}.json", ev)
-            if self.seg == "main" and n == self.p.sanity.samples:
-                self.sanity(ev)
+            if self.seg == "main" and n == self.p.sanity.samples and self.state["sanity"] is None:
+                self.sanity(ev)             # once per run: a replay after a resume doesn't re-pause
         elif e in ("full_eval", "memorization_gap"):
             kind = "full" if e == "full_eval" else "memgap"
             tag = f"{self.seg}_{kind}_s{n}"

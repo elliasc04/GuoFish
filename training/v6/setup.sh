@@ -80,7 +80,7 @@ if ! command -v uv >/dev/null; then
   curl -LsSf https://astral.sh/uv/0.10.12/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
 fi
-[ -x .venv/bin/python ] || uv venv --python 3.13 .venv
+[ -x .venv/bin/python ] || uv venv --python 3.13.7 .venv          # the local training env
 if [ "$CPU" = 1 ]; then BACKEND=cpu
 elif ge "$CUDA" 12.9; then BACKEND=cu129
 elif ge "$CUDA" 12.8; then BACKEND=cu128

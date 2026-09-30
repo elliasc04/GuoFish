@@ -631,3 +631,97 @@ because underscores are allowed in YAML integers. It is the same class of trap a
 
 **Time left:** B2, B3 and B4 at Muon speed, then A0t and Ct. About 5.2 h each (A0t about
 4.2 h), roughly 25 h. The confirmation match itself remains blocked on contract B.
+
+## VM harness (2026-09-30): production driver and VM packaging
+
+Brief: `docs/capacity/training/prod/vm_harness_brief.md`. Where `training_brief.md` differs
+(it claims to supersede this brief; section and report names), the harness brief is followed,
+on the owner's word. Operator steps and every store schema: `PROD_RUNBOOK.md`.
+
+**Sample grid.** Every cadence must be a multiple of the 1,024 effective batch, because the
+trainer's events fire on `done % every == 0`, and 300M, 150M and 10M are not.
+- **Stable checkpoints** every 150,000,640 samples (146,485 steps, the first multiple ≥ 150M).
+  **Branch points** are 2×, 4×, 8× and 16× that: 300,001,280 / 600,002,560 / 1,200,005,120 /
+  2,400,010,240. Their decays are 52.9M / 105.9M / 211.8M / 423.5M, 3.195B samples in all.
+- **Rolling checkpoints and quick-val** every 10,240,000, the grid the screening already used.
+  The 40M sanity check reads 40,960,000, which is also on C0's 2,048,000 quick-val grid.
+- **Warmup** is exactly 6,000,000; it needn't sit on the grid.
+
+**One schedule for the whole main line.** `schedule.total_samples` = ceil(2,400,010,240 / 0.85),
+so the main line holds peak LR through the last branch point. A stable segment is `train.py
+--stop-at-samples <branch point>`: a clean exit that leaves the schedule alone. A normal
+resume can't change `total_samples`, and the stop point is a run control, not a
+hyperparameter. `branch_decay.py` computes the same total for the 2.4B branch, so the final
+decay is just the last branch, with no special case.
+
+**The memorization gap is a CLI flag (`--seen-eval GROUP:N`), not a config field.** Any new
+schema field changes every existing config's plain form and hash. Old checkpoints (Ct's
+included) would then be refused on resume, and `export --weights best` would refuse their
+`best.pt`. The seen set is 200,000 roots of the `policy` group, drawn with
+`default_rng([data_seed, 0x5EE7])`. The gap is logged for raw and EMA at every full eval,
+with `valid` = the group finished a pass.
+
+**Stop rule, as implemented:**
+- **"Better of raw and EMA"** is taken separately for KL and for total, per branch.
+- **"Anomaly" at the first branch** means `nonfinite` or `trainer_exit`. An upload lag, an
+  ignored `control.json` or a sanity miss the operator chose to continue past doesn't stop
+  the run.
+- **After the last branch** the run always stops; the decision still records the rule's
+  verdict.
+- **Ship** is the lowest frozen90 total over every finished branch × {raw, EMA}.
+
+**Store layout additions:**
+- **Branch rolling checkpoints** go to `branches/<name>/rolling/` (last 2), so a VM lost
+  12 h into the 2.4B decay resumes inside the branch rather than restarting it.
+  `branch_decay.py --resume` continues from the branch's own latest checkpoint.
+- `provenance_resume_*` / `code_resume_*` are uploaded on each resume.
+- **Eval tags** are `evals/<segment>_{quick,full,memgap}_s<N>`, `decision_<branch>`,
+  `timecap_<branch>` and `sanity_s<N>`.
+
+**Integrity and ordering.** One upload thread, one FIFO queue: the checkpoint, then its
+`.sha256`, then `state.json`. Before a checkpoint is queued, the log is read to its end and
+the metrics are flushed, so the store never has a gap in the loss trace before a resume
+point. That same ordering makes a pause asked for by the sanity check land on that check's
+own checkpoint. Checkpoints are hard-linked into a staging directory beside the run dir, so
+the trainer's rotation can't delete one mid-upload. Resume trusts only a checkpoint whose
+sidecar exists and equals both `state.json` and the downloaded bytes; a local leftover run
+directory is never trusted.
+
+**Time cap.** The rate is trained samples (stable plus decay) over the driver's wall time
+across sessions, so evals, compiles and restarts are counted: a conservative estimate. The
+first segment always starts. The cap is checked before each later stable segment. The
+operator raises it with `"time_cap_h"` in `control.json`.
+
+**Control.** `control.json` is edge-triggered: it acts once per change of content.
+- `pause` stops the trainer at its next rolling checkpoint or at the segment's end.
+- The sanity check pauses by writing `control.json` synchronously, so a poll can't race a
+  queued write.
+
+**Production pool.** `{origin: root, label: multipv}` at 0.75 and
+`{origin: root, label: [hard_only, value_only]}` at 0.25. This is A3's two groups without
+`in_90m`, so `t20` policy roots fall into `policy` by label.
+
+**VM packaging:**
+- `requirements-prod.txt` holds the brief's pins plus the transitive pins from the local env,
+  and `psutil` (for `test_m7`); scipy was dropped, since nothing imports it.
+- torch comes through `uv pip install --torch-backend`, choosing cu129, cu128 or cu126 by
+  the driver's CUDA version. Its metadata pins triton and the nvidia libraries.
+- **boto3 is the one S3 client**, for both `setup.sh`'s parallel pull and the uploads.
+- `setup.sh` reads RAM and vCPUs through cgroup limits: a RunPod pod is a container, and
+  `/proc/meminfo` shows the host's RAM.
+- `--cpu` turns the hardware checks into warnings for the dry run.
+- `sha256.txt` paths are relative to `data/` (key = `data/<path>`). The pull verifies at pull
+  time and leaves no copy in the tree, since that would dirty the checkout.
+
+**Linux port.** No PowerShell launcher, `Start-Process` or priority code lives in
+`training/v6` beyond `tools/screen.py`'s docstring (a local-box tool) and `tools/after_s2.py`
+(a Windows one-off, untracked).
+- The stale untracked `prod.sh` (L40S, 90M pool) is removed; `setup.sh` and the runbook
+  replace it.
+- The VM uses tmux, and the trainer runs at normal priority, since it is the VM's only job.
+- Triton comes with torch; `descriptive_names=False` is kept.
+
+**Dry-run data.** `tools/make_synth.py` carves 16,384 train and 2,048 val records out of
+frozen90 v2, plus a value-negated copy. Training on that copy with value loss ×10 and policy
+loss ×0.1 makes the total worse from branch to branch, which drives the "worse total" path
+on purpose. The natural run also reaches "worse total" at its third branch, by overfitting.

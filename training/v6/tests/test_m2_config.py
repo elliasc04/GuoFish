@@ -90,9 +90,7 @@ def test_hash_stable_and_sensitive(tmp_path):
         [sys.executable, "-c", "from training.v6.config import load_config, config_hash;"
          f"print(config_hash(load_config(r'{CFG / 'base.yaml'}')))"],
         capture_output=True, text=True, cwd=REPO, check=True,
-        env={"PYTHONHASHSEED": "12345", "CUDA_VISIBLE_DEVICES": "-1",
-             "SYSTEMROOT": __import__("os").environ["SYSTEMROOT"],
-             "PATH": __import__("os").environ["PATH"]})
+        env={**__import__("os").environ, "PYTHONHASHSEED": "12345", "CUDA_VISIBLE_DEVICES": "-1"})
     assert out.stdout.strip() == config_hash(a)
     # the resolved dict rebuilds to the same config
     assert build_config(to_plain(a)) == a

@@ -45,7 +45,7 @@ bash training/v6/setup.sh 2>&1 | tee setup.log
    - `/dev/shm` ≥ 16 GB;
    - ≥ 12 vCPUs.
 2. **Environment:**
-   - installs uv 0.10.12 and a Python 3.13 `.venv`;
+   - installs uv 0.10.12 and a Python 3.13.7 `.venv`;
    - installs `training/v6/requirements-prod.txt`, taking torch from the PyTorch index that matches the driver (cu129, cu128 or cu126);
    - prints the resolved versions.
 3. **Data:**
