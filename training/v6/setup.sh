@@ -10,7 +10,7 @@
 #   --mb "A B"         smoke splits, micro_batch x accum (default "512x2 1024x1")
 #   --steps N          smoke steps per split (default 300)
 #   --set KEY=VALUE    passed to the smoke's trainer (repeatable)
-#   --cpu              dry run on a CPU box: hardware checks warn instead of failing, CPU torch
+#   --cpu              dry run on a CPU box: hardware checks warn instead of failing; cu129 torch
 #   --skip-data | --skip-smoke
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -81,7 +81,7 @@ if ! command -v uv >/dev/null; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 [ -x .venv/bin/python ] || uv venv --python 3.13.7 .venv          # the local training env
-if [ "$CPU" = 1 ]; then BACKEND=cpu
+if [ "$CPU" = 1 ]; then BACKEND=cu129      # the VM's wheels, which run without a GPU (the cpu build lacks CUDA hooks tests patch)
 elif ge "$CUDA" 12.9; then BACKEND=cu129
 elif ge "$CUDA" 12.8; then BACKEND=cu128
 else BACKEND=cu126; fi

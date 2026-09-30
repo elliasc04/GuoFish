@@ -222,9 +222,14 @@ def test_s3_kill_and_resume_is_bit_identical(tmp_path):
 # ----------------------------------------------------------- refusals
 
 def test_refusals(tmp_path):
-    r = subprocess.run([sys.executable, "-m", "training.v6.train", "--config", TINY, "--set",
-                        f"run.out_root={tmp_path.as_posix()}", "run.name=dirty"],
-                       cwd=REPO, capture_output=True, text=True)
+    probe = REPO / f"dirty_probe_{tmp_path.name}.txt"     # untracked: a clean checkout (the VM) is dirty too
+    probe.write_text("x")
+    try:
+        r = subprocess.run([sys.executable, "-m", "training.v6.train", "--config", TINY, "--set",
+                            f"run.out_root={tmp_path.as_posix()}", "run.name=dirty"],
+                           cwd=REPO, capture_output=True, text=True)
+    finally:
+        probe.unlink()
     assert r.returncode != 0 and "working tree is dirty" in r.stderr     # allow_dirty=false
 
     short = ["schedule.total_samples=2560", "schedule.warmup_samples=0", "ckpt.every_samples=1280",

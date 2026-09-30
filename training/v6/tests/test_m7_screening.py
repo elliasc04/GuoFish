@@ -90,7 +90,8 @@ class Probe(torch.utils.data.Dataset):
         return len(self.ds)
 
     def __getitem__(self, k):
-        return self.ds[k], psutil.Process().memory_info().private
+        m = psutil.Process().memory_info()     # private bytes on Windows; USS elsewhere (no `private`)
+        return self.ds[k], m.private if hasattr(m, "private") else psutil.Process().memory_full_info().uss
 
 
 if __name__ == "__main__":

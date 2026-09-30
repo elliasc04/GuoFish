@@ -297,6 +297,7 @@ class Driver:
     # ---- fetch (resume) ------------------------------------------------
     def fetch(self, rel: str, want_sha: str | None = None) -> Path:
         """A checkpoint is trusted only if its sidecar exists and matches (and matches state.json)."""
+        self.drain()            # our own queued uploads land first (the branch's stable checkpoint)
         path = local_path(self.run_dir, rel)
         side = self.store.get_bytes(self.key + rel + ".sha256")
         if side is None:
