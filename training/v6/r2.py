@@ -196,7 +196,6 @@ def pull(store, prefix: str, dest: Path, workers: int) -> None:
     dt = time.monotonic() - t0
     if bad:
         raise SystemExit(f"{len(bad)} file(s) failed verification:\n  " + "\n  ".join(bad[:50]))
-    (dest / "sha256.txt").write_bytes(raw)
     print(f"verified {len(entries)} files against sha256.txt in {dt:.0f} s "
           f"({total / 1e6 / max(dt, 1e-9):,.0f} MB/s)", flush=True)
 
