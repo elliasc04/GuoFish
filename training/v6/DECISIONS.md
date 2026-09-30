@@ -725,3 +725,17 @@ operator raises it with `"time_cap_h"` in `control.json`.
 frozen90 v2, plus a value-negated copy. Training on that copy with value loss ×10 and policy
 loss ×0.1 makes the total worse from branch to branch, which drives the "worse total" path
 on purpose. The natural run also reaches "worse total" at its third branch, by overfitting.
+
+**Found by the Ubuntu container run (2026-09-30).**
+- A race in `prod.py`: a branch fetched its stable checkpoint while the upload was still
+  queued. `fetch()` now drains the queue first.
+- Three Windows-only test assumptions:
+  - `SYSTEMROOT` in `test_m2_config`;
+  - a dirty working tree in `test_refusals`;
+  - `psutil`'s `private` in `test_m7`.
+- **H2's measured worker-memory drop is Windows-only.** Spawned workers there commit
+  OpenBLAS's per-core buffers. Linux forks workers and maps the buffers lazily, so the test
+  asserts the drop on Windows and batch identity everywhere. `OPENBLAS_NUM_THREADS=1` stays
+  on both.
+- `setup.sh --cpu` installs the cu129 wheels, not the CPU build, so a CPU dry run has the
+  VM's packages.
