@@ -1,7 +1,13 @@
 """v6 trainer (§8-§10).
 
     python -m training.v6.train --config training/v6/config/configs/base.yaml \
-        [--set a.b=c ...] [--resume latest|<ckpt>]
+        [--set a.b=c ...] [--resume latest|<ckpt>] [--stop-at-samples N] [--seen-eval GROUP:N]
+
+--stop-at-samples ends the run early at sample N without touching the schedule
+(a production stable segment: the checkpoint at N is the caller's to request via
+ckpt.stable_every_samples). --seen-eval evaluates N fixed training records of
+mixture group GROUP at every full eval and logs the memorization gap against
+frozen90; it is a diagnostic, so it stays out of the config and its hash.
 
 The data stream, augmentation and LR are closed-form in the sample index, so
 a resume at ANY step boundary (mid-pass or at a pass boundary) continues the
@@ -80,7 +86,8 @@ def _strata_meta(path: Path) -> dict:
 
 
 def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
-        crash_after_steps: int | None = None) -> dict:
+        crash_after_steps: int | None = None, stop_at: int | None = None,
+        seen_eval: tuple[str, int] | None = None) -> dict:
     dev = torch.device(cfg.system.device)
     if dev.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("system.device=cuda but CUDA is not available")
@@ -134,6 +141,18 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     quick_idx = quick_subset(frozen.codes, cfg.eval.quick_size, cfg.eval.quick_seed)
     extra = [load_evalset(n, cfg.model.token_scheme, cfg.eval.batch, cfg.eval.workers)
              for n in cfg.eval.extra_sets]
+    seen = None
+    if seen_eval is not None:                # fixed training records of one group
+        gname, n_seen = seen_eval
+        if gname not in mixture.names:
+            raise SystemExit(f"--seen-eval: no mixture group {gname!r} in {mixture.names}")
+        members = np.asarray(mixture._member(mixture.names.index(gname)), dtype=np.int64)
+        if n_seen > len(members):
+            raise SystemExit(f"--seen-eval: {n_seen:,} > {len(members):,} records in {gname}")
+        idx = np.sort(np.random.default_rng([cfg.run.data_seed, 0x5EE7]).choice(members, n_seen, replace=False))
+        seen = EvalSet(f"seen_{gname}", resolve(cfg.data.corpus), cfg.data.split, strata_path,
+                       cfg.model.token_scheme, cfg.eval.batch, cfg.eval.workers, indices=idx,
+                       manifest=manifest_path)
 
     # ---- model / optimizer / resume -----------------------------------
     torch.manual_seed(cfg.run.init_seed)            # dropout (and v5_deepcopy's init draws)
@@ -213,6 +232,13 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
         log.say(f"  full eval @ {done:,} ({reason}): " + " | ".join(
             f"{w} KL {m['policy_kl']:.5f} MSE {m['value_mse']:.5f} total {m['total']:.5f}"
             for w, m in results.items()))
+        if seen is not None:                # memorization gap: (seen - frozen90) / frozen90
+            passes = mixture.passes(done)[seen_eval[0]]
+            for which, net in nets.items():
+                m, f = evaluate(net, seen, dev, amp), results[which]
+                gap = {k: (m[k] - f[k]) / f[k] for k in ("policy_kl", "value_mse")}
+                log.event("memorization_gap", samples=done, weights=which, reason=reason, set=seen.name,
+                          group_passes=passes, valid=passes >= 1, gap=gap, seen=m)
         for es in extra:                    # H3: reported, never used for best.pt
             for which, net in nets.items():
                 m = evaluate(net, es, dev, amp)
@@ -237,9 +263,27 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
             rotate(run_dir / "ckpt", cfg.ckpt.keep_last)
 
     # ---- loop ----------------------------------------------------------
+    stop_steps = total_steps
+    if stop_at is not None:
+        if stop_at % eff or not step0 * eff < stop_at <= total_steps * eff:
+            raise SystemExit(f"--stop-at-samples {stop_at}: must be a multiple of {eff} "
+                             f"in ({step0 * eff}, {total_steps * eff}]")
+        stop_steps = stop_at // eff
+    cuda = dev.type == "cuda"
+
+    def mark():
+        """GPU-stream timestamp on CUDA (read at the log sync, no per-step host
+        sync); wall clock on CPU, where every op is synchronous."""
+        if not cuda:
+            return time.perf_counter()
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return e
+
+    spans = []                          # (kind, start mark, end mark) since the last log
     ds = StreamDataset(shards, mixture, builder, total_steps * accum)
     loader = torch.utils.data.DataLoader(
-        ds, batch_size=None, sampler=range(step0 * accum, total_steps * accum),
+        ds, batch_size=None, sampler=range(step0 * accum, stop_steps * accum),
         num_workers=cfg.data.workers, prefetch_factor=cfg.data.prefetch_factor if cfg.data.workers else None,
         pin_memory=dev.type == "cuda", persistent_workers=False, generator=torch.Generator())
     it = iter(loader)
@@ -251,7 +295,7 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     t_int, wait, excl, n_int = time.perf_counter(), 0.0, 0.0, 0
     params = list(model.parameters())
 
-    for step in range(step0, total_steps):
+    for step in range(step0, stop_steps):
         s = step * eff
         lr, b1 = sched.lr(s), sched.beta1(s)
         for g in opt.param_groups:
@@ -265,14 +309,18 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
         for b in window:
             stream.update(b["record_index"].numpy().tobytes())
             stream.update(b["mirrored"].numpy().tobytes())
+            m0 = mark()
             bd = {k: v.to(dev, non_blocking=True) for k, v in b.items()
                   if k not in ("record_index", "group", "sample_index", "mirrored")}
+            m1 = mark()
             with amp():
                 out = train_fn(bd["tokens"])
             loss, m = loss_fn(out, bd)
             loss.backward()
             wl += loss.detach()
             acc += torch.stack([m[k] for k in METRICS])
+            spans += [("h2d", m0, m1), ("fwd_bwd", m1, mark())]
+        m0 = mark()
         gn = torch.nn.utils.clip_grad_norm_(params, cfg.optim.grad_clip)
         found = (~torch.isfinite(wl) | ~torch.isfinite(gn)).float()
         opt.found_inf, opt.grad_scale = found, None
@@ -280,18 +328,25 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
         opt.zero_grad(set_to_none=True)
         if ema is not None:
             ema.update(model)
+        spans.append(("optim", m0, mark()))
         gn_sum += torch.nan_to_num(gn, nan=0.0, posinf=0.0)
         nonfinite += found
         step_losses.append(wl)
         n_int += 1
         done = s + eff
 
-        if (step + 1) % cfg.system.log_every == 0 or step + 1 == total_steps:
+        if (step + 1) % cfg.system.log_every == 0 or step + 1 in (total_steps, stop_steps):
             vals = torch.cat([acc, gn_sum[None], nonfinite[None], torch.stack(step_losses)]).tolist()
             a = dict(zip(METRICS, vals[:len(METRICS)]))
             gnm, nf, losses = vals[len(METRICS)] / n_int, vals[len(METRICS) + 1], vals[len(METRICS) + 2:]
             wall = time.perf_counter() - t_int - excl
             rows = n_int * eff
+            if cuda:
+                torch.cuda.synchronize()
+            tm = {"h2d": 0.0, "fwd_bwd": 0.0, "optim": 0.0}
+            for kind, x, y in spans:
+                tm[kind] += x.elapsed_time(y) / 1e3 if cuda else y - x
+            spans.clear()
             rec = {"samples": done, "step": step + 1, "lr": lr, "beta1": b1,
                    "loss": sum(losses) / len(losses), "step_losses": losses,
                    "soft_kl": a["soft_kl"] / a["n_soft"] if a["n_soft"] else None,
@@ -304,6 +359,9 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
                    "loader_wait_frac": wait / wall if wall > 0 else None,
                    "peak_vram_mib": (torch.cuda.max_memory_allocated() / 2 ** 20
                                      if dev.type == "cuda" else None),
+                   # seconds this interval: data_wait and eval (evals + checkpoint writes) are
+                   # host time; h2d, fwd_bwd and optim are GPU-stream time (CUDA events)
+                   "time_s": {"interval": wall + excl, "data_wait": wait, **tm, "eval": excl},
                    "passes": mixture.passes(done), "stream_sha": stream.hexdigest()[:16]}
             log.event("step", **rec)
             if step + 1 == step0 + cfg.system.log_every or (step + 1) % (cfg.system.log_every * 20) == 0:
@@ -328,6 +386,12 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
             log.close()
             os._exit(CRASH_EXIT)          # simulated kill: no cleanup, no checkpoint
 
+    if stop_steps < total_steps:
+        log.event("run_stop", samples=stop_steps * eff)
+        log.say(f"[{cfg.run.name}] stopped at {stop_steps * eff:,} samples (--stop-at-samples)")
+        log.close()
+        shards.close()
+        return state["metrics"]
     end = total_steps * eff
     full_eval(end, "end")
     final = run_dir / ("final.pt" if branch else f"ckpt/s{end}.pt")
@@ -346,6 +410,8 @@ def main(argv=None) -> int:
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     ap.add_argument("--resume", default=None, help="'latest' or a checkpoint path")
     ap.add_argument("--crash-after-steps", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--stop-at-samples", type=int, default=None)
+    ap.add_argument("--seen-eval", default=None, type=parse_seen, metavar="GROUP:N")
     args = ap.parse_args(argv)
     cfg = load_config(args.config, args.set)
     run_dir = resolve(cfg.run.out_root) / cfg.run.name
@@ -354,8 +420,16 @@ def main(argv=None) -> int:
         resume = latest_checkpoint(run_dir)
     elif args.resume:
         resume = Path(args.resume)
-    run(cfg, run_dir=run_dir, resume=resume, crash_after_steps=args.crash_after_steps)
+    run(cfg, run_dir=run_dir, resume=resume, crash_after_steps=args.crash_after_steps,
+        stop_at=args.stop_at_samples, seen_eval=args.seen_eval)
     return 0
+
+
+def parse_seen(spec: str) -> tuple[str, int]:
+    group, _, n = spec.rpartition(":")
+    if not group or not n.isdigit() or int(n) <= 0:
+        raise argparse.ArgumentTypeError(f"--seen-eval {spec!r}: expected GROUP:N")
+    return group, int(n)
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ def load_config(path, overrides=()) -> Config:
     d = _read_yaml(Path(path), ())
     for spec in overrides:
         d = apply_override(d, spec)
+    d.pop("prod", None)         # the production driver's own section (tools/prod.py), not trainer config
     return build_config(d)
 
 

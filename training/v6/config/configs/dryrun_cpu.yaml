@@ -1,0 +1,33 @@
+# CPU dry run of the production driver (VM harness brief §8): prod.yaml at d64x2 on the
+# synthetic shards of tools/make_synth.py, with the branch grid scaled down 39,063x:
+# stable checkpoints every 3,840 samples (30 steps x 128), branch points at 2x, 4x, 8x, 16x,
+# total ceil(61,440 / 0.85). Its numbers mean nothing about model quality.
+extends: prod.yaml
+run: {name: dryrun, out_root: models/v6/dryrun}
+model: {d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128, head_dim: 16, smolgen: {compress: 8, gen: 32, hidden: 32}}
+data:
+  corpus: data/processed/synth_v6
+  manifest: data/processed/synth_v6/manifest.json
+  strata: data/processed/strata/synth_v6_train.strata2.npy
+  workers: 0
+optim: {micro_batch: 64, accum: 2, lr: 1.0e-3}
+schedule: {total_samples: 72283, warmup_samples: 1280}
+ema: {half_life_samples: 2560}
+eval:
+  frozen_dir: data/processed/synth_v6_val
+  frozen_strata: data/processed/strata/synth_v6_val_val.strata2.npy
+  quick_every_samples: 1280
+  quick_size: 1024
+  extra_sets: []
+  batch: 512
+  workers: 0
+ckpt: {every_samples: 1280, keep_last: 2, stable_every_samples: 3840}
+system: {device: cpu, precision: fp32, compile: false, log_every: 5}
+prod:
+  store_prefix: runs/_test/
+  branch_points: [7680, 15360, 30720, 61440]
+  sanity: {samples: 5120, ref_kl: null, tol: 0.03}
+  seen_eval: {group: policy, n: 1000}
+  status_every_s: 2
+  metrics_every_s: 5
+  control_every_s: 1
