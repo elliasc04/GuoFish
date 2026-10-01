@@ -121,16 +121,19 @@ def uci_smoke(export: Path, log_path: Path) -> dict:
 # ------------------------------------------------------------ 2. forward
 
 @torch.no_grad()
-def forward_check(export: Path, device: torch.device, rows: torch.Tensor) -> dict:
-    reference, _ = load_for_inference(export)
+def forward_check(export: Path, device: torch.device, positions: list[str]) -> dict:
+    reference, contract = load_for_inference(export)
     reference = reference.to(device)
     engine, _ = ev.load_default_model(export, device)
+    # the core's own rows for this contract; the net reads the first seq_length slots
+    rows = torch.stack([torch.from_numpy(guofish_core.eval_row(f, contract)["tokens"])
+                        for f in positions]).long()
     amp = lambda: torch.autocast("cuda", dtype=ev.AUTOCAST_DTYPE)  # noqa: E731
     out = {"rows": len(rows), "policy_words_differing": 0, "value_max_abs_diff": 0.0}
     for s in range(0, len(rows), 128):
         t = rows[s:s + 128].to(device)
         with amp():
-            p_ref, v_ref = reference(t)
+            p_ref, v_ref = reference(t[:, :reference.seq_length])
             p_eng, v_eng = engine(t)
         out["policy_words_differing"] += int((p_eng.float() != p_ref).sum())
         out["value_max_abs_diff"] = max(out["value_max_abs_diff"], float((v_eng - v_ref).abs().max()))
@@ -199,9 +202,8 @@ def main() -> int:
         print("   " + ln[:200])
 
     positions = fens(CORPUS)[:args.limit]
-    rows = torch.stack([torch.from_numpy(guofish_core.tokens(f)) for f in positions]).long()
     print("2. forward vs training-side", flush=True)
-    report["forward"] = forward_check(args.export, device, rows)
+    report["forward"] = forward_check(args.export, device, positions)
     print(f"   {report['forward']}")
 
     print(f"3. eager vs Inductor, {len(positions)} positions at {args.sims} sims, W=1 K=1", flush=True)

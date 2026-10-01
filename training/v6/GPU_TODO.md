@@ -99,7 +99,7 @@ python -m training.v6.tools.export <run>/ckpt/s<N>.pt --weights raw
 python tools/s7_check.py <run>/export/<file>.pt      # GPU; writes runs/s7/<file>.json
 ```
 
-It covers steps 1–3 below. Step 4 (contract B) is still open.
+It covers steps 1–3 below. Step 4 (contract B) is built; see "Contract B" below.
 
 **Result on A7 (2026-09-28):**
 - UCI and forward: pass. The forward is bit-exact.
@@ -107,6 +107,12 @@ It covers steps 1–3 below. Step 4 (contract B) is still open.
 - The owner accepted it; the ruling and the disagreements are in the root `DECISIONS.md`.
 - A9 (`canonical_65`) was adopted, so the final recipe is a contract-B net. Step 4 now blocks the
   confirmation match.
+
+**Contract B (2026-09-29):** the C++ `canonical_65` tokenizer, policy remap and value sign exist,
+selected by the export's declared contract. B1–B3 pass (`tests/test_s7_contract_b.py`; B2 needs
+the GPU, ~4 min beside a training run). What remains is `tools/s7_check.py` on the final
+contract-B export, in a HOLD gap: UCI, forward and the ≥ 98.75% numerics, as for A7. Root
+`DECISIONS.md`, "S7 contract B", has the details.
 
 The original plan:
 

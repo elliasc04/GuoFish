@@ -8,7 +8,9 @@ by `tools/s7_check.py`. What is pinned here:
      training-side forward exactly.
   2. Storing the Linear layers in bf16 changes no output bit under bf16 autocast:
      that cast is the one autocast applies anyway.
-  3. Contract-B exports and exports without a value_scale are refused.
+  3. A contract-B export reads the core's canonical_65 rows and hands the core
+     contract B, which owns the policy remap and value sign
+     (tests/test_s7_contract_b.py); exports without a value_scale are refused.
   4. v5 and legacy checkpoints are not mistaken for v6 exports; they keep the
      loader every golden is anchored to.
 
@@ -96,10 +98,57 @@ def test_bf16_linear_storage_changes_no_output_bit_under_autocast(tmp_path, attn
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
-def test_contract_b_exports_are_refused(tmp_path):
+B_FENS = [
+    "rnbqkbnr/ppp1pppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 3",       # Black, legal ep
+    "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",      # White, legal ep
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",        # ep square, no capturer
+    "r3k2r/8/8/8/8/8/8/R3K2R b Kq - 0 1",                                  # partial rights
+    "r3k2r/8/8/8/8/8/8/R3K2R w Qk - 0 1",
+    "8/8/8/8/8/8/p6k/7K b - - 0 1",                                        # promotion
+]
+
+
+def test_contract_b_export_reads_the_cores_canonical_rows(tmp_path):
+    """The core's canonical_65 rows in, the net's own side-to-move outputs out."""
+    import chess
+    from core.guofish_net.tokenizers import tokens_canonical_65
+
     path = _export(tmp_path, token_scheme="canonical_65")
-    with pytest.raises(ValueError, match="contract-B"):
-        ev.load_default_model(path, torch.device("cpu"))
+    model, _ = ev.load_default_model(path, torch.device("cpu"))
+    assert model.contract == "B"
+    assert ev.require_engine_contract(model) == guofish_core.SEQ_LENGTH
+    reference, contract = load_for_inference(path)
+    assert contract == "B"
+
+    fens = B_FENS + [p["fen"] for p in json.loads(CORPUS.read_text(encoding="utf-8"))["positions"][:64]]
+    rows = torch.stack([torch.from_numpy(guofish_core.eval_row(f, "B")["tokens"]) for f in fens]).long()
+    canon = torch.stack([torch.from_numpy(tokens_canonical_65(chess.Board(f))) for f in fens]).long()
+    assert torch.equal(rows[:, :guofish_core.CANONICAL_SEQ_LENGTH], canon)
+    with torch.no_grad():
+        policy, value = model(rows)
+        ref_policy, ref_value = reference(canon)
+    assert torch.equal(policy.float(), ref_policy.to(torch.bfloat16).float())
+    assert torch.equal(value, ref_value)
+
+    with ev.TorchEvaluator(model, torch.device("cpu"), 4, switch_interval=0.0) as live:
+        assert live.core.contract == "B"
+
+
+@pytest.mark.parametrize("token_scheme", ["v5_68", "canonical_65"])
+def test_compressed_export_changes_no_engine_output_bit(tmp_path, token_scheme):
+    from data.compress_model import compress_v6_export
+
+    path = _export(tmp_path, attn_bias="smolgen", token_scheme=token_scheme)
+    small = tmp_path / "small.pt"
+    torch.save(compress_v6_export(torch.load(path, weights_only=True)), small)
+    assert small.stat().st_size < 0.6 * path.stat().st_size
+    outs = []
+    for p in (path, small):
+        model, _ = ev.load_default_model(p, torch.device("cpu"))
+        ev.cast_linears(model, torch.bfloat16)          # what load_v6_export does on CUDA
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            outs.append(model(_tokens(64)))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
 
 
 @pytest.mark.parametrize("drop_key", [False, True])

@@ -150,7 +150,7 @@ def dynamo_frame_count() -> int:
 
 
 def configure_inductor() -> dict:
-    """Set the two Inductor options C12b ships, and return what was set.
+    """Set the Inductor options the engine ships, and return what was set.
 
     Returned rather than merely applied so `CaptureReport` and DECISIONS.md can
     state the configuration the numbers were taken under instead of describing
@@ -184,12 +184,20 @@ def configure_inductor() -> dict:
         forward's device time at shape 24 it is 964.6 us against 970.3 us with
         autotuning on, i.e. inside the run-to-run spread, and capture is ~15 s
         faster because the benchmarking is what was slow. BENCH.md C12b-2.
+
+    `triton.descriptive_names = False`
+        REQUIRED ON WINDOWS, and it changes no bit: it only renames kernels. A
+        fused kernel's descriptive name can push its Triton cache path past
+        MAX_PATH (FileNotFoundError at compile); the contract-B adapter's token
+        transform does. train.py and fwd_cost.py set the same thing.
     """
     import torch._inductor.config as inductor_config
 
-    settings = {"use_static_cuda_launcher": False, "triton.autotune_pointwise": False}
+    settings = {"use_static_cuda_launcher": False, "triton.autotune_pointwise": False,
+                "triton.descriptive_names": False}
     inductor_config.use_static_cuda_launcher = False
     inductor_config.triton.autotune_pointwise = False
+    inductor_config.triton.descriptive_names = False
     return settings
 
 
