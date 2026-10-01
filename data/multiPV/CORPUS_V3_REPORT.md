@@ -204,7 +204,8 @@ Bucket `guofishv6corpus`. Layout and deviation: DECISIONS "Corpus v3". Every key
 - **Throughput:** the uplink measured 5.6–8.7 MB/s (≈ 45–70 Mbps) [measured]. The index plus 11.7 GB of the dump plus the small files moved ≈ 17.9 GB in 59 min, ≈ 5 MB/s [measured]. The dump alone needs ≈ 45–70 min [inferred].
 - **To finish:** resumable; it skips the 60 files already there, sends the dump, verifies all 61 sizes, then publishes `data/sha256.txt` last. From the worktree root, with the R2 variables set:
   ```bash
-  CUDA_VISIBLE_DEVICES=-1 python data/multiPV/tools_note_unused 2>/dev/null;   CUDA_VISIBLE_DEVICES=-1 python data/multiPV/r2_push.py --root ../GuoFish/data/processed/r2_stage       --list ../GuoFish/data/processed/r2_stage/sha256.txt --prefix data/ --workers 2 --part-concurrency 8
+  CUDA_VISIBLE_DEVICES=-1 python data/multiPV/r2_push.py --root ../GuoFish/data/processed/r2_stage \
+      --list ../GuoFish/data/processed/r2_stage/sha256.txt --prefix data/ --workers 2 --part-concurrency 8
   ```
 
 ## 8. After the VM build
