@@ -181,7 +181,7 @@ Brief: the harness follow-ups brief (owner, 2026-09-30). Decisions: `DECISIONS.m
 
 | gate | requirement | result |
 |---|---|---|
-| 1 fp32 parity, 5 steps, production model | within 1e-6 relative | **Not met as written.** fp32: CPU eager 6.7e-6, GPU eager 6.7e-6, GPU compiled 1.7e-5. But the *reference against itself*, with only a transposed view made contiguous, differs by 6.7e-6 on CPU and 5.2e-6 on GPU: Newton–Schulz amplifies summation-order rounding ~3.4× per step, so 1e-6 is below the reference's own floor. **float64: 1.9e-14 on CPU, 3.2e-14 compiled on GPU**: the same math. The test holds float64 ≤ 1e-12 and fp32 ≤ 2× the reference's own floor. **Owner to accept.** |
+| 1 fp32 parity, 5 steps, production model | within 1e-6 relative | **Not met as written.** fp32: CPU eager 6.7e-6, GPU eager 6.7e-6, GPU compiled 1.7e-5. But the *reference against itself*, with only a transposed view made contiguous, differs by 6.7e-6 on CPU and 5.2e-6 on GPU: Newton–Schulz amplifies summation-order rounding ~3.4× per step, so 1e-6 is below the reference's own floor. **float64: 1.9e-14 on CPU, 3.2e-14 compiled on GPU**: the same math. The test holds float64 ≤ 1e-12 and fp32 ≤ 2× the reference's own floor. **The owner accepted this amended gate (2026-10-01).** |
 | 2 production numerics | 2,000 steps; last-500 mean loss within 0.3% | **Pass:** 1.26147 (reference) against 1.26297 (batched), **+0.12%**. Caveat: two batched runs differ by −0.31% (GPU bf16 nondeterminism), so the bar is at run-to-run noise. |
 | 3 resume | the same sample stream; the S3 check passes | **Pass:** stream digest equal at all 40 intervals across two kill/resumes (steps 1,000 and 1,500). CPU S3 with `muon_adamw`: bit-identical (max \|Δloss\| 0, weights, EMA and evals identical). |
 | 4 timing on the 5070 | optimizer share ≤ 10%; before and after | **Pass:** **27.5% → 4.1%**; 3,154 → 4,188 samples/s (**+33%**). |
@@ -303,7 +303,7 @@ The test prefixes are left in `runs/_test/`, the designated scratch area.
 
 ### F8. Deviations
 
-1. **Gate 1** is reported against a measured floor rather than 1e-6 (F1). The owner decides.
+1. **Gate 1** is held to a measured floor rather than 1e-6 (F1); the owner accepted this.
 2. **The manifest pin** goes through `build_ok.json` rather than a committed literal hash (F4).
 3. **`prod_a3pool.yaml`** renames A3's groups to `policy` / `value`; the where-clauses are identical.
 4. **Gate 3's run was killed twice:** the planned kill, plus a harness timeout. The check accepts any resume on the 500-step checkpoint grid.

@@ -786,7 +786,7 @@ different order, the reference included.**
 
 Five quintic Newton–Schulz steps amplify summation-order rounding about 3.4× per step. The
 test therefore holds float64 to 1e-12 (the same math) and fp32 to 2× the reference's own
-floor, measured in the same test. **Owner: please accept the amended gate 1 or say otherwise.**
+floor, measured in the same test. **The owner accepted the amended gate 1 (2026-10-01).**
 
 **Gates 2–4** (`tools/muon_gates.py`, three 2,000-step A3 runs on the 5070):
 - **Gate 2:** mean loss over steps 1,501–2,000 was 1.26147 (reference) against 1.26297
