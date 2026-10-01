@@ -705,8 +705,9 @@ class Driver:
         return ok
 
     def wait_paused(self) -> str:
-        self.set(paused=True)
         self.seg = None
+        self.drain()            # the halting checkpoint, its evals and state land before "paused" does
+        self.set(paused=True)
         self.drain()
         print("[prod] paused; write control.json {\"action\": \"continue\"} to resume", flush=True)
         while self.pause_req and self.action != "stop_now":
