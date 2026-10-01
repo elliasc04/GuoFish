@@ -238,13 +238,19 @@ Brief: the harness follow-ups brief (owner, 2026-09-30). Decisions: `DECISIONS.m
   - the smoke's pin check passed (strata hash), and the CPU smoke started on the freshly built v3.
 - **A rebuild changes the manifest hash** (`92700e5dd34d` → `c1a8569f57b0`); see F4.
 
-**Not yet verified, still running when this report was written** (`v6-vmtest` container, log `/root/vmtest.log`):
-- the end of the smoke (the dry-run config does full evals on frozen90's 452k records on CPU, which is slow; `prod.yaml`'s 300-step smoke does none);
-- the pins refusing the smoke build;
-- `vm_upload_v3.sh`;
-- `--pull-corpus` on a fresh clone, and its refusal without `upload_ok.json`.
-
-Read the log, or re-run `/root/vmtest.sh`, before relying on `--pull-corpus`.
+**Then, in the same container** [measured]:
+- **The smoke** finished at both splits, and `setup --build-corpus` exited 0.
+- **`prod.yaml`'s pins refused** the smoke build ("from a --smoke build").
+- **`vm_upload_v3.sh`:**
+  - uploaded 281 files, verified the remote sizes and published `sha256.txt`;
+  - wrote `upload_ok.json` last;
+  - deleted the local dump and index copies.
+- **`--pull-corpus` failed on a fresh clone, a real bug:** with no `data/processed` yet, the disk check's `du` failed and `pipefail` ended the script silently. A VM's first `setup.sh` would have hit it too. **Fixed in `075c69f`.**
+- **On a truly fresh clone it then passed:**
+  - verified the 281 v3 files and pulled `build_ok.json`;
+  - re-verified the 43 frozen90 v2 and eval-set files;
+  - the pulled manifest equals the built one byte for byte, and `git status` is clean.
+- **Without `upload_ok.json`,** `--pull-corpus` refuses (exit 1).
 
 ### F4. Pool-outcome configs and pins
 

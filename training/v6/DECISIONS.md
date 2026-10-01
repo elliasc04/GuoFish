@@ -843,3 +843,7 @@ Over a local directory the upload always won the race; over R2 two scenarios cau
 `wait_paused` now drains the upload queue before setting `paused` (`d77f5dc`). Integrity was
 never at risk: `state.json` only ever names checkpoints whose upload and sidecar completed.
 
+**Found by the container's `--pull-corpus` run.** On a fresh clone `data/processed` doesn't
+exist, so `setup.sh`'s disk check (`du -sk data/processed`) failed and `pipefail` ended the
+script silently, in every mode. It's now guarded (`075c69f`).
+
