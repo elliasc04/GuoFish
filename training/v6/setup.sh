@@ -69,7 +69,8 @@ else
   check "no working nvidia-smi: no NVIDIA GPU or driver"
 fi
 read -r FSTYPE AVAIL_KB <<< "$(df -PTk . | awk 'NR==2 {print $2, $5}')"
-HAVE_KB=$(du -sk data/processed 2>/dev/null | awk '{print $1}'); HAVE_KB=${HAVE_KB:-0}
+HAVE_KB=0                  # a fresh clone has no data/processed: du would fail, and pipefail would end the script
+[ -d data/processed ] && HAVE_KB=$(du -sk data/processed | awk '{print $1}')
 DISK_GB=$(( (AVAIL_KB + HAVE_KB) / 1024 / 1024 ))
 echo "  disk: $FSTYPE, $(( AVAIL_KB / 1024 / 1024 )) GB free + $(( HAVE_KB / 1024 / 1024 )) GB already in data/processed"
 case "$FSTYPE" in
