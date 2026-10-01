@@ -136,7 +136,7 @@ nohup bash data/multiPV/vm_upload_v3.sh --work data > v3_upload.log 2>&1 &
   ```bash
   $PY -m training.v6.r2 cat data/multipv_v3/upload_ok.json
   ```
-- **Only then** can a replacement VM use `--pull-corpus`, and **only then does the local `C0` pool check start** on the 5070. It pulls v3 from R2. Until then, a lost VM means `--build-corpus` again: deterministic, with the same manifest hash.
+- **Only then** can a replacement VM use `--pull-corpus`, and **only then does the local `C0` pool check start** on the 5070. It pulls v3 from R2. Until then, a lost VM means `--build-corpus` again. The shards come out the same, but the manifest hash doesn't (§9).
 
 ## 6. The 40M sanity references
 
@@ -231,7 +231,7 @@ On `--resume`, the current `control.json` is acted on again: a `pause` or `stop_
 
 1. Stop the old driver if it's still running.
 2. On the new VM: steps 1–2, then `setup.sh --pull-corpus` (`--skip-smoke` if you like).
-   - That needs v3's upload to have finished (§5a). If it hadn't, run `setup.sh --build-corpus` again: the build is deterministic, so the manifest hash, and therefore the pins, come out the same.
+   - That needs v3's upload to have finished (§5a). If it hadn't, run `setup.sh --build-corpus` again. The shards come out the same (the build is deterministic), but the manifest records timestamps and the git sha, so **its hash changes on every build**. The pins follow the new `build_ok.json`, so resume still passes. Don't set a literal `prod.pins.corpus_manifest_sha256` unless you'll only ever *pull* this corpus.
 3. Run:
 
 ```bash

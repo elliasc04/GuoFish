@@ -48,7 +48,7 @@ prod:                              # tools/prod.py only; load_config drops this 
   pins:                            # refused at launch and resume if any drifted (follow-ups §4)
     strata_definition_hash: 5e5fdedaae858f45357bb8eb950fc6ba7be63ca5a30ea2b17422b0fe4d6011a9   # definition v3 (t20)
     build_ok: data/processed/v3_build/build_ok.json   # the corpus manifest must hash to its manifest_sha256
-    corpus_manifest_sha256: ""     # optional literal pin; set after the first VM build if wanted
+    corpus_manifest_sha256: ""     # optional literal pin. A rebuild changes the manifest hash (timestamps, git sha), so only pin it for a pulled corpus
   status_every_s: 15               # the dashboard's live tier; step lines land every ~5-10 s
   metrics_every_s: 300
   control_every_s: 300

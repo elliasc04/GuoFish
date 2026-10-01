@@ -161,3 +161,148 @@ On this card the batched-Muon trigger (> 15 %) already fires. Newton–Schulz on
 ## 8. Contract B
 
 **The shipped model is a contract-B export (`canonical_65` input). The engine's contract-B support must land, and pass `tools/s7_check.py` on the final export, before the shipped model can play.** That work is separate from this harness.
+
+---
+
+## Follow-ups (2026-10-01)
+
+Brief: the harness follow-ups brief (owner, 2026-09-30). Decisions: `DECISIONS.md`, "VM harness follow-ups". Commit `d49c919` on `v6-prod`, after fast-forwarding the corpus branch (`0e00579`).
+
+### F1. Batched Muon
+
+**Design:**
+- 70 Muon matrices in **6 oriented-shape groups** (the brief expected about 7): 384×1536 (20, `ff1`ᵀ + `ff2`), 384×1152, 384×384, 16×384, 128×1024 and 128×768.
+- One batched Newton–Schulz per group, with the reference's dtype (bf16 on CUDA), 5 iterations and coefficients.
+- Momentum, Nesterov and the update are foreach ops, and the scale rule is unchanged.
+- On CUDA the whole step is one `torch.compile(fullgraph=True)` graph.
+- The per-parameter `momentum_buffer` state is unchanged, so old and new checkpoints are interchangeable.
+
+**Gates** [measured; `tools/muon_gates.py`, `models/v6/muon_gates/gates.json`]:
+
+| gate | requirement | result |
+|---|---|---|
+| 1 fp32 parity, 5 steps, production model | within 1e-6 relative | **Not met as written.** fp32: CPU eager 6.7e-6, GPU eager 6.7e-6, GPU compiled 1.7e-5. But the *reference against itself*, with only a transposed view made contiguous, differs by 6.7e-6 on CPU and 5.2e-6 on GPU: Newton–Schulz amplifies summation-order rounding ~3.4× per step, so 1e-6 is below the reference's own floor. **float64: 1.9e-14 on CPU, 3.2e-14 compiled on GPU**: the same math. The test holds float64 ≤ 1e-12 and fp32 ≤ 2× the reference's own floor. **Owner to accept.** |
+| 2 production numerics | 2,000 steps; last-500 mean loss within 0.3% | **Pass:** 1.26147 (reference) against 1.26297 (batched), **+0.12%**. Caveat: two batched runs differ by −0.31% (GPU bf16 nondeterminism), so the bar is at run-to-run noise. |
+| 3 resume | the same sample stream; the S3 check passes | **Pass:** stream digest equal at all 40 intervals across two kill/resumes (steps 1,000 and 1,500). CPU S3 with `muon_adamw`: bit-identical (max \|Δloss\| 0, weights, EMA and evals identical). |
+| 4 timing on the 5070 | optimizer share ≤ 10%; before and after | **Pass:** **27.5% → 4.1%**; 3,154 → 4,188 samples/s (**+33%**). |
+
+**Optimizer components** (ms per step, production model):
+
+| component | ms |
+|---|---:|
+| Muon, reference | 88.7 |
+| Muon, batched eager | 18.2 |
+| Muon, batched compiled | 9.3 |
+| gradient clipping | 1.0 |
+| fused AdamW | 0.8 |
+| EMA | 0.5 |
+
+**What gate 1 caught.** The first compiled draft computed `1 − lr·wd` in fp32 on the device, which moved weights by ~6e-8 per step against updates of ~1e-4. The float64 check exposed it at 6.5e-6. The LR and the decay multiplier are now host-computed doubles, filled into tensors of the parameter dtype.
+
+### F2. The quick-val subset and the sanity references
+
+- **The subset:** `training/v6/config/quickval_frozen90_32k.npy` (32,768 indices, sha256 `619f4337…`). It **equals the subset drawn from the definition-v2 sidecar the screening runs read, and from the v3 one** [measured; `test_quickval_subset_is_the_screening_subset`].
+- **How the trainer reads it:** through `eval.quick_indices` + `eval.quick_indices_sha256`, refusing a wrong hash, size or range. The strata no longer decide the subset.
+- **Primary reference:** A3's quick-val KL at 40,960,000 = **0.7399467** (run A3, config `04cda02b8526`, git `c6bed83`, logged 2026-09-28T09:22:46Z) [read]. It's pinned in `prod.yaml` with that provenance. For scale: Ct (same recipe, seed t) read 0.74524 at the same point (+0.7%), and neighbouring quick-vals move ~0.5% [read].
+- **Secondary references:** `runs/<run>/reference.json`, `{source, ref_kl, samples, …}`, polled with `control.json`. Each is checked once, as soon as a main-line quick-val exists at its sample count (at once, if training already passed it).
+- **Failure:** the driver pauses itself, and the reason goes to `status.json` (`pause_reason`), `evals/sanity_<source>_s<N>.json`, `control.json` and the anomalies.
+- **Launch** is refused only without the primary.
+- **Dry-run scenarios** [measured]: primary failure → pause; C0's `reference.json` written after the check's sample count (6,400 on the toy grid) → immediate check → pause, with the reason in all three places.
+
+### F3. `setup.sh` corpus modes
+
+- **`--build-corpus`:**
+  - runs `vm_build_v3.sh --r2-prefix data/ --work data` and maps its exits: 2 inputs, 3 count mismatch, 4 build, 5 gates;
+  - prints `build_ok.json`;
+  - re-verifies frozen90 v2 and the eval sets (`r2 pull --only`);
+  - then the smoke.
+- **`--pull-corpus`:**
+  - refuses without `data/multipv_v3/upload_ok.json`;
+  - pulls v3 and its strata, `build_ok.json`, frozen90 v2 and the eval sets, verifying every sha256;
+  - then the smoke.
+- **Pins first:** the smoke (`prod.py --smoke`) checks the pins before using the GPU.
+- **Runbook additions:**
+  - the upload pane and `upload_ok.json`;
+  - `C0` starts only after the upload;
+  - the secondary reference;
+  - restarting on another pool.
+
+**Container test** (Ubuntu 26.04, `file://` stand-in for R2 holding the corpus session's staged inputs, with the dump cut to its first 300,000 lines):
+
+**Verified** [measured, twice, at `d49c919` and `d77f5dc`]:
+- **The `--build-corpus` path:** `vm_build_v3.sh --smoke 200000`
+  - pulled and verified the 61 inputs;
+  - ran the index-only selection, the build, gate s9 (PASS), the strata and the sha256 list;
+  - wrote `build_ok.json` (139,384 roots, strata `5e5fdedaae85`);
+  - `setup.sh` printed it, flagging SMOKE, and re-verified the 43 frozen90 v2 and eval-set files (`--only`);
+  - the smoke's pin check passed (strata hash), and the CPU smoke started on the freshly built v3.
+- **A rebuild changes the manifest hash** (`92700e5dd34d` → `c1a8569f57b0`); see F4.
+
+**Not yet verified, still running when this report was written** (`v6-vmtest` container, log `/root/vmtest.log`):
+- the end of the smoke (the dry-run config does full evals on frozen90's 452k records on CPU, which is slow; `prod.yaml`'s 300-step smoke does none);
+- the pins refusing the smoke build;
+- `vm_upload_v3.sh`;
+- `--pull-corpus` on a fresh clone, and its refusal without `upload_ok.json`.
+
+Read the log, or re-run `/root/vmtest.sh`, before relying on `--pull-corpus`.
+
+### F4. Pool-outcome configs and pins
+
+- **`prod.yaml`, `prod_no_t20.yaml` and `prod_a3pool.yaml`.** The two fallbacks differ from `prod.yaml` only in `run.name` and `mixture.groups` [asserted]. `prod_a3pool` uses A3's where-clauses exactly [asserted], with prod's group names so `seen_eval` resolves.
+- **Every config pins:**
+  - the strata definition hash, v3 `5e5fdedaae85…`;
+  - the corpus manifest, through `build_ok.json`, plus an optional literal hash;
+  - the quick-val file's sha256;
+  - the A3 reference.
+- **`check_pins` runs at launch, resume and smoke.** It refuses drift in any of them, and a `build_ok.json` from a `--smoke` build [measured; `test_check_pins_refuses_drift`].
+- **The manifest hash** is pinned through `build_ok.json`, because v3 is built on the VM. **A rebuild changes it:** the same smoke build, run twice in the container, gave manifest `92700e5dd34d` then `c1a8569f57b0`, since the manifest records timestamps and the git sha [measured]. So the pin follows each build's `build_ok.json`, and a literal pin suits only a pulled corpus.
+
+### F5. Strata definition v3
+
+- **The corpus branch includes `t20`,** so the definition is v3 (`5e5fdedaae85…`): `depth_tier` gains code 3, and every existing code is unchanged.
+- **What the harness changed:** only the pinned hash, in every config, and the dry-run dataset, which `make_synth.py` regenerates under the current definition. R2's `data/dryrun/` copy is already v3.
+- **Locally:** `data/processed/strata` is now a junction to the corpus session's `strata_def3`. Its codes were compared byte for byte with the v2 sidecars, which are kept as `strata_def2`.
+- The loader still refuses mismatched hashes.
+
+### F6. Optional local smoke
+
+The 5070 ran 300 steps of `prod.yaml`'s model and optimizer, with batched Muon, on corpus v2's `in_90m` groups [measured]:
+
+| split | samples/s | peak VRAM | loader wait | fwd+bwd | optimizer |
+|---|---:|---:|---:|---:|---:|
+| 512×2 | **4,168** | 5,678 MiB | 0.1% | 95.5% | **4.1%** |
+| 1024×1 | 390 | 10,808 MiB | 0.0% | 99.6% | 0.4% |
+
+1024×1 is VRAM-bound on this 12 GB card (11.7 GB in use), so it says nothing about the A100. **The VM smoke stays the go/no-go and picks the split.**
+
+### F7. The dry run against real R2
+
+The R2 keys from `creds/` are mapped into `.env`. The account's default S3 endpoint works; the `.us.` jurisdiction endpoint in the creds file lists no buckets. A write/read/delete probe under `runs/_test/` passed [measured].
+
+**The dry-run scenarios ran against the real bucket**, under `runs/_test/<random>/` (`PROD_DRYRUN_STORE=r2`):
+
+1. **First pass** (`runs/_test/0c2abb9b/`): **6 of 8 passed** [measured]:
+   - reference (continue twice, then worse total; ship and export);
+   - insufficient gain, worse total, time cap;
+   - pause / continue / stop_after_branch;
+   - **kill + wipe + resume from R2 alone: all 65 logged steps bit-identical to the reference.**
+2. **Its two failures were real:**
+   - both sanity-pause scenarios read `state.json` with `paused: true` while it still named the checkpoint *before* the halt (3,840 rather than 5,120), and before `evals/sanity_C0_s5120.json` existed;
+   - the cause: the upload thread snapshots state when it writes, and a state item queued earlier was written after `paused` was set;
+   - over a local directory the upload always won; over R2 it didn't.
+3. **The fix** (`d77f5dc`): the driver drains the upload queue before marking the run paused. Integrity was never at risk; `state.json` never named an unverified checkpoint.
+4. **Re-run** (`runs/_test/8fdd2c73/`) of the reference and the three pause scenarios: **4 of 4 passed** [measured].
+
+The test prefixes are left in `runs/_test/`, the designated scratch area.
+
+### F8. Deviations
+
+1. **Gate 1** is reported against a measured floor rather than 1e-6 (F1). The owner decides.
+2. **The manifest pin** goes through `build_ok.json` rather than a committed literal hash (F4).
+3. **`prod_a3pool.yaml`** renames A3's groups to `policy` / `value`; the where-clauses are identical.
+4. **Gate 3's run was killed twice:** the planned kill, plus a harness timeout. The check accepts any resume on the 500-step checkpoint grid.
+5. **The resume check fills defaults:** a checkpoint's config is compared with defaults filled in, needed once `eval.quick_indices` joined the schema.
+
+### F9. Contract B, restated
+
+**The shipped model is a contract-B export (`canonical_65`). The engine's contract-B support must land, and pass `tools/s7_check.py` on the final export, before the shipped model can play.** No engine code was changed here.
