@@ -739,3 +739,96 @@ on purpose. The natural run also reaches "worse total" at its third branch, by o
   on both.
 - `setup.sh --cpu` installs the cu129 wheels, not the CPU build, so a CPU dry run has the
   VM's packages.
+
+## VM harness follow-ups (2026-10-01)
+
+Brief: the follow-ups brief of 2026-09-30, pasted by the owner. R2 keys arrived in `creds/`.
+
+**R2.**
+- `.env` maps `creds/R2keys.env` to the `R2_*` names. **The account's default S3 endpoint is
+  the right one:** the `.us.` jurisdiction endpoint in the creds file lists no buckets
+  (`NoSuchBucket`). The runbook warns about it.
+- `creds/R2keys.env` was **staged in the index** (`A creds/R2keys.env`) and is now unstaged.
+  The working-tree `.gitignore` already ignores `/creds/*`, but a staged file isn't protected
+  by that. Nothing else in the index was touched; the staged benchmarking files belong to
+  other work, and this brief's commits name their paths explicitly.
+
+**Corpus branch.** `v6-corpus3` (one commit, `0e00579`, strata definition v3 and the VM
+scripts) was fast-forwarded into `v6-prod`. Locally `data/processed/strata` now points (a
+junction) at the corpus session's `strata_def3`; the v2 sidecars are kept as `strata_def2`.
+- All 6 sidecars' codes were compared byte for byte (identical); only the definition hash
+  changes, to `5e5fdedaae85…`. Without the swap, the merged code refuses every local sidecar.
+- R2's frozen90 v2 and eval-set sidecars are already definition v3.
+
+**Batched Muon.**
+- **Grouping:** matrices are grouped by shape after the reference's orientation (tall ones
+  transposed): 6 groups of 70 matrices.
+- **Per group:** one batched Newton–Schulz, with the same dtype, iterations and coefficients.
+- **Momentum and the update** are foreach ops.
+- **On CUDA** the whole step is one `torch.compile(fullgraph=True)` graph.
+- **State:** per-parameter `momentum_buffer`, so checkpoints are interchangeable.
+- **The reference** stays selectable for the gates (`train.py --muon-impl reference`, hidden).
+  It's not config, because it's the same update and the same state.
+- **The compiled step takes its LR and `1 − lr·wd` as host-computed doubles, filled into
+  tensors of the parameter dtype.** Gate 1 found the first draft computing `1 − lr·wd` in
+  fp32 on the device. That moved weights by ~6e-8 per step, large next to an update of ~1e-4:
+  float64 parity was 6.5e-6 before the fix and 3.2e-14 after.
+
+**Gate 1 as written (fp32 within 1e-6) is not met, by any implementation that sums in a
+different order, the reference included.**
+
+| comparison | CPU | GPU |
+|---|---:|---:|
+| float64 | 1.9e-14 | 3.2e-14 compiled |
+| fp32, eager batched | 6.7e-6 | 6.7e-6 |
+| fp32, compiled batched | — | 1.7e-5 |
+| fp32 floor: reference vs itself with only a transposed view made contiguous | 6.7e-6 | 5.2e-6 |
+
+Five quintic Newton–Schulz steps amplify summation-order rounding about 3.4× per step. The
+test therefore holds float64 to 1e-12 (the same math) and fp32 to 2× the reference's own
+floor, measured in the same test. **Owner: please accept the amended gate 1 or say otherwise.**
+
+**Gates 2–4** (`tools/muon_gates.py`, three 2,000-step A3 runs on the 5070):
+- **Gate 2:** mean loss over steps 1,501–2,000 was 1.26147 (reference) against 1.26297
+  (batched), +0.12%: a pass. But two batched runs differ by −0.31% (the resume run against the
+  uninterrupted one, identical up to the kill), so the 0.3% bar is at run-to-run noise.
+- **Gate 3:** the stream digest is equal at all 40 intervals across two resumes (the planned
+  kill and a harness timeout), and the CPU S3 test now also runs `muon_adamw`.
+- **Gate 4:** the optimizer's share fell from 27.5% to 4.1%, and throughput rose from 3,154
+  to 4,188 samples/s (+33%).
+
+**Quick-val subset and the sanity references.**
+- **The subset:** `training/v6/config/quickval_frozen90_32k.npy` (sha256 `619f4337…`) equals
+  the subset drawn from the definition-v2 sidecar the screening used and from the v3 one.
+  `eval.quick_indices` (+ its sha256) makes the trainer read it, and refuse a wrong hash, size
+  or range.
+- **Schema change:** `eval.quick_indices` is a new schema field. Resume now compares a
+  checkpoint's config with defaults filled in, so fields added since are compared at their
+  defaults. Before, any new field refused every older checkpoint.
+- **Primary reference:** A3's quick-val KL at 40,960,000, 0.7399467 (config `04cda02b8526`),
+  pinned with its provenance.
+- **Secondary references:** any number, from `runs/<run>/reference.json`, polled with
+  `control.json`. Each is checked once, as soon as a main-line quick-val exists at its sample
+  count, and on failure pauses the run.
+- **Where it's recorded:** `evals/sanity_<source>_s<N>.json`; the reason also goes to
+  `status.json` (`pause_reason`).
+- **Launch** is refused only without the primary.
+
+**Pins.**
+- **`prod.pins`** holds the strata definition hash, `build_ok.json` (the manifest must hash
+  to its `manifest_sha256`) and an optional literal manifest hash. The quick-val sha256 lives
+  in `eval`, where the trainer checks it.
+- **`check_pins` runs at launch, on resume and before the smoke.** It also refuses a
+  `build_ok.json` from a `--smoke` build.
+- **The manifest hash is pinned through `build_ok.json`**, because v3 is built on the VM and
+  its hash isn't known at commit time. A literal pin can be added after the first build.
+
+**Pool configs.**
+- `prod_no_t20.yaml` and `prod_a3pool.yaml` extend `prod.yaml` and differ only in `run.name`
+  and `mixture.groups` (asserted).
+- **A3's pool keeps prod's group names** (`policy`, `value`) so `prod.seen_eval` still
+  resolves. A3's where-clauses are copied exactly (asserted).
+
+**Strata v3 and the dry run.** The pinned definition is v3 in every config. The dry-run
+dataset is regenerated by `make_synth.py` under the current definition; R2's `data/dryrun/`
+copy, uploaded elsewhere, is already v3.

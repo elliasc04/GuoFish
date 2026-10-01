@@ -15,8 +15,8 @@ data:
   manifest: data/processed/multipv_v3/manifest.json
   strata: data/processed/strata/multipv_v3_train.strata2.npy
   workers: 12                      # 16 vCPUs; resume may change it
-mixture:                           # the production pool (corpus v3 brief §6); C0 decides
-  groups:
+mixture:                           # the production pool, t20 included (corpus v3 brief §6); C0 decides.
+  groups:                          # Fallbacks: prod_no_t20.yaml (C0 fails, C1 passes), prod_a3pool.yaml
     - {name: policy, where: {origin: root, label: multipv}, share: 0.75}
     - {name: value, where: {origin: root, label: [hard_only, value_only]}, share: 0.25}
 optim: {micro_batch: 512, accum: 2}   # the smoke picks 512x2 or 1024x1; effective batch 1,024
@@ -27,6 +27,10 @@ schedule:
 eval:
   quick_every_samples: 10240000
   extra_sets: [v2val_roots, v2val_derived]
+  # the screening runs' 32,768-record frozen90 subset, committed (follow-ups §2): the trainer
+  # reads these indices, not the strata, so a strata-definition change can't shift them
+  quick_indices: training/v6/config/quickval_frozen90_32k.npy
+  quick_indices_sha256: 619f433746aed78211886122ed7f84e7f5eb71657c584fd468a4bf5827e48471
 ckpt: {every_samples: 10240000, keep_last: 2, stable_every_samples: 150000640}
 system: {allow_dirty: false}
 
@@ -35,9 +39,17 @@ prod:                              # tools/prod.py only; load_config drops this 
   branch_points: [300001280, 600002560, 1200005120, 2400010240]
   time_cap_h: 120
   min_kl_gain: 0.0075              # stop rule: frozen90 policy KL, relative
-  sanity: {samples: 40960000, ref_kl: null, tol: 0.03}   # ref_kl: C0's quick-val KL at 40,960,000
+  sanity:                          # primary reference; a secondary (C0) may arrive as runs/<run>/reference.json
+    samples: 40960000
+    ref_kl: 0.7399467204988344
+    ref_run: "A3 (runs/screening ledger, config 04cda02b8526, git c6bed83): models/v6/screen/A3/logs/train.jsonl quick_eval @ 40,960,000, 2026-09-28T09:22:46Z"
+    tol: 0.03
   seen_eval: {group: policy, n: 200000}
-  status_every_s: 60
+  pins:                            # refused at launch and resume if any drifted (follow-ups §4)
+    strata_definition_hash: 5e5fdedaae858f45357bb8eb950fc6ba7be63ca5a30ea2b17422b0fe4d6011a9   # definition v3 (t20)
+    build_ok: data/processed/v3_build/build_ok.json   # the corpus manifest must hash to its manifest_sha256
+    corpus_manifest_sha256: ""     # optional literal pin; set after the first VM build if wanted
+  status_every_s: 15               # the dashboard's live tier; step lines land every ~5-10 s
   metrics_every_s: 300
   control_every_s: 300
   rolling_keep: 2

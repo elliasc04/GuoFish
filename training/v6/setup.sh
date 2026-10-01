@@ -2,10 +2,21 @@
 # Production VM setup (VM harness brief §6). From the repo root, on the v6-prod checkout,
 # with .env in place (training/v6/PROD_RUNBOOK.md):
 #
-#   bash training/v6/setup.sh                   # checks, venv, data pull + verify, smoke
+#   bash training/v6/setup.sh --build-corpus    # first VM: build corpus v3 here, then the smoke
+#   bash training/v6/setup.sh --pull-corpus     # replacement VM: pull the uploaded v3, then the smoke
+#   bash training/v6/setup.sh                   # pull <data-prefix> as listed in its sha256.txt (dry runs)
 #
+# Data modes (one of):
+#   --build-corpus     data/multiPV/vm_build_v3.sh --r2-prefix <data-prefix> --work data (inputs from
+#                      R2, corpus v3 + strata + gates + build_ok.json), then verify frozen90 v2 and
+#                      the eval sets against <data-prefix>sha256.txt
+#   --pull-corpus      needs data/multipv_v3/upload_ok.json in R2 (vm_upload_v3.sh): pull v3 and its
+#                      strata, build_ok.json, frozen90 v2 and the eval sets; verify every sha256
+#   (neither)          pull everything <data-prefix>sha256.txt lists
 # Options:
-#   --data-prefix P    store prefix to pull (default data/); holds sha256.txt
+#   --data-prefix P    store prefix holding sha256.txt (default data/)
+#   --corpus-smoke N   with --build-corpus: build from the first N dump lines (containers only;
+#                      the result is refused by prod.py's pins)
 #   --config C         config the smoke runs (default training/v6/config/configs/prod.yaml)
 #   --mb "A B"         smoke splits, micro_batch x accum (default "512x2 1024x1")
 #   --steps N          smoke steps per split (default 300)
@@ -16,9 +27,17 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 PREFIX=data/; CONFIG=training/v6/config/configs/prod.yaml; MB="512x2 1024x1"; STEPS=300
-CPU=0; SKIP_DATA=0; SKIP_SMOKE=0; SETS=()
+CPU=0; SKIP_DATA=0; SKIP_SMOKE=0; SETS=(); MODE=pull; CORPUS_SMOKE=""
+V3=data/multipv_v3/          # vm_upload_v3.sh's prefix: v3's sha256.txt, build_ok.json, upload_ok.json
+# frozen90 v2 and the two v2 eval sets (shards, manifest, strata, sidecars): what prod.yaml evaluates on
+EVAL_ONLY=(processed/val_frozen_90m_v2/ processed/evalsets/ processed/multipv_v2/
+           processed/strata/val_frozen_90m_v2_val. processed/strata/multipv_v2_val.
+           processed/strata/multipv_v2_valderived.)
 while [ $# -gt 0 ]; do
   case "$1" in
+    --build-corpus) MODE=build; shift ;;
+    --pull-corpus) MODE=pull_v3; shift ;;
+    --corpus-smoke) CORPUS_SMOKE="$2"; shift 2 ;;
     --data-prefix) PREFIX="$2"; shift 2 ;;
     --config) CONFIG="$2"; shift 2 ;;
     --mb) MB="$2"; shift 2 ;;
@@ -27,9 +46,10 @@ while [ $# -gt 0 ]; do
     --cpu) CPU=1; shift ;;
     --skip-data) SKIP_DATA=1; shift ;;
     --skip-smoke) SKIP_SMOKE=1; shift ;;
-    *) sed -n 2,17p "$0"; exit 2 ;;
+    *) sed -n 2,28p "$0"; exit 2 ;;
   esac
 done
+[ -z "$CORPUS_SMOKE" ] || [ "$MODE" = build ] || { echo "--corpus-smoke needs --build-corpus" >&2; exit 2; }
 
 fail() { echo "SETUP FAILED: $*" >&2; exit 1; }
 check() { if [ "$CPU" = 1 ]; then echo "  WARNING (--cpu): $*"; else fail "$*"; fi; }
@@ -104,9 +124,42 @@ if sys.argv[1] != "1":
 EOF
 [ "$CPU" = 1 ] && export CUDA_VISIBLE_DEVICES=-1
 
-echo "== 3/4 data"
+echo "== 3/4 data ($MODE)"
 if [ "$SKIP_DATA" = 1 ]; then echo "  skipped"
-else $PY -m training.v6.r2 pull "$PREFIX" --dest data --workers "$CPUS"; fi
+elif [ "$MODE" = pull ]; then
+  $PY -m training.v6.r2 pull "$PREFIX" --dest data --workers "$CPUS"
+else
+  if [ "$MODE" = build ]; then
+    set +e
+    PY=$PY bash data/multiPV/vm_build_v3.sh --r2-prefix "$PREFIX" --work data ${CORPUS_SMOKE:+--smoke "$CORPUS_SMOKE"}
+    rc=$?
+    set -e
+    L=data/processed/v3_build
+    case $rc in
+      0) ;;
+      2) fail "corpus build, exit 2 (inputs): an input listed in ${PREFIX}sha256.txt is missing or fails its sha256, or the committed rate plan / expected counts differ; see $L/pull.log" ;;
+      3) fail "corpus build, exit 3 (count mismatch): the index-only selection does not reproduce data/multiPV/v3_expected_counts.json; see $L/selection.err. Do not train on it" ;;
+      4) fail "corpus build, exit 4 (build): disk, the builder or the strata failed; see $L/steps.log and $L/build.log" ;;
+      5) fail "corpus build, exit 5 (gates): a corpus gate failed; see $L/gate_s9.json and $L/gate_frozen.json. Do not train on it" ;;
+      *) fail "corpus build exited $rc; see $L/steps.log" ;;
+    esac
+  else
+    $PY -m training.v6.r2 cat "${V3}upload_ok.json" > /dev/null       || fail "${V3}upload_ok.json is not in the store: corpus v3's upload (vm_upload_v3.sh) has not finished"
+    $PY -m training.v6.r2 pull "$V3" --dest data --workers "$CPUS"
+    mkdir -p data/processed/v3_build
+    $PY -m training.v6.r2 get "${V3}build_ok.json" data/processed/v3_build/build_ok.json
+  fi
+  $PY - <<'EOF'
+import json
+ok = json.load(open("data/processed/v3_build/build_ok.json"))
+c = ok["counts"]
+print(f"  build_ok.json: {ok['created_utc']} at {ok['git_sha'][:9]} | roots {c['roots']:,} | train "
+      f"{c['records_train']:,} val {c['records_val']:,} | gates s9 {ok['gates']['s9_passed']} | strata "
+      f"{ok['strata_definition_hash'][:12]} | manifest {ok['manifest_sha256'][:12]}"
+      + (f" | SMOKE: first {ok['smoke_limit_lines']:,} dump lines" if ok.get("smoke_limit_lines") else ""))
+EOF
+  $PY -m training.v6.r2 pull "$PREFIX" --dest data --workers "$CPUS" --only "${EVAL_ONLY[@]}"
+fi
 
 echo "== 4/4 smoke"
 if [ "$SKIP_SMOKE" = 1 ]; then echo "  skipped"

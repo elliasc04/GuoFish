@@ -44,7 +44,7 @@ from training.v6.ckpt import (
     provenance, rotate, sha256_file, utc,
 )
 from training.v6.config import (
-    RESUME_WHITELIST, config_hash, diff_paths, dump_yaml, load_config, to_plain,
+    RESUME_WHITELIST, build_config, config_hash, diff_paths, dump_yaml, load_config, to_plain,
 )
 from training.v6.data.batch import BatchBuilder, StreamDataset
 from training.v6.data.formats import REPO
@@ -81,13 +81,27 @@ def verify_frozen(frozen_dir: Path) -> str:
     return sha256_file(mpath)
 
 
+def pinned_quick_subset(ev, n_frozen: int) -> np.ndarray:
+    """The committed quick-val indices (follow-ups §2): independent of the strata, so a
+    strata-definition change can't shift them. Refused unless sha256, size and range match."""
+    path = resolve(ev.quick_indices)
+    if sha256_file(path) != ev.quick_indices_sha256:
+        raise SystemExit(f"{ev.quick_indices}: sha256 is not the pinned {ev.quick_indices_sha256[:12]}")
+    idx = np.load(path)
+    if (len(idx) != ev.quick_size or idx.dtype != np.int64 or (np.diff(idx) <= 0).any()
+            or idx[0] < 0 or idx[-1] >= n_frozen):
+        raise SystemExit(f"{ev.quick_indices}: not {ev.quick_size:,} sorted unique indices into "
+                         f"the {n_frozen:,}-record frozen set")
+    return idx
+
+
 def _strata_meta(path: Path) -> dict:
     return json.loads(path.with_suffix(".json").read_text())
 
 
 def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
         crash_after_steps: int | None = None, stop_at: int | None = None,
-        seen_eval: tuple[str, int] | None = None) -> dict:
+        seen_eval: tuple[str, int] | None = None, muon_impl: str = "batched") -> dict:
     dev = torch.device(cfg.system.device)
     if dev.type == "cuda" and not torch.cuda.is_available():
         raise SystemExit("system.device=cuda but CUDA is not available")
@@ -138,7 +152,8 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
 
     frozen = EvalSet("frozen90", resolve(cfg.eval.frozen_dir), "val", resolve(cfg.eval.frozen_strata),
                      cfg.model.token_scheme, cfg.eval.batch, cfg.eval.workers)
-    quick_idx = quick_subset(frozen.codes, cfg.eval.quick_size, cfg.eval.quick_seed)
+    quick_idx = (pinned_quick_subset(cfg.eval, len(frozen.indices)) if cfg.eval.quick_indices
+                 else quick_subset(frozen.codes, cfg.eval.quick_size, cfg.eval.quick_seed))
     extra = [load_evalset(n, cfg.model.token_scheme, cfg.eval.batch, cfg.eval.workers)
              for n in cfg.eval.extra_sets]
     seen = None
@@ -157,13 +172,15 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     # ---- model / optimizer / resume -----------------------------------
     torch.manual_seed(cfg.run.init_seed)            # dropout (and v5_deepcopy's init draws)
     model = build_model(cfg.model, cfg.run.init_seed).to(dev)
-    opt = build_optimizer(model, cfg.optim, sched.lr(0))
+    opt = build_optimizer(model, cfg.optim, sched.lr(0), muon_impl=muon_impl,
+                          compile=cfg.system.compile and dev.type == "cuda")
     ema = EMA(model, cfg.ema.half_life_samples, eff) if cfg.ema.enabled else None
     loss_fn = LossFn(cfg, norms, dev)
     step0, best = 0, math.inf
     if resume is not None:
         ck = torch.load(resume, map_location="cpu", weights_only=True)
-        changed = diff_paths(ck["config"], plain)
+        # fields added to the schema since the checkpoint compare at their defaults
+        changed = diff_paths(to_plain(build_config(ck["config"])), plain)
         allowed = RESUME_WHITELIST - (set() if branch else {"schedule.total_samples"})
         if changed - allowed:
             raise SystemExit(f"resume refused: config differs at {sorted(changed - allowed)}")
@@ -188,7 +205,7 @@ def run(cfg, *, run_dir: Path, resume: Path | None = None, branch: bool = False,
     n_params = sum(p.numel() for p in model.parameters())
 
     log.event("run_start", run=cfg.run.name, resume=str(resume) if resume else None, branch=branch,
-              step=step0, samples=step0 * eff, config_hash=chash, params=n_params,
+              step=step0, samples=step0 * eff, config_hash=chash, params=n_params, muon_impl=muon_impl,
               schedule=sched.describe(), normalizers=norms, records=len(shards),
               record_format=shards.format, mixture={"names": mixture.names,
               "shares": mixture.shares.tolist(), "sizes": mixture.sizes,
@@ -412,6 +429,8 @@ def main(argv=None) -> int:
     ap.add_argument("--crash-after-steps", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--stop-at-samples", type=int, default=None)
     ap.add_argument("--seen-eval", default=None, type=parse_seen, metavar="GROUP:N")
+    ap.add_argument("--muon-impl", default="batched", choices=["batched", "reference"],
+                    help=argparse.SUPPRESS)     # reference: the per-matrix Muon, for the parity gates
     args = ap.parse_args(argv)
     cfg = load_config(args.config, args.set)
     run_dir = resolve(cfg.run.out_root) / cfg.run.name
@@ -421,7 +440,7 @@ def main(argv=None) -> int:
     elif args.resume:
         resume = Path(args.resume)
     run(cfg, run_dir=run_dir, resume=resume, crash_after_steps=args.crash_after_steps,
-        stop_at=args.stop_at_samples, seen_eval=args.seen_eval)
+        stop_at=args.stop_at_samples, seen_eval=args.seen_eval, muon_impl=args.muon_impl)
     return 0
 
 

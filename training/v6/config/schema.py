@@ -273,8 +273,12 @@ class EvalConfig:
     best_metric: str = "total"           # total | policy_kl | value_mse
     mirror_n: int = 10_000
     extra_sets: tuple[str, ...] = ()     # data/processed/evalsets/<name>.json, full evals only
+    quick_indices: str = ""              # pinned quick-val record indices (.npy); "" = drawn from strata
+    quick_indices_sha256: str = ""       # required with quick_indices
 
     def __post_init__(self):
+        if bool(self.quick_indices) != bool(self.quick_indices_sha256):
+            raise ValueError("eval.quick_indices and eval.quick_indices_sha256 go together")
         _nonneg("eval.workers", self.workers)
         _nonneg("eval.quick_every_samples", self.quick_every_samples)
         _pos("eval.quick_size", self.quick_size)

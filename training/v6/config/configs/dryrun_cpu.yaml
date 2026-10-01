@@ -21,12 +21,15 @@ eval:
   extra_sets: []
   batch: 512
   workers: 0
+  quick_indices: ""               # drawn from the synthetic val set's strata
+  quick_indices_sha256: ""
 ckpt: {every_samples: 1280, keep_last: 2, stable_every_samples: 3840}
 system: {device: cpu, precision: fp32, compile: false, log_every: 5}
 prod:
   store_prefix: runs/_test/
   branch_points: [7680, 15360, 30720, 61440]
-  sanity: {samples: 5120, ref_kl: null, tol: 0.03}
+  sanity: {samples: 5120, ref_kl: null, ref_run: "", tol: 0.03}
+  pins: {build_ok: ""}           # no corpus build; the strata-definition pin stays
   seen_eval: {group: policy, n: 1000}
   status_every_s: 2
   metrics_every_s: 5

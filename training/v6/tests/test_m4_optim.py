@@ -221,6 +221,64 @@ def test_newton_schulz_and_update_scale():
     assert 0.15 < rms < 0.25                                   # AdamW-like update RMS
 
 
+def _muon_parity(dtype, impl_b, contiguous_ref_b=False, steps=5):
+    """Worst relative difference of every parameter's update over `steps` optimizer steps
+    on the production d384x10 model, the same gradients fed to two optimizers: the
+    reference Muon, and `impl_b` (with `contiguous_ref_b`: the reference again, its
+    transposed view made contiguous, i.e. the same math summed in another order)."""
+    import copy
+    import training.v6.optim.muon as muon_mod
+    cfg = load_config(CFG / "prod.yaml")
+    a = build_model(cfg.model, cfg.run.init_seed).to(dtype)
+    b = copy.deepcopy(a)
+    oa = build_optimizer(a, cfg.optim, 3.5e-4, muon_impl="reference")
+    ob = build_optimizer(b, cfg.optim, 3.5e-4, muon_impl=impl_b)
+    oa.muon.ns_dtype = ob.muon.ns_dtype = dtype
+    assert len(ob.muon.param_groups[0]["params"]) == 70
+    ns = muon_mod.newton_schulz
+
+    def ns_contiguous(g, n, ns_dtype=None):
+        tall = g.size(0) > g.size(1)
+        x = ns(g.T.contiguous() if tall else g, n, ns_dtype)
+        return x.T if tall else x
+
+    gen = torch.Generator().manual_seed(20260802)
+    worst = 0.0
+    for _ in range(steps):
+        pa = [p.detach().clone() for p in a.parameters()]
+        pb = [p.detach().clone() for p in b.parameters()]
+        for x, y in zip(a.parameters(), b.parameters()):
+            g = (torch.randn(x.shape, generator=gen) * 1e-3).to(dtype)
+            x.grad, y.grad = g.clone(), g.clone()
+        oa.step()
+        if contiguous_ref_b:
+            muon_mod.newton_schulz = ns_contiguous
+        try:
+            ob.step()
+        finally:
+            muon_mod.newton_schulz = ns
+        for p0, q0, x, y in zip(pa, pb, a.parameters(), b.parameters()):
+            da, db = x.detach() - p0, y.detach() - q0
+            worst = max(worst, float((db - da).norm() / da.norm()))
+    return worst
+
+
+def test_batched_muon_matches_reference():
+    """VM harness follow-ups §1, gate 1 (CPU). In float64 the batched update is the
+    reference's to 1e-12: the same math. In fp32 the brief's 1e-6 is below the
+    reference's own floor: the reference against itself with only a transposed view
+    made contiguous differs by as much (6.7e-6, measured), because 5 quintic
+    Newton-Schulz steps amplify summation-order rounding (~3.4x per step). So fp32
+    is held to that floor, measured here, not to 1e-6 (DECISIONS.md, follow-ups)."""
+    f64 = _muon_parity(torch.float64, "batched")
+    f32 = _muon_parity(torch.float32, "batched")
+    floor = _muon_parity(torch.float32, "reference", contiguous_ref_b=True)
+    print(f"\nMuon parity, 5 steps, production model: float64 {f64:.1e} | fp32 {f32:.1e} "
+          f"| fp32 floor (reference vs reordered reference) {floor:.1e}")
+    assert f64 <= 1e-12
+    assert floor > 0 and f32 <= 2 * floor
+
+
 def test_muon_adamw_trains_and_round_trips(val_batch):
     c = load_config(CFG / "base.yaml", ["optim.name=muon_adamw", "system.device=cpu",
                                         "system.precision=fp32"])

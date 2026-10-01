@@ -177,20 +177,22 @@ S3 = ["model.dropout=0.1", "optim.micro_batch=78", "optim.accum=2",
       "eval.quick_every_samples=7800", "eval.quick_size=2048", "system.log_every=1"]
 
 
-def test_s3_kill_and_resume_is_bit_identical(tmp_path):
+@pytest.mark.parametrize("optim", ["adamw", "muon_adamw"])     # muon_adamw: batched Muon (follow-ups gate 3)
+def test_s3_kill_and_resume_is_bit_identical(tmp_path, optim):
     """Run A uninterrupted for 200 steps. Run B is killed (os._exit, no
     checkpoint) after step 57 and after step 117, resuming each time from the
     latest rolling checkpoint: step 55 (mid-pass for both groups) and step 115,
     where the 4,485-record `endgame` group has consumed exactly one full pass
     (115 x 39 = 4,485) - the pass boundary. Dropout 0.1 exercises the RNG
     restore; quick evals at steps 50/100/150/200 sit between the kill points."""
-    train(tmp_path, "a", *S3)
-    train(tmp_path, "b", *S3, crash=57, check_exit=CRASH_EXIT)
+    S3o = [*S3, f"optim.name={optim}"]
+    train(tmp_path, "a", *S3o)
+    train(tmp_path, "b", *S3o, crash=57, check_exit=CRASH_EXIT)
     assert sorted(p.name for p in (tmp_path / "b/ckpt").glob("s*.pt"))[-1] == "s8580.pt"
-    train(tmp_path, "b", *S3, resume="latest", crash=117, check_exit=CRASH_EXIT)
+    train(tmp_path, "b", *S3o, resume="latest", crash=117, check_exit=CRASH_EXIT)
     ck = torch.load(tmp_path / "b/ckpt/s17940.pt", map_location="cpu", weights_only=True)
     assert ck["samples"] == 17_940
-    train(tmp_path, "b", *S3, resume="latest")
+    train(tmp_path, "b", *S3o, resume="latest")
 
     a = {s["step"]: s for s in events(tmp_path / "a", "step")}
     b_steps = events(tmp_path / "b", "step")
@@ -213,7 +215,7 @@ def test_s3_kill_and_resume_is_bit_identical(tmp_path):
     fb = [e for e in events(tmp_path / "b", "full_eval")]
     strip = lambda e: {k: v for k, v in e.items() if k != "utc"}  # noqa: E731
     assert [strip(e) for e in fa] == [strip(e) for e in fb]
-    print(f"\nS3: {len(b_steps)} resumed-run steps (kills after 57 and 117, resumes at 55 and "
+    print(f"\nS3 ({optim}): {len(b_steps)} resumed-run steps (kills after 57 and 117, resumes at 55 and "
           f"115 = endgame pass boundary) vs uninterrupted: max |d loss| {worst:.1e}; "
           f"stream digests, final weights, EMA and full-eval metrics identical")
     assert worst == 0.0

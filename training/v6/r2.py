@@ -5,7 +5,7 @@ Credentials come from the environment or an untracked `.env` at the repo root
     R2_ACCOUNT_ID (or R2_ENDPOINT), R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 PROD_STORE=file:///some/dir swaps R2 for a local directory (tests, offline dry runs).
 
-    python -m training.v6.r2 pull data/ [--workers 16]
+    python -m training.v6.r2 pull data/ [--workers 16] [--only processed/evalsets/ ...]
     python -m training.v6.r2 cat runs/prod_v6/status.json          # print an object
     python -m training.v6.r2 get runs/prod_v6/export/<file> <dest>  # download one
     python -m training.v6.r2 put runs/prod_v6/control.json <file|->  # upload (- = stdin)
@@ -171,11 +171,16 @@ def parse_sha_list(text: str) -> list[tuple[str, int, str]]:
     return out
 
 
-def pull(store, prefix: str, dest: Path, workers: int) -> None:
+def pull(store, prefix: str, dest: Path, workers: int, only=()) -> None:
     raw = store.get_bytes(prefix + "sha256.txt")
     if raw is None:
         raise SystemExit(f"{store.where}/{prefix}sha256.txt does not exist")
     entries = parse_sha_list(raw.decode())
+    if only:                                 # relative-path prefixes, e.g. processed/val_frozen_90m_v2/
+        entries = [e for e in entries if any(e[2].startswith(o) for o in only)]
+        missing = [o for o in only if not any(e[2].startswith(o) for e in entries)]
+        if missing:
+            raise SystemExit(f"{store.where}/{prefix}sha256.txt lists nothing under {missing}")
     total = sum(e[1] for e in entries)
     print(f"pull {store.where}/{prefix} -> {dest}: {len(entries)} files, {total / 1e9:.2f} GB", flush=True)
     t0 = time.monotonic()
@@ -207,6 +212,8 @@ def main(argv=None) -> int:
     p.add_argument("prefix", help="store prefix holding sha256.txt, e.g. data/")
     p.add_argument("--dest", type=Path, default=REPO / "data")
     p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--only", nargs="+", default=[], metavar="PATH_PREFIX",
+                   help="only the listed files under these relative-path prefixes")
     sub.add_parser("cat").add_argument("key")
     sub.add_parser("ls").add_argument("prefix")
     p = sub.add_parser("get")
@@ -220,7 +227,7 @@ def main(argv=None) -> int:
     if args.cmd == "pull":
         if not args.prefix.endswith("/"):
             raise SystemExit("prefix must end with '/'")
-        pull(store, args.prefix, args.dest, args.workers)
+        pull(store, args.prefix, args.dest, args.workers, args.only)
     elif args.cmd == "cat":
         b = store.get_bytes(args.key)
         if b is None:

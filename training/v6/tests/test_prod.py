@@ -32,8 +32,9 @@ DRY = "training/v6/config/configs/dryrun_cpu.yaml"
 # every key prod.yaml changes relative to A3 (VM harness brief §2), and nothing else
 OVERRIDES = {"run.name", "run.out_root", "data.corpus", "data.manifest", "data.strata", "data.workers",
              "mixture.groups", "schedule.total_samples", "schedule.warmup_samples", "schedule.decay_frac",
-             "eval.quick_every_samples", "eval.extra_sets", "ckpt.keep_last", "ckpt.stable_every_samples",
-             "system.allow_dirty"}
+             "eval.quick_every_samples", "eval.extra_sets", "eval.quick_indices", "eval.quick_indices_sha256",
+             "ckpt.keep_last", "ckpt.stable_every_samples", "system.allow_dirty"}
+QUICKVAL = REPO / "training/v6/config/quickval_frozen90_32k.npy"
 
 
 # ------------------------------------------------------------- configs
@@ -71,6 +72,65 @@ def test_prod_grid_and_branch_geometry():
     assert 3.19e9 < total < 3.2e9
     assert p.sanity.samples == 40_960_000 and p.sanity.samples % 2_048_000 == 0   # on C0's quick grid too
     assert p.seen_eval.group == "policy" and p.seen_eval.n == 200_000
+
+
+def test_quickval_subset_is_the_screening_subset():
+    """Follow-ups §2: the committed indices are the subset every screening run drew
+    (quick_subset over frozen90 v2's strata, A3's size and seed), and the trainer reads
+    them by sha256. Drawn again here from the current sidecar; also from the definition-v2
+    sidecar the screening runs read, where that copy exists (data/processed/strata_def2)."""
+    import numpy as np
+    from training.v6.eval import quick_subset
+    from training.v6.ckpt import sha256_file
+    from training.v6.train import pinned_quick_subset
+    a3 = load_config(CONFIGS / "a3_resolved.yaml")
+    p = load_config(CONFIGS / "prod.yaml")
+    pinned = pinned_quick_subset(p.eval, 452_405)
+    assert sha256_file(QUICKVAL) == p.eval.quick_indices_sha256 and len(pinned) == a3.eval.quick_size
+    name = "val_frozen_90m_v2_val.strata2.npy"
+    sidecars = [REPO / "data/processed/strata" / name, REPO / "data/processed/strata_def2" / name]
+    drawn = [quick_subset(np.load(s), a3.eval.quick_size, a3.eval.quick_seed) for s in sidecars if s.exists()]
+    assert drawn and all(np.array_equal(d, pinned) for d in drawn)
+    print(f"\nquick-val subset: {len(pinned):,} indices equal to the subset drawn from {len(drawn)} sidecar(s)")
+
+
+def test_pool_configs_differ_from_prod_only_in_pool_and_name():
+    base = to_plain(load_config(CONFIGS / "prod.yaml"))
+    for name in ("prod_no_t20", "prod_a3pool"):
+        cfg, p = prod.load(f"training/v6/config/configs/{name}.yaml", [])
+        assert diff_paths(base, to_plain(cfg)) == {"run.name", "mixture.groups"}, name
+        assert p.pins.strata_definition_hash and p.pins.build_ok and p.sanity.ref_kl == 0.7399467204988344
+        assert [g.name for g in cfg.mixture.groups] == ["policy", "value"]       # seen_eval finds `policy`
+    a3 = load_config(CONFIGS / "a3_resolved.yaml")
+    pool = load_config(CONFIGS / "prod_a3pool.yaml")
+    assert [(g.where, g.share) for g in pool.mixture.groups] == [(g.where, g.share) for g in a3.mixture.groups]
+
+
+def test_check_pins_refuses_drift(tmp_path):
+    import json
+    from training.v6.ckpt import sha256_file
+    from training.v6.data.strata import DEFINITION_HASH
+    man = tmp_path / "manifest.json"
+    man.write_text("{}")
+    ok = tmp_path / "build_ok.json"
+    good = {"manifest_sha256": sha256_file(man), "strata_definition_hash": DEFINITION_HASH, "smoke_limit_lines": None}
+    sets = [f"data.manifest={man.as_posix()}", f"prod.pins.build_ok={ok.as_posix()}"]
+    with pytest.raises(SystemExit, match="missing"):
+        prod.check_pins(*prod.load("training/v6/config/configs/prod.yaml", sets))
+    ok.write_text(json.dumps(good))
+    got = prod.check_pins(*prod.load("training/v6/config/configs/prod.yaml", sets))
+    assert got["corpus_manifest_sha256"] == good["manifest_sha256"] and got["strata_definition_hash"] == DEFINITION_HASH
+    for bad, match in [({"manifest_sha256": "0" * 64}, "not build_ok"), ({"smoke_limit_lines": 1000}, "smoke"),
+                       ({"strata_definition_hash": "0" * 64}, "strata definition")]:
+        ok.write_text(json.dumps({**good, **bad}))
+        with pytest.raises(SystemExit, match=match):
+            prod.check_pins(*prod.load("training/v6/config/configs/prod.yaml", sets))
+    ok.write_text(json.dumps(good))
+    for extra, match in [("prod.pins.strata_definition_hash=00ab", "pinned"),
+                         ("prod.pins.corpus_manifest_sha256=00ab", "pinned"),
+                         ("eval.quick_indices_sha256=00ab", "pinned")]:
+        with pytest.raises(SystemExit, match=match):
+            prod.check_pins(*prod.load("training/v6/config/configs/prod.yaml", [*sets, extra]))
 
 
 @pytest.mark.parametrize("sets, match", [
@@ -293,19 +353,23 @@ def test_dryrun_time_cap(dry):
 
 
 def test_dryrun_sanity_pause_then_stop_now(dry):
-    """Quick-val KL off C0's by more than 3% at the check: the run pauses itself via
-    control.json and records why; stop_now then ends it with nothing to ship."""
+    """Quick-val KL off the primary reference by more than 3% at the check: the run pauses
+    itself via control.json and records why in evals/ and status.json; stop_now then ends
+    it with nothing to ship."""
     name = "sanity"
     kl = dry["ref"].get("kl5120")
     if kl is None:
         pytest.skip("needs the reference run's quick-val KL")
-    proc = launch(dry, name, f"prod.sanity.ref_kl={kl * 1.5}")
+    proc = launch(dry, name, f"prod.sanity.ref_kl={kl * 1.5}", "prod.sanity.ref_run=test-primary")
     until(lambda: (sj(dry, name, "state.json") or {}).get("paused"), "the sanity pause")
     ctl, st = sj(dry, name, "control.json"), sj(dry, name, "state.json")
-    assert ctl["action"] == "pause" and ctl["by"] == "prod.py" and "sanity" in ctl["reason"]
+    assert ctl["action"] == "pause" and ctl["by"] == "prod.py" and "primary" in ctl["reason"]
     # halted on the first checkpoint the driver saw after the check: 5,120 unless the toy
     # trainer (a checkpoint every ~0.5 s) wrote the next within the same 1 s poll
-    assert st["sanity"]["pass"] is False and st["main"]["samples"] >= 5120
+    doc = st["sanity"]["primary"]
+    assert doc["pass"] is False and doc["ref_run"] == "test-primary" and st["main"]["samples"] >= 5120
+    assert sj(dry, name, "evals/sanity_primary_s5120.json")["pass"] is False
+    assert "primary" in until(lambda: (sj(dry, name, "status.json") or {}).get("pause_reason"), "status reason")
     time.sleep(3)
     assert sj(dry, name, "state.json")["main"]["samples"] == st["main"]["samples"]   # stopped
     assert any(a["kind"] == "sanity" for a in st["anomalies"])
@@ -313,6 +377,30 @@ def test_dryrun_sanity_pause_then_stop_now(dry):
     finish(dry, proc, name)
     st = sj(dry, name, "state.json")
     assert st["stopped"] == "operator: stop_now" and st["shipped"] is None and st["phase"] == "done"
+
+
+def test_dryrun_secondary_reference_after_launch(dry):
+    """The primary passes at 5,120; later, past that point, a C0 reference appears as
+    runs/<run>/reference.json, 50% off: the driver checks it against the quick-val it
+    already has, pauses, and says so in evals/, status.json and control.json."""
+    name = "secondary"
+    kl = dry["ref"].get("kl5120")
+    if kl is None:
+        pytest.skip("needs the reference run's quick-val KL")
+    proc = launch(dry, name, f"prod.sanity.ref_kl={kl}")
+    until(lambda: ((sj(dry, name, "state.json") or {}).get("main") or {}).get("samples", 0) >= 6400, "6,400")
+    assert sj(dry, name, "state.json")["sanity"]["primary"]["pass"] is True
+    put_json(dry["store"], f"{dry['prefix']}{name}/reference.json",
+             {"source": "C0", "ref_kl": kl * 1.5, "samples": 5120, "ref_run": "test-C0"})
+    st = until(lambda: (lambda s: s if s and s.get("paused") else None)(sj(dry, name, "state.json")), "pause")
+    doc = st["sanity"]["C0"]
+    assert doc["pass"] is False and doc["quick_kl"] == st["quick_kl"]["5120"] and doc["ref_run"] == "test-C0"
+    assert sj(dry, name, "evals/sanity_C0_s5120.json")["pass"] is False
+    assert "C0" in sj(dry, name, "control.json")["reason"]
+    assert "C0" in until(lambda: (sj(dry, name, "status.json") or {}).get("pause_reason"), "status reason")
+    control(dry, name, "stop_now")
+    finish(dry, proc, name)
+    assert sj(dry, name, "state.json")["stopped"] == "operator: stop_now"
 
 
 def test_dryrun_pause_continue_stop_after_branch(dry):
@@ -327,7 +415,7 @@ def test_dryrun_pause_continue_stop_after_branch(dry):
     paused_at = st["main"]["samples"]
     time.sleep(3)
     assert sj(dry, name, "state.json")["main"]["samples"] == paused_at        # trainer is stopped
-    assert st["sanity"] is None or st["sanity"]["pass"]
+    assert all(d["pass"] for d in st["sanity"].values())
     control(dry, name, "continue")
     until(lambda: (sj(dry, name, "state.json") or {}).get("paused") is False, "continue")
     control(dry, name, "stop_after_branch")

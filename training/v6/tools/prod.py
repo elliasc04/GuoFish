@@ -58,8 +58,16 @@ STOP_ANOMALIES = ("nonfinite", "trainer_exit")     # the kinds that end the run 
 @dataclass(frozen=True)
 class Sanity:
     samples: int = 0                    # 0: no check
-    ref_kl: Optional[float] = None      # C0's quick-val policy KL at `samples`
+    ref_kl: Optional[float] = None      # primary reference: A3's quick-val policy KL at `samples`
+    ref_run: str = ""                   # where ref_kl was read (run, config hash, log line)
     tol: float = 0.03
+
+
+@dataclass(frozen=True)
+class Pins:
+    strata_definition_hash: str = ""    # must equal training.v6.data.strata.DEFINITION_HASH
+    build_ok: str = ""                  # build_ok.json: the corpus manifest must hash to its manifest_sha256
+    corpus_manifest_sha256: str = ""    # optional literal pin of the same hash
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class Settings:
     min_kl_gain: float = 0.0075
     sanity: Sanity = field(default_factory=Sanity)
     seen_eval: SeenEval = field(default_factory=SeenEval)
+    pins: Pins = field(default_factory=Pins)
     status_every_s: float = 60.0
     metrics_every_s: float = 300.0
     control_every_s: float = 300.0
@@ -109,6 +118,47 @@ def load(config: str, sets) -> tuple:
     if p.sanity.samples and (not q or p.sanity.samples % q):
         raise SystemExit(f"prod.sanity.samples={p.sanity.samples} is not on the quick-val grid ({q})")
     return cfg, p
+
+
+def check_pins(cfg, p: Settings) -> dict:
+    """Refuse a run whose inputs drifted from the config's pins (follow-ups §4): the strata
+    definition, the corpus manifest (against build_ok.json, and a literal pin if set) and the
+    quick-val subset file. -> what was checked, for state.json."""
+    from training.v6.data.strata import DEFINITION_HASH
+    pin, got = p.pins, {"strata_definition_hash": DEFINITION_HASH}
+    if pin.strata_definition_hash and pin.strata_definition_hash != DEFINITION_HASH:
+        raise SystemExit(f"strata definition {DEFINITION_HASH[:12]} is not the pinned "
+                         f"{pin.strata_definition_hash[:12]} (prod.pins.strata_definition_hash)")
+    if pin.build_ok or pin.corpus_manifest_sha256:
+        man = sha256_file(resolve(cfg.data.manifest))
+        got["corpus_manifest_sha256"] = man
+        if pin.corpus_manifest_sha256 and man != pin.corpus_manifest_sha256:
+            raise SystemExit(f"{cfg.data.manifest} hashes to {man[:12]}, not the pinned {pin.corpus_manifest_sha256[:12]}")
+        if pin.build_ok:
+            path = resolve(pin.build_ok)
+            if not path.exists():
+                raise SystemExit(f"{pin.build_ok} is missing: build corpus v3 (setup.sh --build-corpus) "
+                                 f"or pull it (setup.sh --pull-corpus) first")
+            ok = json.loads(path.read_text())
+            if ok.get("smoke_limit_lines"):
+                raise SystemExit(f"{pin.build_ok} is from a --smoke build ({ok['smoke_limit_lines']:,} dump "
+                                 f"lines), not a production corpus")
+            if ok["manifest_sha256"] != man:
+                raise SystemExit(f"{cfg.data.manifest} hashes to {man[:12]}, not build_ok.json's "
+                                 f"{ok['manifest_sha256'][:12]}")
+            if ok["strata_definition_hash"] != DEFINITION_HASH:
+                raise SystemExit(f"build_ok.json's strata definition {ok['strata_definition_hash'][:12]} "
+                                 f"!= {DEFINITION_HASH[:12]}")
+            got["build_ok"] = {k: ok.get(k) for k in ("created_utc", "git_sha", "manifest_sha256")}
+    if cfg.eval.quick_indices:
+        sha = sha256_file(resolve(cfg.eval.quick_indices))
+        if sha != cfg.eval.quick_indices_sha256:
+            raise SystemExit(f"{cfg.eval.quick_indices} hashes to {sha[:12]}, not the pinned "
+                             f"{cfg.eval.quick_indices_sha256[:12]}")
+        got["quick_indices_sha256"] = sha
+    print(f"[prod] pins verified: { {k: (v[:12] if isinstance(v, str) else v) for k, v in got.items()} }",
+          flush=True)
+    return got
 
 
 def branch_of(cfg, bp: int) -> tuple[str, int]:
@@ -201,7 +251,7 @@ class Driver:
         self.evals: dict[str, dict] = {}
         self.metrics: list[str] = []
         self.last_step: dict = {}
-        self.control_seen = None
+        self.control_seen = self.reference_seen = None
         self.action, self.pause_req, self.stop_after = "continue", bool(state.get("paused")), False
         self.proc, self.killed, self.seg, self.seg_end = None, None, None, None
         self.next = {"status": 0.0, "metrics": 0.0, "control": 0.0}
@@ -387,8 +437,10 @@ class Driver:
             self.last_step = ev
         elif e == "quick_eval":
             self.put(f"evals/{self.seg}_quick_s{n}.json", ev)
-            if self.seg == "main" and n == self.p.sanity.samples and self.state["sanity"] is None:
-                self.sanity(ev)             # once per run: a replay after a resume doesn't re-pause
+            if self.seg == "main":
+                with self.lock:
+                    self.state["quick_kl"][str(n)] = ev["policy_kl"]
+                self.check_references()
         elif e in ("full_eval", "memorization_gap"):
             kind = "full" if e == "full_eval" else "memgap"
             tag = f"{self.seg}_{kind}_s{n}"
@@ -398,28 +450,77 @@ class Driver:
         elif e == "anomaly":
             self.anomaly("nonfinite", f"trainer: {ev}")
 
-    def sanity(self, ev: dict) -> None:
+    def references(self) -> list:
         s = self.p.sanity
-        dev = (ev["policy_kl"] - s.ref_kl) / s.ref_kl
-        doc = {"samples": ev["samples"], "quick_kl": ev["policy_kl"], "ref_kl": s.ref_kl,
-               "rel_dev": dev, "tol": s.tol, "pass": abs(dev) <= s.tol, "utc": utc()}
-        self.put(f"evals/sanity_s{ev['samples']}.json", doc)
-        self.set(sanity=doc)
-        print(f"[prod] sanity @ {ev['samples']:,}: quick-val KL {ev['policy_kl']:.5f} vs C0 {s.ref_kl:.5f} "
-              f"({dev:+.2%}, tol ±{s.tol:.0%}): {'pass' if doc['pass'] else 'FAIL'}", flush=True)
+        primary = ([{"source": "primary", "ref_kl": s.ref_kl, "samples": s.samples, "tol": s.tol,
+                     "ref_run": s.ref_run}] if s.samples and s.ref_kl is not None else [])
+        return primary + self.state["references"]
+
+    def check_references(self) -> None:
+        """Each reference once per run, as soon as production has a main-line quick-val at
+        its sample count: the primary (config) and any secondary from reference.json."""
+        for ref in self.references():
+            kl = self.state["quick_kl"].get(str(ref["samples"]))
+            if kl is not None and ref["source"] not in self.state["sanity"]:
+                self.sanity(ref, kl)
+
+    def sanity(self, ref: dict, kl: float) -> None:
+        dev = (kl - ref["ref_kl"]) / ref["ref_kl"]
+        doc = {**ref, "quick_kl": kl, "rel_dev": dev, "pass": abs(dev) <= ref["tol"], "utc": utc()}
+        self.put(f"evals/sanity_{ref['source']}_s{ref['samples']}.json", doc)
+        with self.lock:
+            self.state["sanity"][ref["source"]] = doc
+        self.q.put(("state",))
+        print(f"[prod] sanity ({ref['source']}) @ {ref['samples']:,}: quick-val KL {kl:.5f} vs "
+              f"{ref['ref_kl']:.5f} ({dev:+.2%}, tol ±{ref['tol']:.0%}): {'pass' if doc['pass'] else 'FAIL'}",
+              flush=True)
         if not doc["pass"]:
-            reason = f"sanity check failed: quick-val KL {dev:+.2%} from C0 (tol ±{s.tol:.0%})"
+            reason = (f"sanity check failed ({ref['source']} reference): quick-val KL {kl:.5f} at "
+                      f"{ref['samples']:,} is {dev:+.2%} from {ref['ref_kl']:.5f} (tol ±{ref['tol']:.0%})")
             self.anomaly("sanity", reason)
+            self.set(pause_reason=reason)
             ctl = {"action": "pause", "by": "prod.py", "reason": reason, "utc": utc()}
             put_json(self.store, self.key + "control.json", ctl)     # synchronous: a poll must not race it
             self.control_seen = ctl
             self.request("pause")
+            self.status()
+
+    def poll_reference(self) -> None:
+        """runs/<run>/reference.json, written after launch (C0's 40M quick-val, say):
+        {"source": "C0", "ref_kl": float, "samples": int[, "tol": float, "ref_run": str]}."""
+        try:
+            doc = get_json(self.store, self.key + "reference.json")
+        except STORE_ERRORS as e:
+            print(f"[prod] reference.json poll failed ({type(e).__name__}: {e})", flush=True)
+            return
+        if doc is None or doc == self.reference_seen:
+            return
+        self.reference_seen = doc
+        q = self.cfg.eval.quick_every_samples
+        try:
+            ref = {"source": str(doc["source"]), "ref_kl": float(doc["ref_kl"]), "samples": int(doc["samples"]),
+                   "tol": float(doc.get("tol", self.p.sanity.tol)), "ref_run": str(doc.get("ref_run", ""))}
+            ok = (ref["ref_kl"] > 0 and ref["samples"] > 0 and q > 0 and ref["samples"] % q == 0
+                  and ref["source"] not in ("", "primary"))
+        except (KeyError, TypeError, ValueError):
+            ok = False
+        if not ok:
+            self.anomaly("reference", f"ignored reference.json {doc!r}: needs source, ref_kl > 0 and "
+                                      f"samples on the {q:,} quick-val grid")
+            return
+        print(f"[prod] secondary reference: {ref}", flush=True)
+        with self.lock:
+            self.state["references"] = [r for r in self.state["references"] if r["source"] != ref["source"]] + [ref]
+        self.q.put(("state",))
+        self.check_references()
 
     def request(self, action: str) -> None:
         print(f"[prod] control: {action}", flush=True)
         self.action = action
         if action == "continue":
             self.pause_req = self.stop_after = False
+            if self.state.get("pause_reason"):
+                self.set(pause_reason=None)
         elif action == "pause":
             self.pause_req = True
         elif action == "stop_after_branch":
@@ -443,6 +544,10 @@ class Driver:
             self.set(time_cap_h=float(doc["time_cap_h"]))
         self.request(doc["action"])
 
+    def poll(self) -> None:
+        self.poll_control()
+        self.poll_reference()
+
     def halt(self, why: str) -> None:
         self.killed = why
         if self.proc is not None and self.proc.poll() is None:
@@ -463,6 +568,7 @@ class Driver:
             nxt_eta = left / rate / 3600
         self.put("status.json", {
             "run": self.cfg.run.name, "phase": self.state["phase"], "paused": self.pause_req,
+            "pause_reason": self.state.get("pause_reason"),
             "segment": self.seg, "segment_end": self.seg_end, "next_branch_point": self.bps[min(k, len(self.bps) - 1)],
             "samples": done, "step": s.get("step"), "samples_per_s": rate, "lr": s.get("lr"),
             "loss": s.get("loss"), "grad_norm": s.get("grad_norm"), "loader_wait_frac": s.get("loader_wait_frac"),
@@ -490,7 +596,7 @@ class Driver:
         now = time.monotonic()
         for what, every, fn in (("status", self.p.status_every_s, self.status),
                                 ("metrics", self.p.metrics_every_s, self.flush_metrics),
-                                ("control", self.p.control_every_s, self.poll_control)):
+                                ("control", self.p.control_every_s, self.poll)):
             if force or now >= self.next[what]:
                 self.next[what] = now + every
                 fn()
@@ -674,21 +780,23 @@ def new_state(cfg, config: str, sets: list, p: Settings) -> dict:
             "phase": "stable", "k": 0, "segment_started": False, "main_start": 0, "main": None,
             "branch": None, "branch_ckpt": None, "finals": {}, "paused": False,
             "elapsed_s": 0.0, "trained_samples": 0, "metrics_seq": 0, "time_cap_h": p.time_cap_h,
-            "sanity": None, "anomalies": [], "branches": [], "decisions": [],
+            "sanity": {}, "references": [], "quick_kl": {}, "pause_reason": None,
+            "anomalies": [], "branches": [], "decisions": [],
             "shipped": None, "stopped": None, "updated_utc": utc()}
 
 
 def start(config: str, sets: list) -> None:
     cfg, p = load(config, sets)
-    if p.sanity.samples and p.sanity.ref_kl is None:
-        raise SystemExit("prod.sanity.ref_kl is null: set it to C0's quick-val KL at "
-                         f"{p.sanity.samples:,} (CORPUS_V3_REPORT.md), e.g. --set prod.sanity.ref_kl=0.8123")
+    if p.sanity.samples and p.sanity.ref_kl is None:      # C0 is optional; the primary is not
+        raise SystemExit(f"the primary sanity reference is missing: prod.sanity.ref_kl is null (A3's "
+                         f"quick-val KL at {p.sanity.samples:,}; prod.yaml pins it)")
+    pins = check_pins(cfg, p)
     check_dirty(git_state(), cfg.system.allow_dirty)
     store = open_store()
     key = f"{p.store_prefix}{cfg.run.name}/"
     if store.get_bytes(key + "state.json") is not None:
         raise SystemExit(f"{store.where}/{key}state.json exists; continue it with --resume {cfg.run.name}")
-    d = Driver(cfg, p, store, new_state(cfg, config, sets, p))
+    d = Driver(cfg, p, store, {**new_state(cfg, config, sets, p), "pins": pins})
     d.q.put(("bytes", "config.resolved.yaml", yaml.safe_dump({**to_plain(cfg), "prod": asdict(p)}, sort_keys=True).encode()))
     d.q.put(("state",))
     _run(d)
@@ -705,6 +813,10 @@ def resume(run: str, config: str | None, sets: list) -> None:
     cfg, p = load(config or state["config"], state["sets"])
     if cfg.run.name != run:
         raise SystemExit(f"config resolves run.name={cfg.run.name!r}, not {run!r}")
+    state["pins_resume"] = check_pins(cfg, p)
+    for k, v in {"sanity": {}, "references": [], "quick_kl": {}, "pause_reason": None}.items():
+        if state.get(k) is None:                    # a state.json from before these keys existed
+            state[k] = v
     d = Driver(cfg, p, store, state)
     shutil.rmtree(d.stage, ignore_errors=True)
     for f in d.run_dir.rglob("*"):                  # local leftovers: never uploaded, never trusted
@@ -732,6 +844,7 @@ def _run(d: Driver) -> None:
 
 def smoke(config: str, sets: list, mbs: list, steps: int) -> dict:
     cfg, p = load(config, sets)
+    check_pins(cfg, p)                  # a drifted corpus or definition fails here, before GPU time
     eff = cfg.optim.effective_batch
     root = REPO / "models" / "v6" / "_smoke"
     out = {"config": config, "steps": steps, "utc": utc(), "splits": {}}

@@ -31,7 +31,10 @@ def param_groups(model, cfg: OptimConfig, exclude=()) -> list[dict]:
             {"params": keep, "weight_decay": 0.0, "name": "no_decay"}]
 
 
-def build_optimizer(model, cfg: OptimConfig, initial_lr: float):
+def build_optimizer(model, cfg: OptimConfig, initial_lr: float, muon_impl: str = "batched",
+                    compile: bool = False):
+    """muon_impl / compile: how the Muon update is computed (batched, compiled on CUDA, in
+    production; `reference` for the parity gates). Not config: same update, same state."""
     adamw_kw = dict(lr=initial_lr, betas=tuple(cfg.betas), eps=cfg.eps, fused=True)
     if cfg.name == "adamw":
         return torch.optim.AdamW(param_groups(model, cfg), **adamw_kw)
@@ -40,6 +43,7 @@ def build_optimizer(model, cfg: OptimConfig, initial_lr: float):
         raise ValueError("muon_adamw: no block matrices matched")
     muon = Muon([p for n, p in model.named_parameters() if n in muon_names], lr=initial_lr,
                 momentum=cfg.muon.momentum, nesterov=cfg.muon.nesterov,
-                ns_steps=cfg.muon.ns_steps, weight_decay=cfg.weight_decay)
+                ns_steps=cfg.muon.ns_steps, weight_decay=cfg.weight_decay,
+                impl=muon_impl, compile=compile)
     adamw = torch.optim.AdamW(param_groups(model, cfg, exclude=muon_names), **adamw_kw)
     return MuonAdamW(muon, adamw)
