@@ -847,3 +847,83 @@ never at risk: `state.json` only ever names checkpoints whose upload and sidecar
 exist, so `setup.sh`'s disk check (`du -sk data/processed`) failed and `pipefail` ended the
 script silently, in every mode. It's now guarded (`075c69f`).
 
+
+## Corpus v3 (2026-09-30): prepare locally, build on the VM
+
+**`t20` is included.** The index scan (`data/multiPV/v3_index_scan.py`,
+`manifests/v3_index_scan.json`, 51 s, 90M replay self-check passed) counts **78,585,592**
+`t20` policy rows outside ≤5, against a 10M bar. So `value_min_depth` is 20 and v3 selects
+**271,759,447** index rows (≈ 269M records, ≈ 104 GB), not the ≈ 191M / 74 GB the brief
+planned for the no-`t20` case.
+
+**The brief's old value-only figure is 10 rows off.** §3 says 84,821,994; the exact count is
+84,822,004 = 318,991 (≤5, the 90M rate on the same draws) + 27,774,780 + 43,361,069 +
+13,367,164. The recon headroom scan (2026-09-25) gives the same four buckets, and old policy
+matches §3 exactly (56,092,373). Read as an addition slip in the brief, not a selection
+difference; §4's "stop and report" is answered by reporting it. New value-only is 29,554,435
+against the brief's ≈ 29.1M (an estimate).
+
+**Nesting in corpus v2 is enforced, not just argued.** `pass_b_v2.py --nest-manifest
+dataset_manifest_v2.json` refuses any cell below v2's plan and replays v2's selection on the
+same `u` draws: 115,315,219 rows, 0 dropped. The 90M replay: 91,350,634, 0 dropped. Both run
+in every v3 selection, the VM's included.
+
+**Tiers are fixed edges.** old ≥ the 90M build's 26, new 24–25, t20 20–23; `t20` is optional
+in a plan and `value_min_depth` must equal the lowest tier present, so the v2 plan selects
+byte-for-byte what it did (tested).
+
+**Exact counts.** `data/multiPV/v3_expected_counts.json` is the dry run's selection (counts,
+totals, plan, seed, depths). `--expect-counts` compares the whole document and exits 3 on any
+difference, before anything converts. Measured identical on Windows and in the Ubuntu
+container.
+
+**Strata definition v3.** `depth_tier` gains `t20` as code 3, after `v1` = 2, so every existing
+record's code is unchanged; only the definition (and so the hash) changes:
+`5e5fdedaae858f45357bb8eb950fc6ba7be63ca5a30ea2b17422b0fe4d6011a9`. Every sidecar was
+regenerated into `data/processed/strata_def3/` and its `codes_sha256` equals the old one's
+(frozen v1/v2, `multipv_v2` train/val/valderived, `multipv_90m` train). The old sidecars in
+`data/processed/strata/` are untouched. The eval-set JSONs pin shard sha256s and codes, so they
+stay valid. The dry-run set (`make_synth`) was rebuilt under v3.
+
+**R2 layout follows the harness's pull convention**, not the brief's §7 prefix names. The
+harness's `pull` puts `data/<path>` at `data/<path>`, the configs read `data/processed/...`,
+and `git_state` counts untracked files as dirty, so a file outside the ignored
+`data/processed/` would stop `prod.py`. So every key is `data/processed/...`:
+- `data/sha256.txt` (published last) lists `processed/inputs/` (dump, index, checkpoint,
+  `rate_plan_v3.json`, `v3_expected_counts.json`), `processed/val_frozen_90m_v1/` (gate
+  reference), `processed/val_frozen_90m_v2/`, the v2 eval sets (`processed/evalsets/*.json`,
+  `processed/multipv_v2/` manifest + val + valderived shards) and their definition-v3 strata.
+- `data/dryrun/` holds `make_synth`'s set with its own `sha256.txt`: the harness's dry run uses
+  it (`setup.sh --data-prefix data/dryrun/`), not corpus v2 shards.
+- `data/multipv_v3/` (from the VM) has its own `sha256.txt` with `processed/...` paths:
+  `python -m training.v6.r2 pull data/multipv_v3/ --dest data` restores v3 anywhere.
+- Cost: `setup.sh`'s pull of `data/` also fetches the 27 GB of inputs on a resume VM.
+
+**VM scripts.** `vm_build_v3.sh --work data` keeps everything under `data/processed/`; it pulls
+with the harness's `r2 pull`, compares the pulled plan and counts with the committed ones, and
+`--smoke N` runs every step on N lines (no exact compare, whole-index checks n/a, no
+frozen-val gate). `vm_upload_v3.sh` uses `r2_push.py` (2 files × 4 parts, size-checked resume)
+and deletes the dump and index only after the remote sizes verify; `upload_ok.json` is last.
+
+**Derived records off.** `--derived-rate 0` with `--max-ply` left at 2 (records don't depend on
+it); `valderived` is empty, so strata and counts cover train and val only.
+
+**`has_policy` follows the index label on real data.** A synthetic row whose PVs are all
+duplicates converts without a policy, so a `t20` "policy" row *could* become a `hard_only` root
+in the value group. On real data it doesn't: corpus v2's policy-only new tier realised 0
+value-only roots, and the 200k-line smoke's `t20` roots are 16,639 multipv, 0 other. The VM's
+`build_ok.json` carries `depth_tier × label`.
+
+**Pool configs.** `pool_check_c0.yaml` is `a3_resolved.yaml` with only the corpus, the
+production pool and the run name changed; `pool_check_c1.yaml`, `prod_no_t20.yaml` restrict
+both groups to `depth_tier: [old, new]`; `prod_a3pool.yaml` is A3's `in_90m` groups, named
+`policy`/`value` because `prod.seen_eval.group` refers to `policy`.
+
+**Branch.** `v6-corpus3` was cut from `v6-harness` and fast-forwarded to `v6-prod` (1341c19),
+because `training/v6/r2.py` and `setup.sh`, which the VM scripts call, exist only there.
+Merging back is a fast-forward.
+
+**Credentials.** The supplied file uses its own names and a `.us.` jurisdiction endpoint that
+returns NoSuchBucket. The bucket (`guofishv6corpus`, default jurisdiction) works through the
+harness's `R2_ACCOUNT_ID` endpoint. The VM's `.env` needs `R2_ACCOUNT_ID`,
+`R2_BUCKET=guofishv6corpus`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`.

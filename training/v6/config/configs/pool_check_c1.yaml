@@ -1,0 +1,7 @@
+# Pool check C1 (corpus v3 brief §8): C0 without t20, run only if C0 fails.
+extends: pool_check_c0.yaml
+run: {name: C1}
+mixture:
+  groups:
+    - {name: policy, where: {origin: root, label: multipv, depth_tier: [old, new]}, share: 0.75}
+    - {name: value, where: {origin: root, label: [hard_only, value_only], depth_tier: [old, new]}, share: 0.25}
