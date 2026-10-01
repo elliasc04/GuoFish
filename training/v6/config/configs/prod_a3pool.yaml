@@ -1,0 +1,8 @@
+# Production on A3's own pool, the 90M roots (in_90m: v3 nests the 90M build, so these are
+# exactly its roots): the operator's choice if C0 and C1 both fail (corpus v3 brief §8).
+# Groups keep prod.yaml's names, which prod.seen_eval.group refers to.
+extends: prod.yaml
+mixture:
+  groups:
+    - {name: policy, where: {origin: root, label: multipv, in_90m: 1}, share: 0.75}
+    - {name: value, where: {origin: root, label: [hard_only, value_only], in_90m: 1}, share: 0.25}

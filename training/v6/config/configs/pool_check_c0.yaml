@@ -1,0 +1,14 @@
+# Pool check C0 (corpus v3 brief §8): A3 exactly as screened (a3_resolved.yaml: seed 20260802,
+# 60,000,256 samples, quick-val every 2,048,000, so it has the 40,960,000 reading prod's sanity
+# check uses), on corpus v3 with the production pool. Compared with the screening ledger's A3 on
+# frozen90 at f_KL 0.37% / f_MSE 1.7%. Only the corpus, the mixture and the run name change.
+extends: a3_resolved.yaml
+run: {name: C0, out_root: models/v6/pool_check}
+data:
+  corpus: data/processed/multipv_v3
+  manifest: data/processed/multipv_v3/manifest.json
+  strata: data/processed/strata/multipv_v3_train.strata2.npy
+mixture:                           # = prod.yaml's: t20 policy roots are in `policy` by label
+  groups:
+    - {name: policy, where: {origin: root, label: multipv}, share: 0.75}
+    - {name: value, where: {origin: root, label: [hard_only, value_only]}, share: 0.25}
