@@ -2,6 +2,11 @@
 
     python data/multiPV/pass_b_v2.py --rate-plan data/multiPV/rate_plan_v2.json         --out-dir data/processed/multipv_v2 [--limit 200000 | --dry-run]
 
+Corpus v3 (corpus v3 brief §2-4): a plan may add tier t20 (20 <= max_depth < 24; then
+--value-min-depth 20); --nest-manifest dataset_manifest_v2.json also refuses any cell
+below corpus v2's rate and replays v2's selection (0 dropped); --dry-run --write-counts
+writes the exact selection, which --expect-counts later requires (exit 3 on mismatch).
+
 What changes from v1 (everything else - parsing, filters, labels, dedup of
 repeated PVs, val split, shard routing - is v1's code, imported, not copied):
 
@@ -71,22 +76,34 @@ from record_format import shard_name  # noqa: E402
 from training.v6.data.formats import V2_DTYPE, dtype_descr  # noqa: E402
 
 DERIVED_STREAM = 0x5D1E_7E0D
-TIERS = ("old", "new")
+# Pass A max_depth tiers: old >= the floor manifest's value_min_depth (26), new [24, 26),
+# t20 [20, 24). old and new are required in a plan, t20 is optional (corpus v3).
+TIERS = ("old", "new", "t20")
+TIER_MIN_DEPTH = {"new": 24, "t20": 20}
 LABELS = ("policy", "value_only")
 
 
-def load_rate_plan(path: Path, floor: dict) -> dict:
-    """{tier: {label: {bucket: rate}}}, complete and in [0, 1]; refuses any old-tier
-    rate below the floor (90M) manifest's rate for the same cell (nesting)."""
+def tier_edges(plan: dict, old_min: int) -> dict:
+    """{tier: (lo, hi)} on max_depth, for the tiers in `plan`."""
+    edges = {"old": (old_min, 1 << 15), "new": (TIER_MIN_DEPTH["new"], old_min),
+             "t20": (TIER_MIN_DEPTH["t20"], TIER_MIN_DEPTH["new"])}
+    return {t: edges[t] for t in TIERS if t in plan}
+
+
+def load_rate_plan(path: Path, floor: dict, nest: dict | None = None) -> dict:
+    """{tier: {label: {bucket: rate}}}, complete and in [0, 1]. Refuses (nesting) any
+    old-tier rate below the floor (90M) manifest's rate for the same cell, and, given a
+    `nest` manifest (corpus v2), any cell below that build's rate plan."""
     plan = json.loads(path.read_text())
     buckets = sorted(b for b, _, _ in BUCKETS)
-    shape_ok = (sorted(plan) == sorted(TIERS)
-                and all(sorted(plan[t]) == sorted(LABELS) for t in TIERS)
-                and all(sorted(plan[t][lab]) == buckets for t in TIERS for lab in LABELS))
+    tiers = [t for t in TIERS if t in plan]
+    shape_ok = (set(plan) <= set(TIERS) and {"old", "new"} <= set(plan)
+                and all(isinstance(plan[t], dict) and sorted(plan[t]) == sorted(LABELS) for t in tiers)
+                and all(sorted(plan[t][lab]) == buckets for t in tiers for lab in LABELS))
     if not shape_ok:
-        raise SystemExit(f"{path}: rate plan must be {{tier: {{label: {{bucket: rate}}}}}} "
-                         f"over exactly {TIERS} x {LABELS} x {buckets}")
-    bad = [(t, lab, b, r) for t in TIERS for lab in LABELS for b, r in plan[t][lab].items()
+        raise SystemExit(f"{path}: rate plan must be {{tier: {{label: {{bucket: rate}}}}}} over "
+                         f"tiers old, new [, t20] x {LABELS} x {buckets}")
+    bad = [(t, lab, b, r) for t in tiers for lab in LABELS for b, r in plan[t][lab].items()
            if not (isinstance(r, (int, float)) and 0.0 <= r <= 1.0)]
     if bad:
         raise SystemExit(f"{path}: rates outside [0, 1]: {bad}")
@@ -96,22 +113,40 @@ def load_rate_plan(path: Path, floor: dict) -> dict:
     if low:
         raise SystemExit(f"{path}: old-tier rates below the floor manifest's break nesting "
                          f"(label, bucket, plan, floor): {low}")
+    if nest is not None:
+        np_ = nest["rate_plan"]
+        if nest["tier_min_depth"] != {t: lo for t, (lo, _) in tier_edges(np_, floor["value_min_depth"]).items()}:
+            raise SystemExit(f"nest manifest tiers {nest['tier_min_depth']} differ from this builder's")
+        low = [(t, lab, b, plan.get(t, {}).get(lab, {}).get(b, 0.0), r)
+               for t in np_ for lab in LABELS for b, r in np_[t][lab].items()
+               if plan.get(t, {}).get(lab, {}).get(b, 0.0) < r]
+        if low:
+            raise SystemExit(f"{path}: rates below the nest manifest's break nesting "
+                             f"(tier, label, bucket, plan, nest): {low}")
     return plan
 
 
 def select_tiered(index_path: Path, plan: dict, seed: int, value_min_depth: int,
-                  policy_min_depth: int, floor: dict, limit: int = 0):
+                  policy_min_depth: int, floor: dict, limit: int = 0, nest: dict | None = None):
     """-> (sorted line numbers, selected counts {tier: {label: {bucket: n}}},
-    90M rows dropped, 90M rows replayed). The u stream is build_selection's
-    (default_rng(seed), one draw per index row), so the floor manifest's
-    selection is replayed on the same draws; `limit` selects over the first N
-    rows only, which is exactly the full build's selection of those rows."""
+    {"floor"|"nest": [rows replayed, rows dropped]}). The u stream is build_selection's
+    (default_rng(seed), one draw per index row), so the floor manifest's selection, and
+    the nest manifest's (corpus v2) when given, are replayed on the same draws; `limit`
+    selects over the first N rows only, which is exactly the full build's selection of
+    those rows."""
     ix = np.memmap(index_path, dtype=INDEX_DTYPE, mode="r")
     n = min(len(ix), limit) if limit else len(ix)
     old_min = floor["value_min_depth"]
+    edges = tier_edges(plan, old_min)
+    if value_min_depth != min(lo for lo, _ in edges.values()):
+        raise SystemExit(f"value_min_depth {value_min_depth} must be the lowest tier's edge "
+                         f"({min(lo for lo, _ in edges.values())} for tiers {list(edges)})")
+    nest_plan = nest["rate_plan"] if nest else None
+    nest_edges = tier_edges(nest_plan, old_min) if nest else {}
     rng = np.random.default_rng(seed)
-    counts = {t: {lab: {b: 0 for b, _, _ in BUCKETS} for lab in LABELS} for t in TIERS}
-    chunks, lost, n90 = [], 0, 0
+    counts = {t: {lab: {b: 0 for b, _, _ in BUCKETS} for lab in LABELS} for t in edges}
+    chunks = []
+    replay = {"floor": [0, 0], **({"nest": [0, 0]} if nest else {})}
     for start in range(0, n, 20_000_000):
         stop = min(start + 20_000_000, n)
         pc = np.asarray(ix["piece_count"][start:stop])
@@ -119,26 +154,40 @@ def select_tiered(index_path: Path, plan: dict, seed: int, value_min_depth: int,
         pdp = np.asarray(ix["policy_depth"][start:stop])
         u = rng.random(stop - start)
         legal = pc <= MAX_PIECES
-        tier = {"old": legal & (md >= old_min),
-                "new": legal & (md >= value_min_depth) & (md < old_min)}
+        tier = {t: legal & (md >= lo) & (md < hi) for t, (lo, hi) in edges.items()}
+        ntier = {t: legal & (md >= lo) & (md < hi) for t, (lo, hi) in nest_edges.items()}
         has_pol = pdp >= policy_min_depth
         keep = np.zeros(stop - start, dtype=bool)
         keep90 = np.zeros(stop - start, dtype=bool)
+        keepn = np.zeros(stop - start, dtype=bool)
         for b, lo, hi in BUCKETS:
             in_b = (pc >= lo) & (pc <= hi)
             for lab, lm in (("policy", has_pol), ("value_only", ~has_pol)):
                 cell = in_b & lm
-                for t in TIERS:
+                for t in edges:
                     k = tier[t] & cell & (u < plan[t][lab][b])
                     counts[t][lab][b] += int(k.sum())
                     keep |= k
-                keep90 |= tier["old"] & cell & (u < floor[f"bucket_sampling_rates_{lab}"][b])
-        lost += int((keep90 & ~keep).sum())
-        n90 += int(keep90.sum())
+                keep90 |= legal & (md >= old_min) & cell & (u < floor[f"bucket_sampling_rates_{lab}"][b])
+                for t in nest_edges:
+                    keepn |= ntier[t] & cell & (u < nest_plan[t][lab][b])
+        for name, kk in (("floor", keep90), ("nest", keepn)):
+            if name in replay:
+                replay[name][0] += int(kk.sum())
+                replay[name][1] += int((kk & ~keep).sum())
         chunks.append(np.flatnonzero(keep).astype(np.int64) + start)
-        del pc, md, pdp, u, legal, tier, has_pol, keep, keep90
+        del pc, md, pdp, u, legal, tier, ntier, has_pol, keep, keep90, keepn
     del ix
-    return np.concatenate(chunks), counts, lost, n90
+    return np.concatenate(chunks), counts, replay
+
+
+def counts_doc(selected_lines: int, counts: dict, plan: dict, args) -> dict:
+    """The exact-expected-counts document (corpus v3 brief §4): what --expect-counts compares."""
+    return {"selected_lines": selected_lines, "selected_counts": counts,
+            "totals": {t: {lab: sum(v.values()) for lab, v in c.items()} for t, c in counts.items()},
+            "rate_plan": plan, "seed": args.seed, "value_min_depth": args.value_min_depth,
+            "policy_min_depth": args.policy_min_depth,
+            "scope": f"first {args.limit:,} index rows" if args.limit else "whole index"}
 
 
 def position_key(board: chess.Board) -> int:
@@ -363,6 +412,13 @@ def main(argv=None) -> int:
     ap.add_argument("--index", type=Path, default=_HERE / "index" / "pass_a_index.bin")
     ap.add_argument("--floor-manifest", type=Path, default=_HERE / "manifests" / "dataset_manifest_90m.json",
                     help="rates are floored at this build's rates and it must nest")
+    ap.add_argument("--nest-manifest", type=Path, default=None,
+                    help="a tiered build (corpus v2) that must also nest: no cell below its rate plan, "
+                         "and its replayed selection is kept whole")
+    ap.add_argument("--write-counts", type=Path, default=None,
+                    help="--dry-run only: write the exact selection counts here (must not exist)")
+    ap.add_argument("--expect-counts", type=Path, default=None,
+                    help="refuse (exit 3) unless the selection reproduces this counts file exactly")
     ap.add_argument("--value-scale", type=float, default=VALUE_SCALE)
     ap.add_argument("--value-min-depth", type=int, default=24)
     ap.add_argument("--policy-min-depth", type=int, default=20)
@@ -385,9 +441,12 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if not 0.0 <= args.derived_rate <= 1.0:
         raise SystemExit("--derived-rate must be in [0, 1]")
-    for p in (args.source, args.index, args.floor_manifest, args.rate_plan):
-        if not p.exists():
+    for p in (args.source, args.index, args.floor_manifest, args.rate_plan, args.nest_manifest,
+              args.expect_counts):
+        if p is not None and not p.exists():
             raise SystemExit(f"missing {p}")
+    if args.write_counts is not None and (not args.dry_run or args.write_counts.exists()):
+        raise SystemExit("--write-counts needs --dry-run and a path that does not exist")
     if not args.dry_run:
         if args.out_dir is None:
             raise SystemExit("--out-dir is required (unless --dry-run)")
@@ -401,22 +460,43 @@ def main(argv=None) -> int:
     if floor["seed"] != args.seed or floor["value_min_depth"] <= args.value_min_depth \
             or floor["policy_min_depth"] != args.policy_min_depth:
         raise SystemExit("floor manifest seed/depths are incompatible with the tiers and nesting")
-    plan = load_rate_plan(args.rate_plan, floor)
-    selected, sel_counts, lost, n90 = select_tiered(
-        args.index, plan, args.seed, args.value_min_depth, args.policy_min_depth, floor, args.limit)
-    nesting = {"floor_manifest": str(args.floor_manifest), "scope": (
-        f"first {args.limit:,} index rows" if args.limit else "whole index"),
-        "floor_rows_replayed": n90, "floor_rows_dropped": lost}
-    print(f"selected {len(selected):,} lines in {time.time() - t_start:.0f}s; 90M replay "
-          f"{n90:,} rows, {lost:,} dropped", file=sys.stderr, flush=True)
+    nest = json.loads(args.nest_manifest.read_text()) if args.nest_manifest else None
+    if nest is not None and (nest["seed"] != args.seed or nest["policy_min_depth"] != args.policy_min_depth
+                             or nest.get("limit_lines")):
+        raise SystemExit("nest manifest seed/policy depth differ, or it is a --limit build")
+    plan = load_rate_plan(args.rate_plan, floor, nest)
+    selected, sel_counts, replay = select_tiered(
+        args.index, plan, args.seed, args.value_min_depth, args.policy_min_depth, floor, args.limit, nest)
+    (n90, lost), scope = replay["floor"], (f"first {args.limit:,} index rows" if args.limit else "whole index")
+    nesting = {"floor_manifest": str(args.floor_manifest), "scope": scope,
+               "floor_rows_replayed": n90, "floor_rows_dropped": lost}
+    if nest is not None:
+        nesting.update({"nest_manifest": str(args.nest_manifest), "nest_rows_replayed": replay["nest"][0],
+                        "nest_rows_dropped": replay["nest"][1]})
+    print(f"selected {len(selected):,} lines in {time.time() - t_start:.0f}s; replays (rows, dropped) "
+          f"{replay}", file=sys.stderr, flush=True)
     if not args.limit and n90 != floor["selected_lines"]:
         raise SystemExit(f"90M replay selected {n90:,} rows, its manifest says "
                          f"{floor['selected_lines']:,}: the u stream is not reproduced")
-    if lost:
-        raise SystemExit(f"nesting broken: the plan drops {lost:,} 90M lines")
+    if not args.limit and nest is not None and replay["nest"][0] != nest["selected_lines"]:
+        raise SystemExit(f"nest replay selected {replay['nest'][0]:,} rows, its manifest says "
+                         f"{nest['selected_lines']:,}: the u stream is not reproduced")
+    if lost or (nest is not None and replay["nest"][1]):
+        raise SystemExit(f"nesting broken: the plan drops {lost:,} 90M lines and "
+                         f"{replay.get('nest', [0, 0])[1]:,} nest-manifest lines")
+    doc = counts_doc(int(len(selected)), sel_counts, plan, args)
+    if args.expect_counts is not None:
+        want = json.loads(args.expect_counts.read_text())
+        if want != doc:
+            diff = {k: [want.get(k), doc[k]] for k in doc if want.get(k) != doc[k]}
+            print(f"COUNT MISMATCH against {args.expect_counts} (expected, got): "
+                  f"{json.dumps(diff)[:2000]}", file=sys.stderr)
+            return 3
+        print(f"selection reproduces {args.expect_counts} exactly", file=sys.stderr, flush=True)
     if args.dry_run:
-        print(json.dumps({"selected_lines": int(len(selected)), "selected_counts": sel_counts,
-                          "nesting": nesting, "seconds": round(time.time() - t_start, 1)}, indent=1))
+        if args.write_counts is not None:
+            args.write_counts.write_text(json.dumps(doc, indent=1) + "\n", newline="\n")
+        print(json.dumps({**doc, "nesting": nesting, "seconds": round(time.time() - t_start, 1)}, indent=1))
         return 0
 
     cfg = dict(value_min_depth=args.value_min_depth, policy_min_depth=args.policy_min_depth,
@@ -569,8 +649,8 @@ def main(argv=None) -> int:
         "val_split": f"sha1(fen) % 1000 < {args.val_permille}", "seed": args.seed,
         "rate_plan_file": str(args.rate_plan),
         "rate_plan_sha256": hashlib.sha256(args.rate_plan.read_bytes()).hexdigest(),
-        "rate_plan": plan, "tier_min_depth": {"old": floor["value_min_depth"],
-                                              "new": args.value_min_depth},
+        "rate_plan": plan,
+        "tier_min_depth": {t: lo for t, (lo, _) in tier_edges(plan, floor["value_min_depth"]).items()},
         "floor_manifest": str(args.floor_manifest), "nesting": nesting,
         "selection_scope": nesting["scope"], "selected_lines": n_selected,
         "selected_counts": sel_counts,

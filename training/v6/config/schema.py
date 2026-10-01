@@ -19,7 +19,7 @@ STRATA_FIELDS = {
     "value": ("exact_zero", "mate", "middle"),
     "material": ("level", "ahead", "compensated"),
     "origin": ("root", "ply1", "ply2"),
-    "depth_tier": ("old", "new", "v1"),
+    "depth_tier": ("old", "new", "v1", "t20"),
     "in_90m": (0, 1),                   # ints: YAML 1.1 reads yes/no as booleans
 }
 

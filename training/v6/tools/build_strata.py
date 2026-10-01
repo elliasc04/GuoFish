@@ -1,4 +1,4 @@
-"""Write stratum sidecars (§6.6, definition v2) for corpus splits or an eval set.
+"""Write stratum sidecars (§6.6, definition v3) for corpus splits or an eval set.
 
     python -m training.v6.tools.build_strata --shards data/processed/multipv_v2 \
         --split train val valderived [--manifest M] [--out-dir data/processed/strata]

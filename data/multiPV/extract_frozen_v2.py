@@ -1,7 +1,9 @@
 """Re-materialise the frozen 90M val set in v2 format (v6 design doc §6.5 steps 2-3; gate S6).
 
     python data/multiPV/extract_frozen_v2.py --corpus data/processed/multipv_v2 \
-        --out data/processed/val_frozen_90m_v2
+        --out data/processed/val_frozen_90m_v2 [--manifest M] [--frozen-v1 D] [--index I] [--m90 M90]
+
+Any v2-format corpus that nests the 90M build works (corpus v3 too: its build gate).
 
 Replays the 90M selection (the floor manifest's seed and rates, value_min_depth
 26, same Pass A index) and keeps the corpus-v2 val records whose src_line it
@@ -46,8 +48,9 @@ def replay_90m(index: Path, m90: dict) -> np.ndarray:
     return sel
 
 
-def extract(corpus: Path, sel90: np.ndarray, seed: int, n_val: int) -> list[np.ndarray]:
-    ss = ShardSet(corpus, "val")
+def extract(corpus: Path, sel90: np.ndarray, seed: int, n_val: int,
+            manifest: Path | None = None) -> list[np.ndarray]:
+    ss = ShardSet(corpus, "val", manifest)
     if ss.format != "v2":
         raise SystemExit(f"{corpus} is {ss.format}, expected v2")
     kept = []
@@ -90,6 +93,7 @@ def verify(shards_v2: list[np.ndarray], frozen_v1: Path) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", type=Path, required=True)
+    ap.add_argument("--manifest", type=Path, default=None, help="default <corpus>/manifest.json")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--frozen-v1", type=Path, default=_ROOT / "data/processed/val_frozen_90m_v1")
     ap.add_argument("--index", type=Path, default=_HERE / "index" / "pass_a_index.bin")
@@ -100,7 +104,7 @@ def main(argv=None) -> int:
         raise SystemExit(f"{args.out} exists and is not empty")
     m90 = json.loads(args.m90.read_text())
     sel90 = replay_90m(args.index, m90)
-    shards = extract(args.corpus, sel90, m90["seed"], m90["n_val_shards"])
+    shards = extract(args.corpus, sel90, m90["seed"], m90["n_val_shards"], args.manifest)
     args.out.mkdir(parents=True, exist_ok=True)
     entries = []
     for j, part in enumerate(shards):
