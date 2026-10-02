@@ -643,6 +643,80 @@ inline void tokenize_into(const ParsedFen &parsed, std::int32_t *out) {
 }
 
 // ---------------------------------------------------------------------------
+// Contract B: `canonical_65` (design doc §5.4, §11.2)
+//
+// The side-to-move frame screening arm A9 trains on. When Black is to move,
+// square s maps to s ^ 56 and the colours swap, so the mover is always "White":
+// pieces become ours (1..6) and theirs (7..12). A rook that still carries a
+// castling right gets its own token, and the ep target is tagged only when an ep
+// capture is LEGAL, which is the second of cpp/keys.hpp's three ep rules, not the
+// raw one token 66 reads. The reference is `tokens_canonical_65` in
+// core/guofish_net/tokenizers.py, which training's worker transform is checked
+// against (S5).
+//
+// THE ROW STAYS 68 SLOTS. The net reads slots 0..64. Slot 65 holds the side to
+// move and 66..67 are zero, and nothing reads them but the nn_key, which hashes
+// the whole row. That keeps the cache sound: a position and its colour mirror
+// have the same 65 canonical tokens, but not the same White-POV value or
+// real-frame priors, and those are what the cache stores. Keeping the width
+// also leaves the buffers, the captured graphs and the pinning as they are.
+// ---------------------------------------------------------------------------
+
+enum class Contract { A, B };
+
+inline constexpr int kCanonicalSeqLength = 65;
+inline constexpr int kCanonicalIdxCls = 64;
+inline constexpr int kCanonicalIdxSideToMove = 65;
+inline constexpr int kCanonicalFlip = 56;  // s ^ 56: rank flipped, file kept
+
+inline constexpr std::int32_t kCanonicalTheirOffset = 6;  // theirs = piece_type + 6
+inline constexpr std::int32_t kCanonicalOurCastleRook = 13;
+inline constexpr std::int32_t kCanonicalTheirCastleRook = 14;
+inline constexpr std::int32_t kCanonicalEpTarget = 15;
+inline constexpr std::int32_t kCanonicalCls = 16;
+
+static_assert(kCanonicalIdxSideToMove < kSeqLength, "the canonical row must fit the 68-slot buffer");
+
+// Write the contract-B row for `parsed` into `out` (room for `kSeqLength`).
+// `legal_ep` is python-chess's `has_legal_en_passant()`. It is passed in because
+// answering it needs attack tables this header does not include; cpp/keys.hpp
+// computes it.
+inline void tokenize_canonical_into(const ParsedFen &parsed, bool legal_ep, std::int32_t *out) {
+    assert(out != nullptr);
+
+    const bool white = parsed.white_to_move;
+    const int flip = white ? 0 : kCanonicalFlip;
+
+    for (int square = 0; square < 64; ++square) {
+        std::int32_t token = parsed.placement.square_token[square];
+        if (token != kTokenEmpty) {
+            const bool ours = (token <= kTokenBlackOffset) == white;
+            const std::int32_t piece = token > kTokenBlackOffset ? token - kTokenBlackOffset : token;
+            // `parsed.castling` is `clean_castling_rights()`: rook squares only,
+            // each holding a rook of its own back rank's colour.
+            if (piece == 4 && (parsed.castling & square_bb(square)) != 0) {
+                token = ours ? kCanonicalOurCastleRook : kCanonicalTheirCastleRook;
+            } else {
+                token = ours ? piece : piece + kCanonicalTheirOffset;
+            }
+        }
+        out[square ^ flip] = token;
+    }
+
+    // `has_legal_en_passant()` is false for an occupied ep square, so this never
+    // overwrites a piece.
+    if (legal_ep) {
+        out[parsed.ep_square ^ flip] = kCanonicalEpTarget;
+    }
+
+    out[kCanonicalIdxCls] = kCanonicalCls;
+    out[kCanonicalIdxSideToMove] = white ? kTokenWhiteToMove : kTokenBlackToMove;
+    for (int i = kCanonicalIdxSideToMove + 1; i < kSeqLength; ++i) {
+        out[i] = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The inverse: a ParsedFen back to FEN text
 //
 // Moved here from cpp/search.hpp in C7, unchanged. It was written for

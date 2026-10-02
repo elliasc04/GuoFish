@@ -552,7 +552,8 @@ def test_autotuning_is_off_because_that_is_what_pins_the_kernels(inductor):
     import torch._inductor.config as inductor_config
 
     assert inductor.graph.inductor_settings == {
-        "use_static_cuda_launcher": False, "triton.autotune_pointwise": False}
+        "use_static_cuda_launcher": False, "triton.autotune_pointwise": False,
+        "triton.descriptive_names": False}
     assert inductor_config.triton.autotune_pointwise is False
     # Not a preference: with torch 2.8.0+cu129 / triton 3.4.0 on this device the
     # static launcher raises OverflowError on the first Inductor kernel.

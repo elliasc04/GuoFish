@@ -1,0 +1,17 @@
+# CPU plumbing config: d64x2, fp32, no compile, frozen val used AS TRAIN DATA.
+# For harness tests only (M5); its numbers mean nothing about model quality.
+extends: base.yaml
+run:   {name: v6-tiny-cpu}
+model: {d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128}
+data:
+  corpus: data/processed/val_frozen_90m_v1
+  manifest: data/processed/val_frozen_90m_v1/manifest.json
+  split: val
+  strata: data/processed/strata/val_frozen_90m_v1_val.strata2.npy
+  workers: 0
+optim: {micro_batch: 64, accum: 2, lr: 1.0e-3}
+schedule: {kind: wsd, total_samples: 38400, warmup_samples: 3840, decay_frac: 0.2}   # 300 steps x 128
+ema: {half_life_samples: 12800}
+eval: {quick_every_samples: 12800, quick_size: 2048, full_every_samples: 0, workers: 0, mirror_n: 1000}
+ckpt: {every_samples: 6400, keep_last: 3, stable_every_samples: 12800}
+system: {device: cpu, precision: fp32, compile: false, log_every: 10}

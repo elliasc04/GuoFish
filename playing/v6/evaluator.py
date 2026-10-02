@@ -250,15 +250,119 @@ def hoist_norm_parameter_casts(model: torch.nn.Module) -> int:
     return hoisted
 
 
+class ExportedNet(torch.nn.Module):
+    """A `core.guofish_net` export behind the boundary the C++ core reads (S7).
+
+    `GuoFishNet.forward` returns fp32, which is its documented contract; the
+    policy buffer is bf16. The logits are bf16 until that `.float()`, so
+    narrowing them back here is exact. Doing it inside the module puts the cast
+    inside the captured graph. Leaving it to the callback's cross-device
+    `copy_` would allocate a converted temporary and move twice the bytes on
+    every batch. The value stays fp32 (the net takes tanh in fp32), which the
+    float32 value buffer takes as is.
+
+    `embedding`, `seq_length` and `cls_index` are exposed for
+    `require_engine_contract`; `value_scale` is exposed for the engine's cp readout.
+
+    `contract` is the export's, and `TorchEvaluator` hands it to the C++ core. For
+    contract B (`canonical_65`, design doc §11.2) the core writes canonical tokens
+    into the first 65 of each row's 68 slots and does the policy remap and value
+    sign itself, so this module only narrows the row to what the net reads.
+    """
+
+    def __init__(self, net: torch.nn.Module):
+        super().__init__()
+        self.net = net
+        self.value_scale = net.value_scale
+        self.contract = net.cfg.contract
+        self.seq_length = SEQ_LENGTH
+        if self.contract == "A":
+            self.embedding = net.embedding
+            self.cls_index = net.cfg.cls_index
+
+    def forward(self, tokens: torch.Tensor):
+        if self.contract == "B":
+            tokens = tokens[:, :guofish_core.CANONICAL_SEQ_LENGTH]
+        policy, value = self.net(tokens)
+        return policy.to(AUTOCAST_DTYPE), value
+
+
+def cast_linears(model: torch.nn.Module, dtype: torch.dtype) -> int:
+    """Store every nn.Linear's weight and bias in `dtype`. Returns how many.
+
+    This is the cast autocast applies to those tensors on every call, done once
+    instead. It changes no output bit (tests/test_s7_v6_loader.py). Embeddings,
+    LayerNorms and the residual stream stay fp32, as they were in training and in
+    every frozen90 score. That is why this is not `model.to(bfloat16)`, which is the
+    v5 path's choice and gives a bf16 residual stream.
+    """
+    n = 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.Linear):
+            module.to(dtype)
+            n += 1
+    return n
+
+
+def is_v6_export(path: Path) -> bool:
+    """True for a `training/v6/tools/export.py` file (it carries `arch_version`).
+
+    Memory-mapped, so peeking costs no read of the weights. A file that
+    cannot be mapped predates torch's zip format, so only a legacy net can be
+    stored that way; `load_model` then loads it or fails loudly.
+    """
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError:
+        return False
+    return isinstance(blob, dict) and "arch_version" in blob
+
+
+def load_v6_export(path: Path, device: torch.device, log=print) -> ExportedNet:
+    """A v6 export, through `core.guofish_net.load_for_inference` (doc §11.1).
+
+    The export declares its contract. A contract-B (`canonical_65`) export runs
+    on the core's canonical tokenizer, policy remap and value sign (§11.2), which
+    `TorchEvaluator` selects from `ExportedNet.contract`.
+    """
+    from core.guofish_net import load_for_inference
+
+    log(f"Loading {path} on {device}")
+    net, contract = load_for_inference(path)
+    cfg = net.cfg
+    if getattr(net, "value_scale", None) is None:
+        raise ValueError(
+            f"{path} records no value_scale, so the engine could not convert its value "
+            f"to centipawns. Re-export it with training/v6/tools/export.py, which "
+            f"records the training corpus's value_scale.")
+    params = sum(p.numel() for p in net.parameters())
+    log(f"Detected v6 export: d{cfg.d_model}x{cfg.n_layers}, {cfg.n_heads} heads, "
+        f"d_ff {cfg.d_ff}, attn_bias={cfg.attn_bias}, value_head={cfg.value_head.pool}, "
+        f"value_repr={cfg.value_repr.kind}, {params:,} parameters, contract {contract}")
+    if device.type == "cuda":
+        n = cast_linears(net, AUTOCAST_DTYPE)
+        log(f"Precision: {n} Linear layers stored in "
+            f"{str(AUTOCAST_DTYPE).removeprefix('torch.')}; embeddings, LayerNorms and "
+            f"the residual stream fp32, as trained")
+    return ExportedNet(net).to(device).eval()
+
+
 def load_default_model(model_path: Path | None = None,
                        device: torch.device | None = None) -> tuple[torch.nn.Module,
                                                                     torch.device]:
-    """Either supported generation on the best available device.
+    """Any supported generation on the best available device.
 
-    Routed through `playing.v6.chess_transformer_v2.load_model`, which picks the
+    A v6 export (S7) goes through `load_v6_export`. Everything else is routed
+    through `playing.v6.chess_transformer_v2.load_model`, which picks the
     architecture off the checkpoint's own metadata — v5 students
     (training/v5_multiPV) and the legacy ChessTransformerV2 that guofish2..
     guofish4 are. There is no flag to get wrong.
+
+    The v5 and legacy nets deliberately stay on that private copy. Converting
+    them through `core.guofish_net` would re-run them on different modules, a
+    measured 1.7e-4 relative shift in bf16 value MSE (training/v6/S2_REPORT.md).
+    Every golden and baseline here is anchored to their current numerics
+    (README_BUILD.md, "Golden data").
 
     That loader used to be `playing.v5.playv5.load_model`, which is the same code
     but reached through a module whose import executes `import core.mctsv3` and
@@ -277,7 +381,8 @@ def load_default_model(model_path: Path | None = None,
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(Path(model_path) if model_path else DEFAULT_MODEL, device)
+    path = Path(model_path) if model_path else DEFAULT_MODEL
+    model = load_v6_export(path, device) if is_v6_export(path) else load_model(path, device)
     require_engine_contract(model)
     return model, device
 
@@ -314,7 +419,11 @@ class TorchEvaluator:
         # Constructing this sets sys.setswitchinterval, before any search thread
         # exists. That is the whole reason the setting lives in a constructor —
         # see guofish_core.LiveEvaluator.
-        self.core = guofish_core.LiveEvaluator(self.max_batch, self._evaluate, switch_interval)
+        #
+        # The contract is the export's (design doc §11.2): the core picks its
+        # tokenizer, policy remap and value sign from it. v5 and legacy nets are A.
+        self.core = guofish_core.LiveEvaluator(self.max_batch, self._evaluate, switch_interval,
+                                               getattr(model, "contract", "A"))
         self.switch_interval = self.core.switch_interval
         self.switch_interval_before = self.core.switch_interval_before
 
@@ -613,6 +722,7 @@ __all__ = [
     "AUTOCAST_DTYPE",
     "DEFAULT_MODEL",
     "DEFAULT_SWITCH_INTERVAL",
+    "ExportedNet",
     "MIN_VOCAB_SIZE",
     "POISON_BITS",
     "POLICY_SIZE",
@@ -620,6 +730,9 @@ __all__ = [
     "SHIPPING_MODEL",
     "TorchEvaluator",
     "build",
+    "cast_linears",
+    "is_v6_export",
     "load_default_model",
+    "load_v6_export",
     "require_engine_contract",
 ]

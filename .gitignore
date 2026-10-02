@@ -10,7 +10,8 @@ node_modules/
 /outputs/finetuned_transformer
 # Testing
 coverage/
-
+*.env
+/creds/*
 # Project Specific
 /data/processed/
 /data/_mmap_cache/

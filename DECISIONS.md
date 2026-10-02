@@ -7811,3 +7811,236 @@ what established it was needed.
   simulations was not measured.
 * **Anything on Linux.** No CUDA there, so every C12b test skips and the arm certifies
   nothing in this chunk.
+
+# S7 — the engine loads v6 exports (2026-09-27)
+
+Design doc `docs/capacity/training_stack.md` §11.1 and §12 S7. Contract A only: `v5_68`
+tokens and a White-POV value, so no C++ change. The first net through it is the screening
+arm A7: d384×10 with smolgen, 20,891,905 parameters.
+
+## Dispatch on the file, and the v5 nets keep their loader
+
+`load_default_model` peeks at the file memory-mapped. A file carrying `arch_version` (a
+`training/v6/tools/export.py` export) goes through `load_v6_export`, which calls
+`core.guofish_net.load_for_inference`. Everything else goes through
+`chess_transformer_v2.load_model`, unchanged. Checked: both v5 checkpoints and the
+guofish2/guofish4 nets are recognised as non-exports.
+
+**Deviation from §11.1:**
+- **What §11.1 says:** the evaluator "drops its private model copy".
+- **What it would cost:** converting the v5 nets through `core.guofish_net` would re-run
+  them on different modules, a measured 1.7e-4 relative shift in bf16 value MSE
+  (`training/v6/S2_REPORT.md`). Gate 2, Gate 2b, Gate 2', the C10b graph tests and every
+  file in `golden/` and `baseline/` are anchored to those nets' current numerics, and
+  Global Rules 1–2 forbid regenerating them.
+- **So:** retiring the private copy is its own chunk, one that re-bases those gates.
+  S7 needs only the new path.
+
+## The boundary: `ExportedNet` and bf16 Linear storage
+
+- **Policy dtype.** `GuoFishNet.forward` returns fp32 (its documented contract), but the
+  policy buffer is bf16. `ExportedNet` narrows the policy inside the module.
+  - **Exactness:** the logits are bf16 until the net's `.float()`.
+  - **Why in the module:** the cast then lives inside the captured graph. The callback's
+    cross-device `copy_` would instead allocate a converted temporary and move twice the
+    bytes on every batch.
+  - The value stays fp32, and the float32 buffer takes it as is.
+- **Weight storage (`cast_linears`).** On CUDA, every `nn.Linear`'s weight and bias is
+  stored in bf16.
+  - **Why it is free:** that is the cast autocast applies on every call anyway, so no output
+    bit moves. `tests/test_s7_v6_loader.py` checks it under CPU autocast for plain, static
+    and smolgen nets; `tools/s7_check.py` checks it on the GPU over the c10 corpus.
+  - **Why not all of it:** embeddings, LayerNorms and the residual stream stay fp32, as in
+    training and in every frozen90 score. The v5 path instead casts the whole model to
+    bf16, which gives a bf16 residual stream. Copying that here would run the new net on
+    numerics it was never evaluated under.
+- **Refused files:**
+  - contract B (`canonical_65`), until the §11.2 tokenizer, remap and value sign exist;
+  - exports without a `value_scale`. `score cp = value_scale * atanh(q)` drives every
+    resign and adjudication threshold, and falling back to `LEGACY_VALUE_SCALE` would
+    misreport a v6 net as a legacy one.
+
+  `export.py` now records the training corpus manifest's `value_scale`: 290.6806 for
+  corpus v2, the same as the shipping net.
+
+## S7 is certified by `tools/s7_check.py`, on the GPU
+
+The three S7 parts and their criteria:
+
+| part | what runs | criterion |
+|---|---|---|
+| UCI | `uci_wrapper_v6.py --model <export> --no-book --no-syzygy --max-batch 128`; `go nodes 800` on the 20 Gate 1 positions | capture succeeds; every bestmove is legal |
+| Forward | engine-held export vs the training-side forward under the same autocast | reported only; expected 0 differing words |
+| Contract-A numerics | eager-captured vs Inductor-captured, the same export | ≥ 98.75% move agreement |
+
+- **Numerics protocol:** Gate 2''s own — W=1 K=1, 1,600 sims, Gate 2b's recorded search
+  config, C12b's cache size — on the 500 positions of `golden/c10_corpus.json`.
+- **Why 98.75% and not 98%:** 98.75% is §11.1's figure for new architectures. The 98% floor
+  is the owner's Gate 2' ruling for the v5 net. S7 is held to the doc's number and the
+  report prints the measured rate either way.
+- **Where the output goes:** `runs/s7/`. It is torch output about a new net, so it is
+  neither golden nor baseline data. The tool reads `golden/` and writes nothing there or
+  in `baseline/`.
+- **When it runs:** in a HOLD gap of the v6 screening queue, which owns the GPU.
+
+## Tests and the mutation drill
+
+`tests/test_s7_v6_loader.py` holds 11 CPU tests; `tests/` gained only additions. Two
+mutations were each caught with 3 failures:
+- removing the bf16 narrowing in `ExportedNet.forward`;
+- storing the Linear layers in fp16.
+
+## Not done
+
+* **Contract B** (§11.2–11.3: the C++ `canonical_65` tokenizer, policy remap, value
+  sign, and B1–B3). It is needed only if screening arm A9 is adopted.
+* **§11.1's cost figure:** fresh-root delivered sims/s against the 90M net, in doublings.
+  The screening pass's `fwd_cost.py` measured the forward (A7 at 1.163× plain d384×10);
+  the delivered-sims measurement is a replay-bench run.
+* **§11.4's Q-knob recompute.** Before any fixed-config comparison, the middle-stratum
+  prediction-std ratio against the 90M net, and FPU / C_PUCT corrected from it.
+* **Switching `playv6.DEFAULT_MODEL`.** The shipping engine still loads the 90M v5 net.
+  A v6 net is selected with `--model` / `ModelPath`.
+
+## S7 result on A7, and the owner's ruling (2026-09-28)
+
+`tools/s7_check.py models/v6/screen/A7/export/A7_d384x10_5a63ca00_s60000256_raw.pt` ran in
+the screening queue's gap after A9, 01:17–01:36 UTC. Report:
+`runs/s7/A7_d384x10_5a63ca00_s60000256_raw.json`.
+
+| part | result |
+|---|---|
+| UCI | **pass**. Ready in 117 s. Inductor + CUDA-graph ladder `[1 … 128]` captured in 112.9 s, +908 MiB reserved (v5 d384×6: ~730). 20/20 bestmoves legal at `go nodes 800`. |
+| Forward vs training side | **0** of 500 × 4,096 policy words differ; value max \|Δ\| **0.0**. The bf16-Linear storage is bit-exact on the GPU as well. |
+| Contract-A numerics | **493/500 = 98.60%**, against the 98.75% criterion: **fails by one position** (494 needed). |
+
+- **Protocol:** eager vs Inductor, W=1 K=1, 1,600 sims, c10 corpus.
+- **Sweep times:** eager 571 s, Inductor 409 s.
+- **The 7 disagreements:**
+  - 4 are near-ties by the eager arm's top-two margin (0.00%, 0.25%, 0.31%, 1.06%).
+  - 3 are decisive:
+    - `rnbr2k1/pp2qppp/5n2/6B1/2p1p3/2N3P1/PP2PPBP/R2Q1RK1 w - - 2 15`: eager `d1c1` (51.7%)
+      vs Inductor `d1a4` (11.3%);
+    - `7k/p2qr2p/6pN/1pp2nP1/3p3P/2P1nP2/P4Q2/2BR2K1 w - - 2 32`: eager `d1e1` (38.8%) vs
+      Inductor `c1e3` (57.9%);
+    - `r2qrbk1/pb3pp1/1pnppn1p/2p5/P3P2P/2PP1NP1/1PN1QPB1/R1B1R1K1 b - - 2 13`: eager `a8c8`
+      (4.9%) vs Inductor `c6a5` (0.1%).
+- **Context:** the same measurement on the shipping v5 net was 98.65% (513/520). The owner's
+  Gate 2' floor for it is 98%.
+
+**Ruling, 2026-09-28, owner:** 98.60% is within an acceptable margin; S7 is accepted for
+contract A and the screening queue proceeds. It is recorded as a ruling, like C12b's:
+- **Unchanged:** `s7_check.py`'s `MIN_AGREEMENT` stays at §11.1's 98.75%, so the tool still
+  reports this run as a fail.
+- **Not adjudicated:** the three decisive disagreements have not been checked against
+  Stockfish, as C12b's were.
+
+**Consequence of screening arm A9, adopted 01:17 UTC** (`canonical_65` on top of smolgen:
+ΔKL +3.19%, ΔMSE +4.47% vs A7):
+- The screening recipe is now a **contract-B** net. This loader refuses those until §11.2's
+  C++ tokenizer, policy remap and value sign exist and pass B1–B3.
+- So the confirmation match and a production build of the final recipe are blocked on
+  contract B. S7 must also be re-run on that net.
+
+# S7 contract B — the engine's `canonical_65` path (2026-09-29)
+
+Design doc §11.2–11.3. A9 was adopted, so the final recipe is a contract-B net.
+
+## The three C++ changes, selected by the export's contract
+
+| §11.2 | where |
+|---|---|
+| Tokenizer | `cpp/tokens.hpp` `tokenize_canonical_into`: s ^ 56 and colours swapped when Black moves, castling-right rooks as their own tokens, the ep target only when `has_legal_en_passant` (cpp/keys.hpp) |
+| Policy remap | `cpp/search.hpp` `expand_from_live_row`: Black to move reads `index ^ ((56 << 6) \| 56)` |
+| Value sign | the same place: Black to move negates the side-to-move value to White-POV, once per row |
+| Contract flag | export `contract` → `load_for_inference` → `ExportedNet.contract` → `TorchEvaluator` → `LiveEvaluator(contract=)` → `Search.set_evaluator`. Anything but "A" or "B" is a `ValueError` |
+
+Everything after `expand_from_live_row`, the cache included, is White-POV and real-frame, as
+under contract A. Contract A's rows, keys and gather are unchanged: the remap is `^ 0`.
+
+## The row stays 68 slots, and slot 65 carries the side to move
+
+- **What the net reads:** slots 0..64, the 65 canonical tokens. `ExportedNet` narrows the row
+  to them inside the module.
+- **Why 68:** the buffers, `graphs.py`'s static input, the pinning and the eager token block are
+  all 68 wide. Keeping the width changed none of them.
+- **Why slot 65:** the nn_key hashes the whole row, and x and its colour mirror have the same 65
+  canonical tokens. The cache stores real-frame priors and a White-POV value, which differ
+  between the two, so the key has to tell them apart. Slots 66..67 are zero.
+- **Padding rows:** the graph's pad row is still the v5 start position. Its first 65 ids are
+  ≤ 13, inside the 17-row table, and padding outputs are never read.
+
+## It replaces an uncommitted Python adapter
+
+The tree carried an uncommitted contract-B adapter inside `ExportedNet`. It canonicalised the
+v5_68 row in torch, remapped the policy and negated the value.
+- **Its ep rule was pseudo-legal:** it tagged the target whenever our pawn stood beside it. So a
+  pinned capturer was tagged there and not in training, as its own `ponytail:` comment said.
+- **Games that ran on it:** `benchmarking/engine/games/v6/A9_800n_vs_SF2800_*` and
+  `A3_800n_vs_SF2800_*`.
+- **What changed:** its forward is now the narrowing above. `tools/s7_check.py`'s forward check
+  and `tests/test_s7_v6_loader.py`'s contract-B test followed, both uncommitted too.
+
+## B1–B3 (`tests/test_s7_contract_b.py`), as §11.3 defines them
+
+- **B1.** On the 100k FENs of `golden/tokens.npz`:
+  - the C++ canonical tokens equal `tokens_canonical_65`;
+  - the row equals the colour mirror's in its 65 tokens, with a different nn_key.
+  - The reference half needs torch, because `core.guofish_net` imports it.
+- **B2.** f_sym from the shipping v5 net (90M), both arms at W=1 K=1 with Gate 2b's search config
+  and a 400k cache, on the 500 c10 positions. Every tree array and every best move must be
+  identical.
+  - **f(x) and f(mirror x) are one batch, the White-to-move board first, in both arms.** That
+    is what makes their bits the same across arms, so f_sym is exactly equivariant.
+  - **One reading (deviation):** the v5 net sees the RAW ep file, and the canonical row keeps
+    only a legal ep target. So the contract-A arm clears token 66 when no legal capture exists,
+    before f_sym. Otherwise the arms would legitimately differ after every double push.
+  - **Budget:** 16 simulations. §11.3 names none, identity is node for node, and each
+    simulation cost ~16 ms beside the running screening queue.
+- **B3.** By hand: Black to move with a legal ep (d4e3), with partial rights (Kq, e8c8), and
+  with a promotion (a2a1, four colliding moves).
+  - Tokens are written as canonical-frame pictures.
+  - The remap: a hand-made row marks one canonical index, and the root's priors must be its
+    softmax.
+  - The sign: the Black root's value must be −0.25 for a network +0.25.
+  - Control: the same row as contract A gives uniform priors and +0.25.
+  - A 200-simulation, 2-worker run covers the dispatcher, on the ep position.
+
+## Results
+
+| run | result |
+|---|---|
+| Windows / MSVC Release, GPU hidden | 1,594 passed, 107 skipped, 5 deselected (Gate 2b's four, and B2) |
+| B2 on the GPU, beside the screening queue | 500 / 500 trees and best moves identical; 246 s |
+| `tests/test_c10b_graphs.py` on the GPU | 14 passed. Contract A's Gate 2 priors through the captured live evaluator are unchanged |
+| Linux / Clang Debug + ASan + UBSan | Every test passed except the C0b acquire-wait gate at [32], a timing flake on the loaded box; it passed on re-run. 0 ASan errors, 0 UBSan errors, no leak stack naming guofish_core |
+| Linux / Clang Debug + TSan: C9 and contract B | 155 passed, 0 ThreadSanitizer warnings; the race-probe teeth test passed |
+
+**Mutation drill** (a scratch copy per mutation; the repository module's sha256 was unchanged):
+- value sign dropped: caught by B3;
+- remap dropped: caught by B3;
+- raw ep instead of legal: caught by B1;
+- side-to-move slot constant: caught by B1's key check and B3;
+- castling rook on the wrong square: caught by B1 and B3.
+
+**Smoke on A9** (`A9_d384x10_533cdbc3_s60000256_raw.pt`):
+- Forward, engine vs training side on the core's canonical rows: 0 of 128 × 4,096 policy words
+  differ, value max |Δ| 0.0.
+- UCI at max_batch 8, eager capture: 6 of 6 bestmoves legal at `go nodes 200`.
+- A queen up with White to move and its colour mirror with Black to move both score +675,
+  with mirrored moves.
+
+## Found, not fixed
+
+- **`tests/test_s7_v6_loader.py` imports torch at module scope** (bfc6c64). On the torch-less
+  Linux venv it stops collection of the whole suite, so the Linux runs above pass
+  `--ignore` for it.
+- **`search_parallel` at W >= 2 can hang on a root mate in one**, with any live evaluator,
+  contract A included. It reproduces on HEAD's C++. W=1, the shipping configuration, is
+  unaffected. B3's parallel run uses the ep position for that reason.
+
+## Not done
+
+- **`tools/s7_check.py` on the final contract-B export**, in a HOLD gap: UCI at max_batch 128,
+  the Inductor capture, and the ≥ 98.75% numerics.
+- **§11.4's Q-knob recompute** for a canonical net, before any fixed-config comparison.

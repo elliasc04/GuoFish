@@ -59,6 +59,22 @@ def get_file_size_mb(path: Path) -> float:
     return path.stat().st_size / (1024 * 1024)
 
 
+def compress_v6_export(blob: dict) -> dict:
+    """A training/v6 export with its Linear layers stored in bf16: the cast the engine
+    applies anyway (playing/v6/evaluator.cast_linears), so its outputs keep every bit.
+    Embeddings, LayerNorms and the rest stay fp32, as trained; the metadata is kept."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from core.guofish_net import ModelConfig, build_model
+    from training.v6.ckpt import weights_sha256
+
+    net = build_model(ModelConfig.from_dict(blob["model_config"]))
+    linear = {f"{n}.{p}" for n, m in net.named_modules() if isinstance(m, nn.Linear)
+              for p in ("weight", "bias")}
+    sd = {k: v.to(torch.bfloat16) if k in linear else v for k, v in blob["state_dict"].items()}
+    return {**blob, "state_dict": sd, "weights_sha256": weights_sha256(sd)}
+
+
 def compress_to_fp16(state_dict: dict) -> dict:
     """Convert all float32 tensors to float16."""
     compressed = {}
@@ -86,6 +102,19 @@ def main():
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+
+    if isinstance(ckpt, dict) and "arch_version" in ckpt:
+        if args.quantize:
+            raise SystemExit("--quantize is for the v1 ChessTransformer; a v6 export takes the bf16 path")
+        print(f"v6 export, contract {ckpt['contract']}: Linear layers -> bfloat16")
+        output_path = args.output or args.checkpoint.with_stem(args.checkpoint.stem + "_bf16")
+        torch.save(compress_v6_export(ckpt), output_path)
+        compressed_size = get_file_size_mb(output_path)
+        print(f"\nSaved to {output_path}")
+        print(f"Original:   {original_size:.1f} MB")
+        print(f"Compressed: {compressed_size:.1f} MB")
+        print(f"Reduction:  {(1 - compressed_size / original_size) * 100:.1f}%")
+        return
 
     # Extract model state dict only
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:

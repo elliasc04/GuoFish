@@ -1,0 +1,123 @@
+ckpt:
+  every_samples: 10240000
+  export_weights: ema
+  keep_last: 3
+  stable_every_samples: 0
+data:
+  corpus: data/processed/multipv_v2
+  manifest: data/processed/multipv_v2/manifest.json
+  prefetch_factor: 2
+  split: train
+  strata: data/processed/strata/multipv_v2_train.strata2.npy
+  workers: 8
+ema:
+  enabled: true
+  half_life_samples: 2000000.0
+eval:
+  batch: 1024
+  best_metric: total
+  extra_sets: []
+  frozen_dir: data/processed/val_frozen_90m_v2
+  frozen_strata: data/processed/strata/val_frozen_90m_v2_val.strata2.npy
+  full_every_samples: 0
+  mirror_n: 10000
+  quick_every_samples: 2048000
+  quick_seed: 20260924
+  quick_size: 32768
+  workers: 4
+mixture:
+  groups:
+  - name: policy90
+    share: 0.75
+    where:
+      in_90m: 1
+      label: multipv
+      origin: root
+  - name: vonly90
+    share: 0.25
+    where:
+      in_90m: 1
+      label:
+      - hard_only
+      - value_only
+      origin: root
+model:
+  attn_bias: smolgen
+  aux_policy_head: false
+  d_ff: 1536
+  d_model: 384
+  dropout: 0.0
+  final_norm: true
+  head_dim: 64
+  init: independent
+  n_heads: 6
+  n_layers: 10
+  smolgen:
+    compress: 16
+    gen: 128
+    hidden: 128
+  token_scheme: canonical_65
+  value_head:
+    pool: cls_mlp
+  value_repr:
+    kind: scalar
+optim:
+  accum: 2
+  betas:
+  - 0.9
+  - 0.999
+  decay_embedding: false
+  eps: 1.0e-08
+  grad_clip: 1.0
+  lr: 0.00035
+  micro_batch: 512
+  muon:
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+  name: muon_adamw
+  weight_decay: 0.01
+run:
+  data_seed: 20260802
+  init_seed: 20260802
+  name: A3
+  out_root: models/v6/screen
+schedule:
+  decay_frac: 0.2
+  decay_shape: one_minus_sqrt
+  final_lr_frac: 0.0
+  kind: wsd
+  onecycle:
+    base_momentum: 0.85
+    cycle_momentum: true
+    div_factor: 25.0
+    final_div_factor: 10000.0
+    max_momentum: 0.95
+    pct_start: 0.1
+  total_samples: 60000256
+  warmup_samples: 1200005
+system:
+  allow_dirty: true
+  compile: true
+  compile_mode: default
+  device: cuda
+  log_every: 50
+  precision: bf16
+  tf32: true
+targets:
+  mirror_prob: 0.0
+  policy_hard:
+    epsilon: 0.1
+    head: main
+    weight: 0.0
+  policy_soft:
+    epsilon: 0.05
+    source: stored
+    temperature: null
+    weight: 1.0
+  value:
+    stratum_weights:
+      exact_zero: 1.0
+      mate: 1.0
+      middle: 1.0
+    weight: 1.0

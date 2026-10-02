@@ -1,0 +1,10 @@
+# Production pool without t20 (VM harness follow-ups §4): used when C0 fails and C1 passes.
+# prod.yaml in every other key (pins included); tests/test_prod.py asserts the diff is exactly
+# run.name and mixture.groups. Corpus v3 builds no t20 value-only rows, so only the policy
+# group actually loses records; both name their tiers so the pool is explicit.
+extends: prod.yaml
+run: {name: prod_v6_no_t20}
+mixture:
+  groups:
+    - {name: policy, where: {origin: root, label: multipv, depth_tier: [old, new]}, share: 0.75}
+    - {name: value, where: {origin: root, label: [hard_only, value_only], depth_tier: [old, new]}, share: 0.25}

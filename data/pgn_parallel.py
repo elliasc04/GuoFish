@@ -9,7 +9,6 @@ import io
 
 import chess
 import chess.pgn
-import torch
 
 
 # =============================================================================
@@ -116,6 +115,9 @@ def parse_game_block(pgn_text: str):
     if n == 0:
         return None
 
+    # imported here, not at module level: _board_to_tokens callers (the corpus
+    # builders' spawned pool workers) would otherwise each load torch, ~770 MB
+    import torch
     tokens = torch.tensor(all_tokens, dtype=torch.int8).view(n, SEQ_LENGTH)
     moves = torch.tensor(move_indices, dtype=torch.long)
     values = torch.full((n,), value, dtype=torch.int8)

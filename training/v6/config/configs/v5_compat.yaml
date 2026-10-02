@@ -1,0 +1,40 @@
+# v5 semantics on the v6 stack (§4 compat preset; gate S2).
+# Source of every value: training/v5_multiPV/configs/corpus90m.yaml plus the
+# recon report (OneCycleLR's default cycle_momentum=True, 0.85/0.95, H4).
+extends: base.yaml
+run:   {name: v6-v5compat, data_seed: 20260802, init_seed: 20260802}
+model: {dropout: 0.1, init: v5_deepcopy}
+data:
+  corpus: data/processed/multipv_90m
+  manifest: data/multiPV/manifests/dataset_manifest_90m.json
+  # kept out of the live corpus directory (build_strata's default --out-dir)
+  strata: data/processed/strata/multipv_90m_train.strata2.npy
+mixture: {groups: natural}          # uniform over records
+targets:
+  policy_soft: {source: stored, temperature: null, epsilon: 0.05}
+  policy_hard: {weight: 0.0}
+  value: {weight: 1.0}
+  mirror_prob: 0.5
+optim:
+  lr: 3.5e-4                        # OneCycle max_lr
+  betas: [0.9, 0.999]               # beta1 is overridden by momentum cycling, as in v5
+  eps: 1.0e-8
+  weight_decay: 0.01
+  decay_embedding: true             # v5 decayed embedding.weight
+  grad_clip: 1.0
+  micro_batch: 512
+  accum: 2
+schedule:
+  kind: onecycle
+  total_samples: 360302592          # 4 epochs x 90,075,648 (drop_last) = v5 90M x 4
+  onecycle:
+    pct_start: 0.1
+    div_factor: 25.0
+    final_div_factor: 1.0e4
+    cycle_momentum: true
+    base_momentum: 0.85
+    max_momentum: 0.95
+ema: {enabled: false}               # v5 had no EMA
+ckpt:
+  export_weights: raw
+system: {precision: bf16, compile: true, tf32: true, log_every: 50}

@@ -1,0 +1,95 @@
+# Screening queue (brief of 2026-09-26), read by training/v6/tools/screen.py before
+# every arm. Each arm changes one thing against the current best (`base: best`, the
+# default) and is judged against it; an adopted arm becomes the best. Entry fields
+# are documented in screen.py's docstring. Seeds: s = 20260802 (proxy.yaml) for data
+# and init on every arm; t = 20260925 for the confirmation pair.
+config: training/v6/config/configs/proxy.yaml
+calibration: {reference: A0, replicate: A0r}
+arms:
+  # --- 3.1 calibration
+  - {name: A0, base: null}
+  - {name: A0r, base: A0, ref: A0, adopt: false}
+
+  # --- 3.2 Phase 2 (corpus v2, base90 mixture)
+  - {name: A1, set: [model.dropout=0.0]}
+  - {name: A4, set: [model.value_head.pool=flatten], arch: true}
+  - {name: A5, set: [model.value_repr.kind=hlgauss], arch: true}
+  - {name: A6, set: [model.attn_bias=static], arch: true}
+  - {name: A7, set: [model.attn_bias=smolgen], arch: true, also: [A6]}
+  - {name: A9, set: [model.token_scheme=canonical_65, targets.mirror_prob=0.0], arch: true}
+  # in_90m policy roots 0.75 / in_90m value-only roots 0.25 (natural: 0.602 / 0.398)
+  - name: A8
+    set:
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.75},
+         {name: vonly90, where: {in_90m: 1, origin: root, label: [hard_only, value_only]}, share: 0.25}]"
+  - {name: A3, set: [optim.name=muon_adamw]}
+
+  # --- 3.3 Phase 3 (corpus v2). B0 widens the current mixture from the 90M roots to
+  # all v2 roots: natural over roots unless A8's policy / value-only split was adopted,
+  # in which case that split is kept over all roots.
+  - name: B0
+    only_if: {not_adopted: A8}
+    set: ["mixture.groups=[{name: roots, where: {origin: root}, share: 1.0}]"]
+  - name: B0
+    only_if: {adopted: A8}
+    set:
+      - "mixture.groups=[{name: policy, where: {origin: root, label: multipv}, share: 0.75},
+         {name: vonly, where: {origin: root, label: [hard_only, value_only]}, share: 0.25}]"
+  # hard labels on the main head; the hard-label rows are the 90M value-only positions
+  - {name: B1a, set: [targets.policy_hard.weight=0.25]}
+  - {name: B1b, set: [targets.policy_hard.weight=0.5]}
+
+  - id: phase3_review
+    pause: >-
+      Phase 3 review before B2-B4. B2 (w_hard on the aux head) runs only if B1's best lost
+      PV-restricted KL; B3 (derived records at 10% of samples) needs B1's best w_hard; B4's
+      restratified shares depend on the mixture then current. Insert B2/B3/B4 above the
+      confirmation entries in training/v6/screen_queue.yaml, then delete runs/screening/HOLD.
+
+  # --- Phase 3 review (2026-09-29; decisions: training/v6/DECISIONS.md, "Phase 3 review").
+  # B1's best is B1a (w_hard 0.25); it lost PV-restricted KL (-5.86% vs A3), so B2 runs.
+  - {name: B2, set: [model.aux_policy_head=true, targets.policy_hard.head=aux, targets.policy_hard.weight=0.25]}
+  # B3: derived records from the 90M roots at 10% of samples (the root groups scaled by 0.9), on
+  # top of B2's aux-head hard labels -- derived rows carry only hard labels. If B2 was not adopted
+  # the combination is judged against the best, and its delta against B2 is reported.
+  - name: B3
+    only_if: {adopted: B2}
+    set:
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.675},
+         {name: vonly90, where: {in_90m: 1, origin: root, label: [hard_only, value_only]}, share: 0.225},
+         {name: derived90, where: {in_90m: 1, origin: [ply1, ply2]}, share: 0.1}]"
+  - name: B3
+    only_if: {not_adopted: B2}
+    base: B2
+    ref: best
+    also: [B2]
+    set:
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.675},
+         {name: vonly90, where: {in_90m: 1, origin: root, label: [hard_only, value_only]}, share: 0.225},
+         {name: derived90, where: {in_90m: 1, origin: [ply1, ply2]}, share: 0.1}]"
+  # B4: exact-zero lambda 2; value-only 6-14 x1.5 and value-only mates x0.5 (6-14 mates x0.75),
+  # as rates WITHIN the value-only share, so the adopted policy / value-only / derived split holds.
+  - name: B4
+    only_if: {not_adopted: B3}
+    set:
+      - targets.value.stratum_weights.exact_zero=2.0
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.75},
+         {name: vo_614, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: [exact_zero, middle]}, share: 0.073256},
+         {name: vo_614_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: mate}, share: 0.019609},
+         {name: vo_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: mate}, share: 0.008101},
+         {name: vo_rest, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: [exact_zero, middle]}, share: 0.149034}]"
+  - name: B4
+    only_if: {adopted: B3}
+    set:
+      - targets.value.stratum_weights.exact_zero=2.0
+      - "mixture.groups=[{name: policy90, where: {in_90m: 1, origin: root, label: multipv}, share: 0.675},
+         {name: vo_614, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: [exact_zero, middle]}, share: 0.06593},
+         {name: vo_614_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: '6_14', value: mate}, share: 0.017648},
+         {name: vo_mate, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: mate}, share: 0.007291},
+         {name: vo_rest, where: {in_90m: 1, origin: root, label: [hard_only, value_only], bucket: [le5, '15_27', ge28], value: [exact_zero, middle]}, share: 0.134131},
+         {name: derived90, where: {in_90m: 1, origin: [ply1, ply2]}, share: 0.1}]"
+
+  # --- 3.4 confirmation at seed t
+  - {name: A0t, base: A0, ref: null, adopt: false, set: [run.data_seed=20260925, run.init_seed=20260925]}
+  - {name: Ct, base: best, ref: A0t, adopt: false, confirms: best,
+     set: [run.data_seed=20260925, run.init_seed=20260925]}

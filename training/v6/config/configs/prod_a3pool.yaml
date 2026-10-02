@@ -1,0 +1,10 @@
+# A3's own pool (VM harness follow-ups §4): used when C0 (and C1) fail. A3's where-clauses
+# (the in_90m roots, as a3_resolved.yaml has them) on corpus v3, which contains every 90M root;
+# the groups keep prod.yaml's names so prod.seen_eval still finds `policy`. prod.yaml in every
+# other key (pins included); tests/test_prod.py asserts the diff is run.name and mixture.groups.
+extends: prod.yaml
+run: {name: prod_v6_a3pool}
+mixture:
+  groups:
+    - {name: policy, where: {in_90m: 1, origin: root, label: multipv}, share: 0.75}
+    - {name: value, where: {in_90m: 1, origin: root, label: [hard_only, value_only]}, share: 0.25}
