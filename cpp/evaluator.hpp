@@ -57,6 +57,7 @@
 #define GUOFISH_EVALUATOR_HPP
 
 #include "arena.hpp"
+#include "tokens.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -75,6 +76,12 @@ namespace guofish {
 // receive identical priors — a preserved defect (scope §1), not a bug to route
 // around here.
 inline constexpr std::size_t kPolicySize = 4096;
+
+// Contract B's policy remap (design doc §11.2): with Black to move the row is in
+// the side-to-move frame, so move (from, to) reads the logit at
+// (from ^ 56, to ^ 56). On `from * 64 + to` that is one XOR.
+inline constexpr std::size_t kCanonicalPolicyFlip =
+    (static_cast<std::size_t>(kCanonicalFlip) << 6) | static_cast<std::size_t>(kCanonicalFlip);
 
 // "This leaf was not sent to the network." Used by the dispatcher to mark the
 // leaves the transposition cache answered, which consume no row of the batch.
@@ -219,10 +226,12 @@ inline void apply_policy_temperature(float *values, std::size_t count,
 //   `priors`      out, canonical order, `count` floats.
 //   `temperature` C11b. Divides the logits; 1.0f is the identity and skips the
 //                 divide. See apply_policy_temperature.
+//   `policy_flip` XORed into every row index: kCanonicalPolicyFlip for a
+//                 contract-B row with Black to move, else 0.
 inline void gather_softmax_canonical(const std::uint16_t *policy_row, const std::uint16_t *packed,
                                      const std::uint16_t *generation, std::size_t count,
                                      std::vector<float> &scratch, float *priors,
-                                     float temperature = 1.0f) {
+                                     float temperature = 1.0f, std::size_t policy_flip = 0) {
     assert(policy_row != nullptr && packed != nullptr && generation != nullptr);
     assert(priors != nullptr);
     scratch.resize(count);
@@ -233,7 +242,7 @@ inline void gather_softmax_canonical(const std::uint16_t *policy_row, const std:
     for (std::size_t k = 0; k < count; ++k) {
         const std::size_t g = generation[k];
         assert(g < count);
-        scratch[g] = bf16_to_float(policy_row[policy_index(packed[k])]);
+        scratch[g] = bf16_to_float(policy_row[policy_index(packed[k]) ^ policy_flip]);
     }
 
     apply_policy_temperature(scratch.data(), count, temperature);
@@ -298,8 +307,13 @@ public:
 
     // The network's ABSOLUTE (White-POV) value for row `i`. The side-to-move
     // flip is search's job and happens in `mover_value`, exactly as it does in
-    // the replay path.
+    // the replay path. Under contract B the network's value is side-to-move, and
+    // the search converts it once, where it reads this (expand_from_live_row).
     virtual float value_at(std::size_t i) const noexcept = 0;
+
+    // Which rows the network reads and which frame its outputs come back in
+    // (design doc §11). The search reads it when the evaluator is installed.
+    virtual Contract contract() const noexcept { return Contract::A; }
 };
 
 }  // namespace guofish

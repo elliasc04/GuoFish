@@ -7941,3 +7941,106 @@ contract A and the screening queue proceeds. It is recorded as a ruling, like C1
   C++ tokenizer, policy remap and value sign exist and pass B1–B3.
 - So the confirmation match and a production build of the final recipe are blocked on
   contract B. S7 must also be re-run on that net.
+
+# S7 contract B — the engine's `canonical_65` path (2026-09-29)
+
+Design doc §11.2–11.3. A9 was adopted, so the final recipe is a contract-B net.
+
+## The three C++ changes, selected by the export's contract
+
+| §11.2 | where |
+|---|---|
+| Tokenizer | `cpp/tokens.hpp` `tokenize_canonical_into`: s ^ 56 and colours swapped when Black moves, castling-right rooks as their own tokens, the ep target only when `has_legal_en_passant` (cpp/keys.hpp) |
+| Policy remap | `cpp/search.hpp` `expand_from_live_row`: Black to move reads `index ^ ((56 << 6) \| 56)` |
+| Value sign | the same place: Black to move negates the side-to-move value to White-POV, once per row |
+| Contract flag | export `contract` → `load_for_inference` → `ExportedNet.contract` → `TorchEvaluator` → `LiveEvaluator(contract=)` → `Search.set_evaluator`. Anything but "A" or "B" is a `ValueError` |
+
+Everything after `expand_from_live_row`, the cache included, is White-POV and real-frame, as
+under contract A. Contract A's rows, keys and gather are unchanged: the remap is `^ 0`.
+
+## The row stays 68 slots, and slot 65 carries the side to move
+
+- **What the net reads:** slots 0..64, the 65 canonical tokens. `ExportedNet` narrows the row
+  to them inside the module.
+- **Why 68:** the buffers, `graphs.py`'s static input, the pinning and the eager token block are
+  all 68 wide. Keeping the width changed none of them.
+- **Why slot 65:** the nn_key hashes the whole row, and x and its colour mirror have the same 65
+  canonical tokens. The cache stores real-frame priors and a White-POV value, which differ
+  between the two, so the key has to tell them apart. Slots 66..67 are zero.
+- **Padding rows:** the graph's pad row is still the v5 start position. Its first 65 ids are
+  ≤ 13, inside the 17-row table, and padding outputs are never read.
+
+## It replaces an uncommitted Python adapter
+
+The tree carried an uncommitted contract-B adapter inside `ExportedNet`. It canonicalised the
+v5_68 row in torch, remapped the policy and negated the value.
+- **Its ep rule was pseudo-legal:** it tagged the target whenever our pawn stood beside it. So a
+  pinned capturer was tagged there and not in training, as its own `ponytail:` comment said.
+- **Games that ran on it:** `benchmarking/engine/games/v6/A9_800n_vs_SF2800_*` and
+  `A3_800n_vs_SF2800_*`.
+- **What changed:** its forward is now the narrowing above. `tools/s7_check.py`'s forward check
+  and `tests/test_s7_v6_loader.py`'s contract-B test followed, both uncommitted too.
+
+## B1–B3 (`tests/test_s7_contract_b.py`), as §11.3 defines them
+
+- **B1.** On the 100k FENs of `golden/tokens.npz`:
+  - the C++ canonical tokens equal `tokens_canonical_65`;
+  - the row equals the colour mirror's in its 65 tokens, with a different nn_key.
+  - The reference half needs torch, because `core.guofish_net` imports it.
+- **B2.** f_sym from the shipping v5 net (90M), both arms at W=1 K=1 with Gate 2b's search config
+  and a 400k cache, on the 500 c10 positions. Every tree array and every best move must be
+  identical.
+  - **f(x) and f(mirror x) are one batch, the White-to-move board first, in both arms.** That
+    is what makes their bits the same across arms, so f_sym is exactly equivariant.
+  - **One reading (deviation):** the v5 net sees the RAW ep file, and the canonical row keeps
+    only a legal ep target. So the contract-A arm clears token 66 when no legal capture exists,
+    before f_sym. Otherwise the arms would legitimately differ after every double push.
+  - **Budget:** 16 simulations. §11.3 names none, identity is node for node, and each
+    simulation cost ~16 ms beside the running screening queue.
+- **B3.** By hand: Black to move with a legal ep (d4e3), with partial rights (Kq, e8c8), and
+  with a promotion (a2a1, four colliding moves).
+  - Tokens are written as canonical-frame pictures.
+  - The remap: a hand-made row marks one canonical index, and the root's priors must be its
+    softmax.
+  - The sign: the Black root's value must be −0.25 for a network +0.25.
+  - Control: the same row as contract A gives uniform priors and +0.25.
+  - A 200-simulation, 2-worker run covers the dispatcher, on the ep position.
+
+## Results
+
+| run | result |
+|---|---|
+| Windows / MSVC Release, GPU hidden | 1,594 passed, 107 skipped, 5 deselected (Gate 2b's four, and B2) |
+| B2 on the GPU, beside the screening queue | 500 / 500 trees and best moves identical; 246 s |
+| `tests/test_c10b_graphs.py` on the GPU | 14 passed. Contract A's Gate 2 priors through the captured live evaluator are unchanged |
+| Linux / Clang Debug + ASan + UBSan | Every test passed except the C0b acquire-wait gate at [32], a timing flake on the loaded box; it passed on re-run. 0 ASan errors, 0 UBSan errors, no leak stack naming guofish_core |
+| Linux / Clang Debug + TSan: C9 and contract B | 155 passed, 0 ThreadSanitizer warnings; the race-probe teeth test passed |
+
+**Mutation drill** (a scratch copy per mutation; the repository module's sha256 was unchanged):
+- value sign dropped: caught by B3;
+- remap dropped: caught by B3;
+- raw ep instead of legal: caught by B1;
+- side-to-move slot constant: caught by B1's key check and B3;
+- castling rook on the wrong square: caught by B1 and B3.
+
+**Smoke on A9** (`A9_d384x10_533cdbc3_s60000256_raw.pt`):
+- Forward, engine vs training side on the core's canonical rows: 0 of 128 × 4,096 policy words
+  differ, value max |Δ| 0.0.
+- UCI at max_batch 8, eager capture: 6 of 6 bestmoves legal at `go nodes 200`.
+- A queen up with White to move and its colour mirror with Black to move both score +675,
+  with mirrored moves.
+
+## Found, not fixed
+
+- **`tests/test_s7_v6_loader.py` imports torch at module scope** (bfc6c64). On the torch-less
+  Linux venv it stops collection of the whole suite, so the Linux runs above pass
+  `--ignore` for it.
+- **`search_parallel` at W >= 2 can hang on a root mate in one**, with any live evaluator,
+  contract A included. It reproduces on HEAD's C++. W=1, the shipping configuration, is
+  unaffected. B3's parallel run uses the ep position for that reason.
+
+## Not done
+
+- **`tools/s7_check.py` on the final contract-B export**, in a HOLD gap: UCI at max_batch 128,
+  the Inductor capture, and the ≥ 98.75% numerics.
+- **§11.4's Q-knob recompute** for a canonical net, before any fixed-config comparison.

@@ -1796,8 +1796,14 @@ public:
     // both: the dump's whole value is that a miss is a hard failure proving a
     // divergence, and a live fallback would turn every such proof into a silent
     // "the network answered instead".
-    void set_evaluator(BatchEvaluator *evaluator) noexcept { evaluator_ = evaluator; }
+    // The evaluator's contract picks the tokenizer, the policy remap and the
+    // value sign. Read once, here: it is set before any search thread starts.
+    void set_evaluator(BatchEvaluator *evaluator) noexcept {
+        evaluator_ = evaluator;
+        contract_ = evaluator != nullptr ? evaluator->contract() : Contract::A;
+    }
     const BatchEvaluator *evaluator() const noexcept { return evaluator_; }
+    Contract contract() const noexcept { return contract_; }
     const EvalStats &eval_stats() const noexcept { return eval_stats_; }
 
     // The topology this build can see, whatever it is. Reported rather than
@@ -2784,7 +2790,7 @@ private:
         NetworkValue root_value(0.0);
         bool expanded = false;
         if (evaluator_ != nullptr) {
-            const EvalRow row(root_parsed_);
+            const EvalRow row(root_parsed_, contract_);
             const LeafEval leaf = evaluate_and_expand(root_, row, packed, raw, generation, diag,
                                                       cache_hit_, stats_);
             root_value = leaf.value;
@@ -3136,7 +3142,7 @@ private:
         // be handed. The cache probe, the dump lookup and the cache insert all
         // use `row.key()`; nothing below recomputes it. See EvalRow in
         // cpp/keys.hpp for why that is a requirement and not a tidiness.
-        const EvalRow row(parsed);
+        const EvalRow row(parsed, contract_);
         const LeafDiag diag = diag_of(d, parsed);
         const LeafEval leaf =
             evaluate_and_expand(node, row, packed, raw, d.generation, diag, cache_hit_, *d.stats);
@@ -3362,10 +3368,19 @@ private:
         // temperature threaded into the interior path alone would re-create
         // exactly that inconsistency under a new name and at a far larger
         // magnitude, which is the worse version of a defect already paid for.
+        //
+        // Contract B (design doc §11.2) is converted here too, once per row: with
+        // Black to move the row is in the side-to-move frame, so the gather reads
+        // (from ^ 56, to ^ 56) and the value is negated to White-POV. Everything
+        // after this line, the cache included, is White-POV and real-frame, as
+        // under contract A.
+        const bool flip = contract_ == Contract::B && !diag.parsed->white_to_move;
         gather_softmax_canonical(evaluator_->policy_row(eval_row), packed.data(),
                                  generation.data(), packed.size(), live_scratch_,
-                                 live_priors_.data(), config_.policy_temperature);
-        const NetworkValue value(static_cast<double>(evaluator_->value_at(eval_row)));
+                                 live_priors_.data(), config_.policy_temperature,
+                                 flip ? kCanonicalPolicyFlip : 0);
+        const float network_value = evaluator_->value_at(eval_row);
+        const NetworkValue value(static_cast<double>(flip ? -network_value : network_value));
 
         const bool ok = expand(node, packed.data(), live_priors_.data(), packed.size(), packed, raw,
                                "the live evaluator", "network  ", diag, stats);
@@ -4564,7 +4579,7 @@ private:
         std::size_t next_row = 0;
         for (std::size_t i = 0; i < count; ++i) {
             const LeafNode &item = *batch_[i];
-            const EvalRow row(item.parsed);
+            const EvalRow row(item.parsed, contract_);
             live_keys_.push_back(row.key());
 
             if (cache_.has_value() && cache_->probe(row.key(), live_hits_[i])) {
@@ -4748,6 +4763,7 @@ private:
     // C10. The live evaluator, borrowed. nullptr is the replay build, which is
     // what every Gate 1 test runs and therefore the default.
     BatchEvaluator *evaluator_ = nullptr;
+    Contract contract_ = Contract::A;
     EvalStats eval_stats_;
     // Per-batch, reused. `live_slot_[i]` is the evaluator row leaf i was given,
     // or kNoEvalRow if the cache answered it; `live_keys_[i]` is the key that

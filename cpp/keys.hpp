@@ -422,7 +422,10 @@ inline NNKey nn_key_of_tokens(const std::int32_t *tokens) {
 
 class EvalRow {
 public:
-    explicit EvalRow(const ParsedFen &parsed) : key_(fill(parsed, tokens_)) {}
+    // `contract` picks the tokenizer: the v5_68 row (A), or the canonical_65 row
+    // (B, see tokenize_canonical_into). The key hashes whichever was written.
+    explicit EvalRow(const ParsedFen &parsed, Contract contract = Contract::A)
+        : key_(fill(parsed, contract, tokens_)) {}
 
     // The 68 int32s the evaluator is handed. This is the row a dispatcher
     // copies into its batch buffer (C9), and in the replay build it is what
@@ -437,8 +440,12 @@ private:
     // initialiser list from a buffer that has just been filled — which is what
     // makes "the key is a function of the tokens" a property of construction
     // rather than a two-step the caller could get half-right.
-    static NNKey fill(const ParsedFen &parsed, std::int32_t (&out)[kSeqLength]) {
-        tokenize_into(parsed, out);
+    static NNKey fill(const ParsedFen &parsed, Contract contract, std::int32_t (&out)[kSeqLength]) {
+        if (contract == Contract::B) {
+            tokenize_canonical_into(parsed, has_legal_en_passant(parsed), out);
+        } else {
+            tokenize_into(parsed, out);
+        }
         return nn_key_of_tokens(out);
     }
 

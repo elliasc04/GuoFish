@@ -1633,13 +1633,26 @@ py::dict cache_type_separation() {
     return d;
 }
 
+// The export file's contract letter (design doc §10.5) as the core's enum. Anything
+// else is a hard error (§11.2 item 4), never a default.
+guofish::Contract contract_from(const std::string &name, const char *where) {
+    if (name == "A") {
+        return guofish::Contract::A;
+    }
+    if (name == "B") {
+        return guofish::Contract::B;
+    }
+    throw py::value_error(std::string("guofish_core.") + where + ": contract must be 'A' (v5_68) or " +
+                          "'B' (canonical_65), got '" + name + "'");
+}
+
 // The evaluator's input row and the key derived from it, as a pair a test can
 // compare. This is the surface for "the stored nn_key is computed from the EXACT
 // same token buffer row dispatched to the evaluator": the caller gets the tokens
 // and the key from ONE object, so it can check that the key really is a function
 // of those bytes and of nothing else.
-py::dict eval_row(std::string_view fen) {
-    const guofish::EvalRow row(guofish::parse_fen(fen));
+py::dict eval_row(std::string_view fen, const std::string &contract) {
+    const guofish::EvalRow row(guofish::parse_fen(fen), contract_from(contract, "eval_row"));
 
     py::array_t<std::int32_t> tokens(guofish::kSeqLength);
     std::copy(row.tokens(), row.tokens() + guofish::kSeqLength, tokens.mutable_data());
@@ -1965,12 +1978,14 @@ py::array_t<T> make_array_view(const std::shared_ptr<AlignedArray<T>> &buffer,
 // cliff at exactly 1 ms. Linux's ns-resolution wait shows the honest ~1.3×.
 class LiveEvaluator final : public guofish::BatchEvaluator {
 public:
-    LiveEvaluator(std::size_t max_batch, py::object callback, double switch_interval)
+    LiveEvaluator(std::size_t max_batch, py::object callback, double switch_interval,
+                  const std::string &contract)
         : max_batch_(max_batch),
           input_(std::make_shared<AlignedBuffer>(max_batch, kTokenWidth)),
           policy_(std::make_shared<AlignedArray<std::uint16_t>>(max_batch * guofish::kPolicySize)),
           value_(std::make_shared<AlignedArray<float>>(max_batch)),
-          callback_(std::move(callback)) {
+          callback_(std::move(callback)),
+          contract_(contract_from(contract, "LiveEvaluator")) {
         if (max_batch == 0) {
             throw py::value_error("guofish_core.LiveEvaluator: max_batch must be > 0");
         }
@@ -2014,6 +2029,10 @@ public:
     }
 
     float value_at(std::size_t i) const noexcept override { return value_->data()[i]; }
+
+    guofish::Contract contract() const noexcept override { return contract_; }
+
+    const char *contract_name() const noexcept { return contract_ == guofish::Contract::B ? "B" : "A"; }
 
     guofish::EvalTiming run(std::size_t count) override {
         guofish::EvalTiming timing;
@@ -2098,6 +2117,7 @@ private:
     std::shared_ptr<AlignedArray<float>> value_;
     py::object callback_;
     py::object teardown_;
+    guofish::Contract contract_;
     double switch_interval_ = 0.0;
     double switch_interval_before_ = 0.0;
 };
@@ -2875,7 +2895,7 @@ void bind_replay_search(py::module_ &m, const char *name, const char *doc) {
             "cache_entry",
             [](Search &self, const std::string &fen) -> py::object {
                 guofish::CachedEval entry;
-                const guofish::EvalRow row(guofish::parse_fen(fen));
+                const guofish::EvalRow row(guofish::parse_fen(fen), self.contract());
                 if (!self.cache_probe(row.key(), entry)) {
                     return py::none();
                 }
@@ -2972,6 +2992,8 @@ PYBIND11_MODULE(guofish_core, m) {
     m.doc() = "GuoFish C++ core — C0 toolchain spike, C0b GIL contention probe, C1 movegen, C2 tokenizer";
 
     m.attr("SEQ_LENGTH") = guofish::kSeqLength;
+    // Contract B: how many of each row's SEQ_LENGTH slots the network reads.
+    m.attr("CANONICAL_SEQ_LENGTH") = guofish::kCanonicalSeqLength;
 
     // C8. Whether this module carries the debug-only full-tree virtual-loss
     // audit (`ReplaySearch.debug_total_vloss`). A module attribute rather than a
@@ -3503,8 +3525,8 @@ PYBIND11_MODULE(guofish_core, m) {
         "a ceiling of ~60 batches/s that reads as a slow network rather than as a lock. At "
         "0.0005 the same measurement is a p99 of 78 us. `switch_interval_before` reports what "
         "was overwritten.")
-        .def(py::init<std::size_t, py::object, double>(), py::arg("max_batch"),
-             py::arg("callback"), py::arg("switch_interval") = 0.0005,
+        .def(py::init<std::size_t, py::object, double, const std::string &>(), py::arg("max_batch"),
+             py::arg("callback"), py::arg("switch_interval") = 0.0005, py::arg("contract") = "A",
              "`callback(count)` is called once per batch, with the GIL held, on a "
              "C++-created thread. It must read rows [0, count) of input_buffer and write rows "
              "[0, count) of policy_buffer and value_buffer.\n\n"
@@ -3514,15 +3536,21 @@ PYBIND11_MODULE(guofish_core, m) {
              "dispatcher is not launching kernels.\n\n"
              "`switch_interval` <= 0 leaves the interpreter's setting alone. That exists for "
              "the C10 measurement of the setting's own cost (BENCH.md) and for nothing else; "
-             "production takes the default.")
+             "production takes the default.\n\n"
+             "`contract` is the export's: 'A' (v5_68 rows, White-POV value) or 'B' "
+             "(canonical_65 rows, side-to-move policy frame and value; design doc §11.2). A "
+             "search takes it from the evaluator it is given.")
         .def_property_readonly("max_batch", &LiveEvaluator::max_batch)
+        .def_property_readonly("contract", &LiveEvaluator::contract_name)
         .def("input_view", &LiveEvaluator::input_view,
-             "int32 [max_batch, 68], zero-copy. C++ writes it; read it, do not write it.")
+             "int32 [max_batch, 68], zero-copy. C++ writes it; read it, do not write it. "
+             "Under contract B the network reads the first 65 columns.")
         .def("policy_view", &LiveEvaluator::policy_view,
              "uint16 [max_batch, 4096] holding bf16 bit patterns, zero-copy. Write it.")
         .def("value_view", &LiveEvaluator::value_view,
-             "float32 [max_batch], zero-copy. Write it with the network's ABSOLUTE "
-             "(White-POV) value; the side-to-move flip is search's job.")
+             "float32 [max_batch], zero-copy. Write it with the network's value: ABSOLUTE "
+             "(White-POV) under contract A, side-to-move under B. Either way the flip is "
+             "search's job.")
         .def("buffer_spans", &LiveEvaluator::buffer_spans,
              "{name: (address, nbytes)} for a host that wants to page-lock the buffers.\n\n"
              "Pinning C++-owned memory needs cudaHostRegister, and calling it from this module "
@@ -3586,9 +3614,10 @@ PYBIND11_MODULE(guofish_core, m) {
           "build. This function exists because a build that stops gives an acceptance test "
           "nothing to point at.");
 
-    m.def("eval_row", &eval_row, py::arg("fen"),
+    m.def("eval_row", &eval_row, py::arg("fen"), py::arg("contract") = "A",
           "The 68-token evaluator input row for `fen` AND the nn_key computed from exactly "
-          "those tokens, as one dict.\n\n"
+          "those tokens, as one dict. Contract 'B' writes the canonical_65 row: 65 tokens, "
+          "then the side to move, then zeros.\n\n"
           "They come from one guofish::EvalRow, which is the whole point: the cache key must "
           "be a function of the bytes handed to the network, never of a second derivation "
           "from the board that happens to agree today (scope 2.5, and the C7 brief's "

@@ -135,7 +135,7 @@ def weights_sha256(sd: dict) -> str:
     h = hashlib.sha256()
     for k in sorted(sd):
         h.update(k.encode())
-        h.update(sd[k].detach().cpu().contiguous().numpy().tobytes())
+        h.update(sd[k].detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
     return h.hexdigest()
 
 

@@ -263,17 +263,26 @@ class ExportedNet(torch.nn.Module):
 
     `embedding`, `seq_length` and `cls_index` are exposed for
     `require_engine_contract`; `value_scale` is exposed for the engine's cp readout.
+
+    `contract` is the export's, and `TorchEvaluator` hands it to the C++ core. For
+    contract B (`canonical_65`, design doc §11.2) the core writes canonical tokens
+    into the first 65 of each row's 68 slots and does the policy remap and value
+    sign itself, so this module only narrows the row to what the net reads.
     """
 
     def __init__(self, net: torch.nn.Module):
         super().__init__()
         self.net = net
-        self.embedding = net.embedding
-        self.seq_length = net.seq_length
-        self.cls_index = net.cfg.cls_index
         self.value_scale = net.value_scale
+        self.contract = net.cfg.contract
+        self.seq_length = SEQ_LENGTH
+        if self.contract == "A":
+            self.embedding = net.embedding
+            self.cls_index = net.cfg.cls_index
 
     def forward(self, tokens: torch.Tensor):
+        if self.contract == "B":
+            tokens = tokens[:, :guofish_core.CANONICAL_SEQ_LENGTH]
         policy, value = self.net(tokens)
         return policy.to(AUTOCAST_DTYPE), value
 
@@ -312,21 +321,15 @@ def is_v6_export(path: Path) -> bool:
 def load_v6_export(path: Path, device: torch.device, log=print) -> ExportedNet:
     """A v6 export, through `core.guofish_net.load_for_inference` (doc §11.1).
 
-    Contract A only: the C++ core writes v5_68 tokens and reads a White-POV
-    value. A contract-B (`canonical_65`) export needs the §11.2 C++ changes
-    first and is refused here rather than fed tokens it was not trained on.
+    The export declares its contract. A contract-B (`canonical_65`) export runs
+    on the core's canonical tokenizer, policy remap and value sign (§11.2), which
+    `TorchEvaluator` selects from `ExportedNet.contract`.
     """
     from core.guofish_net import load_for_inference
 
     log(f"Loading {path} on {device}")
     net, contract = load_for_inference(path)
     cfg = net.cfg
-    if contract != "A":
-        raise ValueError(
-            f"{path} is a contract-{contract} export (token_scheme={cfg.token_scheme}). "
-            f"The C++ core speaks contract A only (v5_68 tokens, White-POV value); "
-            f"contract B needs the canonical tokenizer, policy remap and value sign "
-            f"of design doc §11.2 first.")
     if getattr(net, "value_scale", None) is None:
         raise ValueError(
             f"{path} records no value_scale, so the engine could not convert its value "
@@ -416,7 +419,11 @@ class TorchEvaluator:
         # Constructing this sets sys.setswitchinterval, before any search thread
         # exists. That is the whole reason the setting lives in a constructor —
         # see guofish_core.LiveEvaluator.
-        self.core = guofish_core.LiveEvaluator(self.max_batch, self._evaluate, switch_interval)
+        #
+        # The contract is the export's (design doc §11.2): the core picks its
+        # tokenizer, policy remap and value sign from it. v5 and legacy nets are A.
+        self.core = guofish_core.LiveEvaluator(self.max_batch, self._evaluate, switch_interval,
+                                               getattr(model, "contract", "A"))
         self.switch_interval = self.core.switch_interval
         self.switch_interval_before = self.core.switch_interval_before
 
